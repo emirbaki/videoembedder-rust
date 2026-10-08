@@ -216,15 +216,20 @@ function timelineBar(group) {
 
 function play(path, start) {
   const player = $("player");
-  if (player.dataset.path !== path) {
-    player.dataset.path = path;
-    player.src = "/api/video?key=" + encodeURIComponent(key) +
-      "&path=" + encodeURIComponent(path);
-  }
+  const source = "/api/video?key=" + encodeURIComponent(key) +
+    "&path=" + encodeURIComponent(path);
+
   const seek = () => {
     player.currentTime = start;
     player.play();
   };
+
+  if (player.dataset.path !== path) {
+    player.dataset.path = path;
+    player.addEventListener("loadedmetadata", seek, { once: true });
+    player.src = source;
+    return;
+  }
   if (player.readyState >= 1) seek();
   else player.addEventListener("loadedmetadata", seek, { once: true });
 }

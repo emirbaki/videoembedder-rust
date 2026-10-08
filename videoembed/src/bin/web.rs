@@ -232,48 +232,72 @@ fn mime_of(path: &Path) -> &'static str {
     }
 }
 
+/// What one Range header asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangePlan {
+    /// Send the whole file with a 200.
+    Whole,
+    /// Send the bytes from start to end, both included, with a 206.
+    Part(u64, u64),
+    /// Send a 416 and no body.
+    Refused,
+}
+
+fn range_plan(range_header: Option<&str>, len: u64) -> RangePlan {
+    match range_header {
+        None => RangePlan::Whole,
+        Some(header) => match parse_range(header, len) {
+            Some((start, end)) => RangePlan::Part(start, end),
+            None => RangePlan::Refused,
+        },
+    }
+}
+
 /// Build a reply for one video file. A Range header gives a 206 and a slice.
 fn video_reply(path: &Path, range_header: Option<&str>) -> Result<Reply> {
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let len = file.metadata()?.len();
     let mime = mime_of(path);
 
-    let Some(range_header) = range_header else {
-        let data: Box<dyn Read + Send> = Box::new(file);
-        return Ok(Response::new(
-            StatusCode(200),
-            vec![head("Content-Type", mime), head("Accept-Ranges", "bytes")],
-            data,
-            Some(len as usize),
-            None,
-        ));
-    };
-
-    let Some((start, end)) = parse_range(range_header, len) else {
-        let data: Box<dyn Read + Send> = Box::new(std::io::empty());
-        return Ok(Response::new(
-            StatusCode(416),
-            vec![head("Content-Range", &format!("bytes */{len}"))],
-            data,
-            Some(0),
-            None,
-        ));
-    };
-
-    file.seek(SeekFrom::Start(start))?;
-    let count = end - start + 1;
-    let data: Box<dyn Read + Send> = Box::new(file.take(count));
-    Ok(Response::new(
-        StatusCode(206),
-        vec![
-            head("Content-Type", mime),
-            head("Accept-Ranges", "bytes"),
-            head("Content-Range", &format!("bytes {start}-{end}/{len}")),
-        ],
-        data,
-        Some(count as usize),
-        None,
-    ))
+    match range_plan(range_header, len) {
+        RangePlan::Whole => {
+            let data: Box<dyn Read + Send> = Box::new(file);
+            Ok(Response::new(
+                StatusCode(200),
+                vec![head("Content-Type", mime), head("Accept-Ranges", "bytes")],
+                data,
+                Some(len as usize),
+                None,
+            ))
+        }
+        RangePlan::Refused => {
+            let data: Box<dyn Read + Send> = Box::new(std::io::empty());
+            Ok(Response::new(
+                StatusCode(416),
+                vec![head("Content-Range", &format!("bytes */{len}"))],
+                data,
+                Some(0),
+                None,
+            ))
+        }
+        RangePlan::Part(start, end) => {
+            file.seek(SeekFrom::Start(start))?;
+            let count = end - start + 1;
+            let data: Box<dyn Read + Send> = Box::new(file.take(count));
+            Ok(Response::new(
+                StatusCode(206),
+                vec![
+                    head("Content-Type", mime),
+                    head("Accept-Ranges", "bytes"),
+                    head("Content-Range", &format!("bytes {start}-{end}/{len}")),
+                ],
+                data,
+                Some(count as usize),
+                None,
+            ))
+        }
+    }
 }
 
 fn read_body<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result<T, String> {
@@ -799,6 +823,30 @@ mod tests {
         assert_eq!(parse_range("bytes=abc", 1000), None);
         assert_eq!(parse_range("bytes=50-10", 1000), None);
         assert_eq!(parse_range("bytes=", 1000), None);
+    }
+
+    #[test]
+    fn no_range_header_asks_for_the_whole_file() {
+        assert_eq!(range_plan(None, 1000), RangePlan::Whole);
+    }
+
+    #[test]
+    fn a_range_header_asks_for_a_slice() {
+        assert_eq!(range_plan(Some("bytes=0-99"), 1000), RangePlan::Part(0, 99));
+        assert_eq!(range_plan(Some("bytes=500-"), 1000), RangePlan::Part(500, 999));
+    }
+
+    #[test]
+    fn a_range_starting_past_the_end_is_refused_without_a_panic() {
+        assert_eq!(range_plan(Some("bytes=2000-"), 1000), RangePlan::Refused);
+        assert_eq!(range_plan(Some("bytes=-"), 1000), RangePlan::Refused);
+        assert_eq!(range_plan(Some("bytes=0-"), 0), RangePlan::Refused);
+    }
+
+    #[test]
+    fn a_suffix_range_reads_from_the_end() {
+        assert_eq!(range_plan(Some("bytes=-100"), 1000), RangePlan::Part(900, 999));
+        assert_eq!(range_plan(Some("bytes=-5000"), 1000), RangePlan::Part(0, 999));
     }
 
     #[test]
