@@ -141,9 +141,98 @@ function startPolling() {
   pollProgress();
 }
 
+async function runSearch(event) {
+  event.preventDefault();
+  const query = $("query").value.trim();
+  if (query === "") return;
+  note("");
+  try {
+    const answer = await api("/api/search", { query });
+    renderGroups(answer.groups);
+  } catch (err) {
+    note(err.message);
+    renderGroups([]);
+  }
+}
+
+function renderGroups(groups) {
+  const list = $("groups");
+  list.textContent = "";
+  const timeline = $("timeline");
+  timeline.textContent = "";
+
+  if (groups.length === 0) {
+    note("No window scored above 0.4.");
+    return;
+  }
+  note("");
+  for (const group of groups) {
+    const item = document.createElement("li");
+
+    const title = document.createElement("strong");
+    title.textContent = group.video;
+    item.appendChild(title);
+
+    for (const hit of group.hits) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "hit";
+      row.textContent =
+        hit.score.toFixed(3) + "  " + hit.start.toFixed(1) + "-" + hit.end.toFixed(1) + " s";
+      row.addEventListener("click", () => play(group.video, hit.start));
+      item.appendChild(row);
+    }
+
+    list.appendChild(item);
+    timeline.appendChild(timelineBar(group));
+  }
+}
+
+function timelineBar(group) {
+  const bar = document.createElement("div");
+  bar.className = "track";
+
+  const name = document.createElement("span");
+  name.className = "track-name";
+  name.textContent = group.video;
+  bar.appendChild(name);
+
+  // The store holds no true duration. The largest window end is the axis.
+  const last = group.hits.length > 0 ? group.hits[group.hits.length - 1].end : 0;
+  const span = group.duration > 0 ? group.duration : last > 0 ? last : 1;
+
+  for (const hit of group.hits) {
+    const mark = document.createElement("button");
+    mark.type = "button";
+    mark.className = "mark";
+    mark.style.left = (hit.start / span) * 100 + "%";
+    mark.style.width = ((hit.end - hit.start) / span) * 100 + "%";
+    mark.title = hit.score.toFixed(3) + "  " + hit.start.toFixed(1) + " s";
+    mark.addEventListener("click", () => play(group.video, hit.start));
+    bar.appendChild(mark);
+  }
+  return bar;
+}
+
+function play(path, start) {
+  const player = $("player");
+  if (player.dataset.path !== path) {
+    player.dataset.path = path;
+    player.src = "/api/video?key=" + encodeURIComponent(key) +
+      "&path=" + encodeURIComponent(path);
+  }
+  const seek = () => {
+    player.currentTime = start;
+    player.play();
+  };
+  if (player.readyState >= 1) seek();
+  else player.addEventListener("loadedmetadata", seek, { once: true });
+}
+
 function boot() {
   $("pick").addEventListener("click", pickFolder);
   $("start").addEventListener("click", startIndex);
+  $("search-form").addEventListener("submit", runSearch);
   refreshState().catch((err) => note(err.message));
   refreshVideos().catch((err) => note(err.message));
 }
