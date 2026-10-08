@@ -17,6 +17,10 @@ use crate::store::{self, KIND_WINDOW, Record};
 pub const WINDOW: f64 = 4.0;
 /// Window step in seconds.
 pub const STRIDE: f64 = 2.0;
+/// The fine window length in seconds, for the refine step.
+pub const FINE_WINDOW: f64 = 1.0;
+/// The fine window step in seconds, for the refine step.
+pub const FINE_STRIDE: f64 = 0.5;
 /// Small slack for the last window near the end of a video.
 pub const EPS: f64 = 0.05;
 /// A window below this score never enters a result group.
@@ -95,6 +99,55 @@ pub fn windows(duration: f64) -> Vec<(f64, f64)> {
         start += STRIDE;
     }
     plan
+}
+
+/// The fine windows inside one coarse span. Each pair is a start and an end.
+///
+/// The caller passes a span that already sits inside the video. A span shorter
+/// than one fine window gets one window. An empty span gets none.
+pub fn fine_windows(lo: f64, hi: f64) -> Vec<(f64, f64)> {
+    let mut plan = Vec::new();
+    if hi <= lo {
+        return plan;
+    }
+    let mut start = lo;
+    while start + FINE_WINDOW <= hi + EPS {
+        plan.push((start, start + FINE_WINDOW));
+        start += FINE_STRIDE;
+    }
+    if plan.is_empty() {
+        plan.push((lo, lo + FINE_WINDOW));
+    }
+    plan
+}
+
+/// Refine one coarse hit. Embed the fine windows in the span and keep the best.
+///
+/// `query` is the full prefixed query text, the same text the coarse rank uses.
+/// Returns None when every fine window fails.
+pub fn refine_hit(
+    embedder: &Embedder,
+    video: &Path,
+    query: &str,
+    start: f64,
+    end: f64,
+) -> Result<Option<(f64, f64, f32)>> {
+    let query_vec = embedder.embed_text(query)?;
+    let mut best: Option<(f64, f64, f32)> = None;
+    for (n, (lo, hi)) in fine_windows(start, end).into_iter().enumerate() {
+        let dir = work_dir(n);
+        let outcome = media::extract_window(video, lo, hi, &dir)
+            .and_then(|(frames, audio)| embedder.embed_window(&frames, &audio));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(vec) = outcome else {
+            continue;
+        };
+        let score = crate::embed::dot(&query_vec, &vec);
+        if best.map(|held| score > held.2).unwrap_or(true) {
+            best = Some((lo, hi, score));
+        }
+    }
+    Ok(best)
 }
 
 /// A fresh working folder for one window of ffmpeg output.
@@ -255,6 +308,25 @@ mod tests {
     fn a_video_shorter_than_one_window_has_no_plan() {
         assert!(windows(3.0).is_empty());
         assert_eq!(windows(5.0).len(), 1);
+    }
+
+    #[test]
+    fn fine_windows_step_a_four_second_span() {
+        let plan = fine_windows(0.0, 4.0);
+        assert_eq!(plan.len(), 7);
+        assert_eq!(plan[0], (0.0, 1.0));
+        assert_eq!(plan[6], (3.0, 4.0));
+    }
+
+    #[test]
+    fn a_span_shorter_than_the_fine_window_gets_one_window() {
+        assert_eq!(fine_windows(5.0, 5.6), vec![(5.0, 6.0)]);
+    }
+
+    #[test]
+    fn an_empty_span_has_no_fine_window() {
+        assert!(fine_windows(4.0, 4.0).is_empty());
+        assert!(fine_windows(4.0, 3.0).is_empty());
     }
 
     #[test]

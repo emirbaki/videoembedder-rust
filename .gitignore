@@ -15,3 +15,8 @@
 /spike/search_work/
 /spike/rust_work/
 /spike/work/
+
+# Scratch output from a sweep run
+/spike/sweep_work/
+/spike/sweep_out.txt
+/spike/cf_out.txt
