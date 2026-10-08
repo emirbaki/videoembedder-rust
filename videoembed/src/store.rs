@@ -17,6 +17,7 @@ const MAGIC: &[u8; 4] = b"VEI1";
 pub const KIND_WINDOW: u8 = 0;
 pub const KIND_NOTE: u8 = 1;
 
+#[derive(Clone)]
 pub struct Record {
     pub kind: u8,
     pub label: String,
@@ -108,7 +109,8 @@ impl Store {
         Ok(removed)
     }
 
-    fn write(&self) -> Result<()> {
+    /// Build the store bytes. `write` sends them to the file.
+    fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&(self.dim as u32).to_le_bytes());
@@ -123,6 +125,18 @@ impl Store {
                 out.extend_from_slice(&x.to_le_bytes());
             }
         }
+        out
+    }
+
+    /// True when the store holds a window record with this exact path.
+    pub fn holds_video(&self, path: &str) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.kind == KIND_WINDOW && record.label == path)
+    }
+
+    fn write(&self) -> Result<()> {
+        let out = self.encode();
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -175,5 +189,84 @@ impl<'a> Cursor<'a> {
     fn f32(&mut self) -> Result<f32> {
         let b = self.take(4)?;
         Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+}
+
+/// Build store bytes for a test. The real path goes through `Store::encode`.
+#[cfg(test)]
+fn encode_for_test(dim: usize, records: &[Record]) -> Vec<u8> {
+    let store = Store {
+        path: PathBuf::from("unused.vei"),
+        dim,
+        records: records.to_vec(),
+    };
+    store.encode()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(label: &str) -> Record {
+        Record {
+            kind: KIND_WINDOW,
+            label: label.to_string(),
+            start: 0.0,
+            end: 4.0,
+            vec: vec![1.0, 0.0],
+        }
+    }
+
+    fn store_of(records: Vec<Record>) -> Store {
+        Store {
+            path: PathBuf::from("unused.vei"),
+            dim: 2,
+            records,
+        }
+    }
+
+    #[test]
+    fn holds_video_matches_one_exact_path() {
+        let store = store_of(vec![record("D:/video/a.mp4"), record("D:/video/b.mp4")]);
+        assert!(store.holds_video("D:/video/a.mp4"));
+        assert!(!store.holds_video("D:/video/zz.mp4"));
+        assert!(!store.holds_video(""));
+    }
+
+    #[test]
+    fn holds_video_keeps_a_path_with_a_space_and_a_unicode_letter() {
+        let store = store_of(vec![record("D:/video/doğum günü.mp4")]);
+        assert!(store.holds_video("D:/video/doğum günü.mp4"));
+        assert!(!store.holds_video("D:/video/dogum gunu.mp4"));
+    }
+
+    #[test]
+    fn holds_video_ignores_a_note_with_the_same_text() {
+        let mut note = record("birthday");
+        note.kind = KIND_NOTE;
+        let store = store_of(vec![note]);
+        assert!(!store.holds_video("birthday"));
+    }
+
+    #[test]
+    fn the_store_round_trips_through_the_file_format() {
+        let records = vec![record("D:/video/a.mp4"), record("D:/video/b.mp4")];
+        let bytes = encode_for_test(2, &records);
+        let decoded = Store::decode(PathBuf::from("unused.vei"), &bytes).unwrap();
+        assert_eq!(decoded.dim, 2);
+        assert_eq!(decoded.records.len(), 2);
+        assert_eq!(decoded.records[1].label, "D:/video/b.mp4");
+        assert_eq!(decoded.records[0].start, 0.0);
+        assert_eq!(decoded.records[0].end, 4.0);
+        assert_eq!(decoded.records[0].vec, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_damaged_file_is_rejected_with_a_message() {
+        let err = match Store::decode(PathBuf::from("broken.vei"), b"nope") {
+            Ok(_) => panic!("a damaged file was accepted"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("broken.vei"));
     }
 }
