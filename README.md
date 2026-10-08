@@ -4,7 +4,7 @@ Search inside a video by text. The app embeds a video in short windows, then
 returns the window that matches a query.
 
 Example. A 30 s clip shows a party at 20 s. The query `birthday party` returns
-the window 20.0-24.0 s with a score of 0.76.
+the window 21.0-23.0 s with a score of 0.78.
 
 ## Status
 
@@ -156,18 +156,18 @@ Run the Python check from the `spike` folder with the machine learning
 environment:
 
 ```
-VEI_WIN=4 VEI_STRIDE=2 VEI_SUFFIX=_w4 python 06_video_search.py index testvideo_nolabels.mp4
-python 07_parity_rust_store.py index_testvideo_nolabels_w4.npz
+VEI_WIN=2 VEI_STRIDE=1 VEI_SUFFIX=_w2 python 06_video_search.py index testvideo_nolabels.mp4
+python 07_parity_rust_store.py index_testvideo_nolabels_w2.npz
 ```
 
 Four queries work against `testvideo_nolabels.mp4`:
 
 | Query | Expected window | True scene |
 |---|---|---|
-| `birthday party` | 20.0-24.0 s | 20-30 s |
-| `blue` | 12.0-16.0 s | 10-20 s |
-| `sunny weather` | 0.0-4.0 s | 0-10 s |
-| `tuesday morning` | 10.0-14.0 s | 10-20 s |
+| `birthday party` | 21.0-23.0 s | 20-30 s |
+| `blue` | 12.0-14.0 s | 10-20 s |
+| `sunny weather` | 0.0-2.0 s | 0-10 s |
+| `tuesday morning` | 11.0-13.0 s | 10-20 s |
 
 ## Known rough edges
 

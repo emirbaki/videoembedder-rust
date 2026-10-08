@@ -101,7 +101,7 @@ pub fn windows(duration: f64) -> Vec<(f64, f64)> {
     plan
 }
 
-/// The fine windows inside one coarse span. Each pair is a start and an end.
+/// The fine windows inside one span. Each pair is a start and an end.
 ///
 /// The caller passes a span that already sits inside the video. A span shorter
 /// than one fine window gets one window. An empty span gets none.
@@ -121,7 +121,7 @@ pub fn fine_windows(lo: f64, hi: f64) -> Vec<(f64, f64)> {
     plan
 }
 
-/// Refine one coarse hit. Embed the fine windows in the span and keep the best.
+/// Refine one hit. Embed the fine windows in the span and keep the best.
 ///
 /// `query` is the full prefixed query text, the same text the rank uses.
 /// Returns None when every fine window fails.

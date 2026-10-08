@@ -38,7 +38,7 @@ The package `videoembed` holds one binary, a console.
 | `src/media.rs` | ffprobe duration, frame and audio extraction with ffmpeg. |
 | `src/store.rs` | The `VEI1` store file, append, forget, rank. |
 
-A window is 4 s long and the stride is 2 s. The store sits at `store/index.vei`
+A window is 2 s long and the stride is 1 s. The store sits at `store/index.vei`
 and holds one vector for each window and note.
 
 ## 4. Design
@@ -195,7 +195,7 @@ The store format stays `VEI1`. The current `store/index.vei` keeps working, and
 both binaries share it.
 
 The timeline axis uses the largest window end as the video length. That value
-can sit up to 4 s below the true length. The bar tolerates that, and the player
+can sit up to 2 s below the true length. The bar tolerates that, and the player
 reads the true length from the browser.
 
 ## 5. Data flow
