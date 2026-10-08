@@ -70,7 +70,80 @@ async function forget(path) {
   }
 }
 
+let folder = null;
+let timer = null;
+
+async function pickFolder() {
+  try {
+    const answer = await api("/api/pick-folder", {});
+    if (answer.path === null) return;
+    folder = answer.path;
+    $("folder").textContent = folder;
+    $("start").disabled = false;
+    note("");
+  } catch (err) {
+    note(err.message);
+  }
+}
+
+async function startIndex() {
+  if (folder === null) return;
+  $("start").disabled = true;
+  note("");
+  try {
+    await api("/api/index", { path: folder });
+    startPolling();
+  } catch (err) {
+    $("start").disabled = false;
+    note(err.message);
+  }
+}
+
+function showProgress(p) {
+  $("progress").hidden = !p.running && p.indexed === 0 && !p.error;
+  const width = p.window_count > 0 ? (p.window * 100) / p.window_count : 0;
+  $("progress-bar").style.width = width + "%";
+
+  if (p.error !== null) {
+    $("progress-text").textContent = p.error;
+    return;
+  }
+  if (p.running) {
+    $("progress-text").textContent =
+      "File " + p.file_index + "/" + p.file_count +
+      ", window " + p.window + "/" + p.window_count +
+      " - " + p.file;
+    return;
+  }
+  $("progress-text").textContent = "Done. " + p.indexed + " windows indexed.";
+}
+
+async function pollProgress() {
+  let p;
+  try {
+    p = await api("/api/progress");
+  } catch (err) {
+    note(err.message);
+    return;
+  }
+  showProgress(p);
+  if (p.running) return;
+  clearInterval(timer);
+  timer = null;
+  $("start").disabled = false;
+  await refreshVideos();
+  await refreshState();
+}
+
+function startPolling() {
+  if (timer !== null) return;
+  timer = setInterval(pollProgress, 500);
+  pollProgress();
+}
+
 function boot() {
+  $("pick").addEventListener("click", pickFolder);
+  $("start").addEventListener("click", startIndex);
   refreshState().catch((err) => note(err.message));
   refreshVideos().catch((err) => note(err.message));
 }
