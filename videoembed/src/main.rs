@@ -2,17 +2,14 @@
 //!
 //! Type a command at the prompt. Each command works one step at a time.
 
-mod embed;
-mod media;
-mod store;
-
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-use embed::{DOC_PREFIX, Embedder, QUERY_PREFIX};
-use store::{KIND_NOTE, KIND_WINDOW, Record, Store};
+use videoembed::embed::{DOC_PREFIX, Embedder, QUERY_PREFIX};
+use videoembed::media;
+use videoembed::store::{KIND_NOTE, KIND_WINDOW, Record, Store};
 
 /// Window length in seconds.
 const WINDOW: f64 = 4.0;
