@@ -17,6 +17,14 @@ const MAGIC: &[u8; 4] = b"VEI1";
 pub const KIND_WINDOW: u8 = 0;
 pub const KIND_NOTE: u8 = 1;
 
+/// Make one label form for one video path.
+///
+/// Windows gives a path with backslashes or with slashes, or with both. The
+/// console and the web binary must agree, so every label becomes a slash form.
+pub fn normalize_label(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 #[derive(Clone)]
 pub struct Record {
     pub kind: u8,
@@ -98,10 +106,13 @@ impl Store {
     }
 
     /// Remove every window record of one video path.
+    ///
+    /// The path separators do not matter, like `holds_video`.
     pub fn forget(&mut self, path: &str) -> Result<usize> {
+        let want = normalize_label(path);
         let before = self.records.len();
         self.records
-            .retain(|r| !(r.kind == KIND_WINDOW && r.label == path));
+            .retain(|r| !(r.kind == KIND_WINDOW && normalize_label(&r.label) == want));
         let removed = before - self.records.len();
         if removed > 0 {
             self.write()?;
@@ -129,10 +140,14 @@ impl Store {
     }
 
     /// True when the store holds a window record with this exact path.
+    ///
+    /// The path separators do not matter, so the console and the web binary
+    /// find the same record.
     pub fn holds_video(&self, path: &str) -> bool {
+        let want = normalize_label(path);
         self.records
             .iter()
-            .any(|record| record.kind == KIND_WINDOW && record.label == path)
+            .any(|record| record.kind == KIND_WINDOW && normalize_label(&record.label) == want)
     }
 
     fn write(&self) -> Result<()> {
@@ -246,6 +261,36 @@ mod tests {
         note.kind = KIND_NOTE;
         let store = store_of(vec![note]);
         assert!(!store.holds_video("birthday"));
+    }
+
+    #[test]
+    fn normalize_label_turns_backslashes_into_forward_slashes() {
+        assert_eq!(normalize_label("D:\\video\\a.mp4"), "D:/video/a.mp4");
+        assert_eq!(normalize_label("D:/video/a.mp4"), "D:/video/a.mp4");
+        assert_eq!(normalize_label("../spike/a.mp4"), "../spike/a.mp4");
+    }
+
+    #[test]
+    fn holds_video_matches_across_path_separators() {
+        let store = store_of(vec![record("D:\\video\\a.mp4")]);
+        assert!(store.holds_video("D:/video/a.mp4"));
+        assert!(store.holds_video("D:\\video\\a.mp4"));
+    }
+
+    #[test]
+    fn forget_removes_a_label_across_path_separators() {
+        let dir = std::env::temp_dir().join(format!("vei_forget_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store {
+            path: dir.join("index.vei"),
+            dim: 2,
+            records: vec![record("D:\\video\\a.mp4"), record("D:\\video\\b.mp4")],
+        };
+        let removed = store.forget("D:/video/a.mp4").unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(store.records.len(), 1);
+        assert_eq!(store.records[0].label, "D:\\video\\b.mp4");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

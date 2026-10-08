@@ -14,11 +14,13 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use videoembed::embed::{Embedder, QUERY_PREFIX};
 use videoembed::index::{self, Group, Progress};
 use videoembed::media;
-use videoembed::store::{KIND_WINDOW, Record, Store};
+use videoembed::store::{KIND_WINDOW, Record, Store, normalize_label};
 
 type Reply = Response<Box<dyn Read + Send>>;
 
 const ADDRESS: &str = "127.0.0.1:8787";
+/// The most bytes one request body may hold.
+const MAX_BODY: usize = 1024 * 1024;
 const PAGE: &str = include_str!("../../assets/index.html");
 const JS: &str = include_str!("../../assets/app.js");
 const CSS: &str = include_str!("../../assets/app.css");
@@ -81,12 +83,12 @@ struct SearchAnswer {
     groups: Vec<Group>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct PathBody {
     path: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct QueryBody {
     query: String,
 }
@@ -300,13 +302,25 @@ fn video_reply(path: &Path, range_header: Option<&str>) -> Result<Reply> {
     }
 }
 
-fn read_body<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result<T, String> {
-    let mut text = String::new();
+/// Read one request body. The read stops one byte past the limit.
+fn read_body<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result<T, (u16, String)> {
+    let mut raw = Vec::new();
     request
         .as_reader()
-        .read_to_string(&mut text)
-        .map_err(|err| format!("read the body: {err}"))?;
-    serde_json::from_str(&text).map_err(|err| format!("the body is not valid JSON: {err}"))
+        .take(MAX_BODY as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|err| (400, format!("read the body: {err}")))?;
+    parse_body(&raw)
+}
+
+/// Parse one request body. A body over the limit gives a 413.
+///
+/// The limit stops one local process from filling the memory of the server.
+fn parse_body<T: for<'de> Deserialize<'de>>(raw: &[u8]) -> Result<T, (u16, String)> {
+    if raw.len() > MAX_BODY {
+        return Err((413, format!("the body is larger than {MAX_BODY} bytes")));
+    }
+    serde_json::from_slice(raw).map_err(|err| (400, format!("the body is not valid JSON: {err}")))
 }
 
 fn models_dir() -> PathBuf {
@@ -540,7 +554,7 @@ impl Engine {
         if plan.is_empty() {
             bail!("{} is shorter than one window", video.display());
         }
-        let label = video.to_string_lossy().to_string();
+        let label = normalize_label(&video.to_string_lossy());
         self.store.forget(&label)?;
         {
             let mut progress = self.progress.lock().unwrap();
@@ -566,7 +580,7 @@ impl Engine {
         let _ = std::fs::remove_dir_all(&dir);
         records.push(Record {
             kind: KIND_WINDOW,
-            label: video.to_string_lossy().to_string(),
+            label: normalize_label(&video.to_string_lossy()),
             start: start as f32,
             end: end as f32,
             vec: outcome?,
@@ -671,8 +685,8 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
         (true, "/api/forget") => {
             let body: PathBody = match read_body(&mut request) {
                 Ok(body) => body,
-                Err(message) => {
-                    request.respond(error_reply(400, &message))?;
+                Err((code, message)) => {
+                    request.respond(error_reply(code, &message))?;
                     return Ok(());
                 }
             };
@@ -692,8 +706,8 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
         (true, "/api/index") => {
             let body: PathBody = match read_body(&mut request) {
                 Ok(body) => body,
-                Err(message) => {
-                    request.respond(error_reply(400, &message))?;
+                Err((code, message)) => {
+                    request.respond(error_reply(code, &message))?;
                     return Ok(());
                 }
             };
@@ -716,8 +730,8 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
         (true, "/api/search") => {
             let body: QueryBody = match read_body(&mut request) {
                 Ok(body) => body,
-                Err(message) => {
-                    request.respond(error_reply(400, &message))?;
+                Err((code, message)) => {
+                    request.respond(error_reply(code, &message))?;
                     return Ok(());
                 }
             };
@@ -856,6 +870,26 @@ mod tests {
         );
         assert_eq!(found.get("path").unwrap(), "D:/video/doğum günü.mp4");
         assert_eq!(found.get("key").unwrap(), "abc");
+    }
+
+    #[test]
+    fn parse_body_reads_a_valid_body() {
+        let body: PathBody = parse_body(br#"{"path":"D:/a.mp4"}"#).unwrap();
+        assert_eq!(body.path, "D:/a.mp4");
+    }
+
+    #[test]
+    fn parse_body_rejects_json_that_is_not_valid() {
+        let err = parse_body::<PathBody>(b"not json").unwrap_err();
+        assert_eq!(err.0, 400);
+        assert!(err.1.contains("not valid JSON"), "{}", err.1);
+    }
+
+    #[test]
+    fn parse_body_refuses_a_body_over_one_mib() {
+        let raw = vec![b' '; MAX_BODY + 1];
+        let err = parse_body::<PathBody>(&raw).unwrap_err();
+        assert_eq!(err.0, 413);
     }
 
     #[test]

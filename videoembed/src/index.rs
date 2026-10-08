@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::embed::Embedder;
 use crate::media;
-use crate::store::{KIND_WINDOW, Record};
+use crate::store::{self, KIND_WINDOW, Record};
 
 /// Window length in seconds.
 pub const WINDOW: f64 = 4.0;
@@ -118,7 +118,7 @@ pub fn index_video(
     if plan.is_empty() {
         bail!("{} is shorter than one window", video.display());
     }
-    let label = video.to_string_lossy().to_string();
+    let label = store::normalize_label(&video.to_string_lossy());
     let mut records = Vec::with_capacity(plan.len());
     for (n, (start, end)) in plan.iter().enumerate() {
         let dir = work_dir(n);
