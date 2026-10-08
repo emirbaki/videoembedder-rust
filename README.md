@@ -81,15 +81,15 @@ a script.
 
 | Command | Action |
 |---|---|
-| `index <path>` | Cut the video into 4 s windows on a 2 s stride. Embed each window. |
+| `index <path>` | Cut the video into 2 s windows on a 1 s stride. Embed each window. |
 | `note <text>` | Add one free text record. |
 | `search <query>` | Rank every record. Show the top 10. |
 | `list` | Group the records by video. |
 | `forget <path>` | Drop one video from the index. |
 | `quit` | Stop. |
 
-The stride is 2 s, so the windows overlap. A hit at 20.0-24.0 s can start at
-18 s or 22 s in the true scene.
+The stride is 1 s, so the windows overlap. A hit at 20.0-22.0 s can start at
+19 s or 21 s in the true scene.
 
 The store sits at `videoembed/store/index.vei`. Both the console and the future
 web binary use that one file. The format is `VEI1`, and a crash cannot corrupt

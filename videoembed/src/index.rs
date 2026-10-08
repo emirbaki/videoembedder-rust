@@ -1,6 +1,6 @@
 //! The folder scan, the window plan, and the progress object.
 //!
-//! One window is 4 s long. The stride is 2 s, so windows overlap.
+//! One window is 2 s long. The stride is 1 s, so windows overlap.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,9 +14,9 @@ use crate::media;
 use crate::store::{self, KIND_WINDOW, Record};
 
 /// Window length in seconds.
-pub const WINDOW: f64 = 4.0;
+pub const WINDOW: f64 = 2.0;
 /// Window step in seconds.
-pub const STRIDE: f64 = 2.0;
+pub const STRIDE: f64 = 1.0;
 /// The fine window length in seconds, for the refine step.
 pub const FINE_WINDOW: f64 = 1.0;
 /// The fine window step in seconds, for the refine step.
@@ -123,7 +123,7 @@ pub fn fine_windows(lo: f64, hi: f64) -> Vec<(f64, f64)> {
 
 /// Refine one coarse hit. Embed the fine windows in the span and keep the best.
 ///
-/// `query` is the full prefixed query text, the same text the coarse rank uses.
+/// `query` is the full prefixed query text, the same text the rank uses.
 /// Returns None when every fine window fails.
 pub fn refine_hit(
     embedder: &Embedder,
@@ -299,15 +299,16 @@ mod tests {
     #[test]
     fn windows_cover_a_thirty_second_video() {
         let plan = windows(30.0);
-        assert_eq!(plan.len(), 14);
-        assert_eq!(plan[0], (0.0, 4.0));
-        assert_eq!(plan[13], (26.0, 30.0));
+        assert_eq!(plan.len(), 29);
+        assert_eq!(plan[0], (0.0, 2.0));
+        assert_eq!(plan[28], (28.0, 30.0));
     }
 
     #[test]
     fn a_video_shorter_than_one_window_has_no_plan() {
-        assert!(windows(3.0).is_empty());
-        assert_eq!(windows(5.0).len(), 1);
+        assert!(windows(1.0).is_empty());
+        assert_eq!(windows(2.0).len(), 1);
+        assert_eq!(windows(5.0).len(), 4);
     }
 
     #[test]
@@ -393,8 +394,8 @@ mod tests {
         for (n, _) in plan.iter().enumerate() {
             report(n + 1, plan.len());
         }
-        assert_eq!(seen.len(), 14);
-        assert_eq!(seen[0], (1, 14));
-        assert_eq!(seen[13], (14, 14));
+        assert_eq!(seen.len(), 29);
+        assert_eq!(seen[0], (1, 29));
+        assert_eq!(seen[28], (29, 29));
     }
 }
