@@ -11,7 +11,7 @@ the window 20.0-24.0 s with a score of 0.76.
 | Part | State |
 |---|---|
 | Console app | Works. |
-| Web UI | Designed, not built. See `docs/superpowers/specs/`. |
+| Web UI | Works. See the Web UI section. |
 | GPU | Not used. The model runs on the CPU. |
 
 ## How it works
@@ -97,6 +97,43 @@ it, because a write goes through a temp file and a rename.
 
 Set `VEI_MODELS` to point at another model folder.
 
+## Web UI
+
+Run the web binary from the `videoembed` folder:
+
+```bash
+./target/debug/web.exe
+```
+
+The app opens `http://127.0.0.1:8787/` in your browser.
+
+1. Press Choose folder and pick a folder.
+2. Press Index. The bar shows the file and the window.
+3. Type a query. The hits appear under Search.
+4. Press a hit. The player jumps to that moment.
+5. Press Forget on a row to drop one video from the index.
+6. Press Quit to stop the server.
+
+The server binds to `127.0.0.1` only, so another machine cannot reach it.
+
+Each `/api/` call carries the header `X-VEI: 1`. A foreign page cannot set that
+header, and the server sends no CORS headers, so its request fails. The player
+needs one exception. A `<video>` element cannot set a header, so `/api/video`
+takes a random key in the query instead. The page reads that key from
+`/api/state`.
+
+| Endpoint | Method | Action |
+|---|---|---|
+| `/api/state` | GET | The version, the record count, the video count, and the video key. |
+| `/api/progress` | GET | The progress object of the running job. |
+| `/api/videos` | GET | Every indexed video with its window count. |
+| `/api/search` | POST | Rank the store and group the hits by video. |
+| `/api/pick-folder` | POST | Open the folder dialog. |
+| `/api/index` | POST | Index every video under a folder. |
+| `/api/forget` | POST | Drop one video from the index. |
+| `/api/video` | GET | The video bytes, with byte ranges. |
+| `/api/quit` | POST | Stop the server. |
+
 ## Repository layout
 
 | Path | Role |
@@ -136,4 +173,4 @@ Four queries work against `testvideo_nolabels.mp4`:
 
 1. The ffmpeg path is a fixed absolute path in `videoembed/src/media.rs`.
 2. The console has no progress line during a long index.
-3. The app loads one video at a time. There is no folder scan yet.
+3. The console indexes one video. The web page indexes a folder.

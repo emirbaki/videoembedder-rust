@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>videoembed</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>videoembed</h1>
+  <span id="status">Loading</span>
+  <button id="quit" type="button">Quit</button>
+</header>
+
+<main>
+<section>
+  <h2>Folder</h2>
+  <p id="folder">No folder</p>
+  <button id="pick" type="button">Choose folder</button>
+  <button id="start" type="button" disabled>Index</button>
+  <div id="progress" hidden>
+    <div class="bar"><div id="progress-bar"></div></div>
+    <p id="progress-text"></p>
+  </div>
+</section>
+
+<section>
+  <h2>Search</h2>
+  <form id="search-form">
+    <input id="query" type="search" placeholder="birthday party" autocomplete="off">
+    <button type="submit">Search</button>
+  </form>
+  <p id="message" class="message" hidden></p>
+  <ul id="groups"></ul>
+</section>
+
+<section>
+  <h2>Player</h2>
+  <video id="player" controls preload="metadata"></video>
+</section>
+
+<section>
+  <h2>Timeline</h2>
+  <div id="timeline"></div>
+</section>
+
+<section>
+  <h2>Indexed</h2>
+  <table id="videos"><tbody></tbody></table>
+</section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
