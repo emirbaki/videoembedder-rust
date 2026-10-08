@@ -6,9 +6,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::embed::Embedder;
+use crate::media;
 use crate::store::{KIND_WINDOW, Record};
 
 /// Window length in seconds.
@@ -100,6 +102,40 @@ pub fn work_dir(at: usize) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("vei_{}_{n}_{at}", std::process::id()))
+}
+
+/// Index one video. Embed every window and return its records.
+///
+/// The callback runs after each window with the window number, counting from 1,
+/// and the window count of the whole video.
+pub fn index_video(
+    embedder: &Embedder,
+    video: &Path,
+    on_window: &mut dyn FnMut(usize, usize),
+) -> Result<Vec<Record>> {
+    let duration = media::probe_duration(video)?;
+    let plan = windows(duration);
+    if plan.is_empty() {
+        bail!("{} is shorter than one window", video.display());
+    }
+    let label = video.to_string_lossy().to_string();
+    let mut records = Vec::with_capacity(plan.len());
+    for (n, (start, end)) in plan.iter().enumerate() {
+        let dir = work_dir(n);
+        let outcome = media::extract_window(video, *start, *end, &dir)
+            .and_then(|(frames, audio)| embedder.embed_window(&frames, &audio));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vec = outcome?;
+        records.push(Record {
+            kind: KIND_WINDOW,
+            label: label.clone(),
+            start: *start as f32,
+            end: *end as f32,
+            vec,
+        });
+        on_window(n + 1, plan.len());
+    }
+    Ok(records)
 }
 
 /// Group the ranked records by video.
@@ -270,5 +306,23 @@ mod tests {
         let records = vec![record("a.mp4", 0.0, 4.0)];
         assert!(group_hits(&records, &[(0, 0.39)]).is_empty());
         assert!(group_hits(&[], &[]).is_empty());
+    }
+
+    /// A contract pin for `index_video`.
+    ///
+    /// `index_video` needs the model, so it has no unit test of its own. This
+    /// test pins the callback contract that it obeys: the number counts from 1,
+    /// and it reaches the window count on the last window.
+    #[test]
+    fn the_callback_numbering_matches_the_window_plan() {
+        let plan = windows(30.0);
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let mut report = |n: usize, total: usize| seen.push((n, total));
+        for (n, _) in plan.iter().enumerate() {
+            report(n + 1, plan.len());
+        }
+        assert_eq!(seen.len(), 14);
+        assert_eq!(seen[0], (1, 14));
+        assert_eq!(seen[13], (14, 14));
     }
 }

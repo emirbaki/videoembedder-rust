@@ -8,15 +8,8 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use videoembed::embed::{DOC_PREFIX, Embedder, QUERY_PREFIX};
-use videoembed::media;
-use videoembed::store::{KIND_NOTE, KIND_WINDOW, Record, Store};
-
-/// Window length in seconds.
-const WINDOW: f64 = 4.0;
-/// Window step in seconds.
-const STRIDE: f64 = 2.0;
-/// Small slack for the last window near the end of a video.
-const EPS: f64 = 0.05;
+use videoembed::index;
+use videoembed::store::{KIND_NOTE, Record, Store};
 
 fn main() -> Result<()> {
     let models = models_dir();
@@ -105,39 +98,9 @@ fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
     if !video.is_file() {
         bail!("{} is not a file", video.display());
     }
-    let duration = media::probe_duration(&video)?;
-    let label = video.to_string_lossy().to_string();
-    println!("Video: {label}");
-    println!("Duration: {duration:.2} s");
-
-    let work = std::env::temp_dir().join(format!("vei_{}", std::process::id()));
-    let mut records = Vec::new();
-    let mut start = 0.0;
-    let mut n = 0;
-    while start + WINDOW <= duration + EPS {
-        let end = start + WINDOW;
-        n += 1;
-        let dir = work.join(format!("w{n:03}"));
-        let (frames, audio) = media::extract_window(&video, start, end, &dir)?;
-        let vec = embedder.embed_window(&frames, &audio)?;
-        println!(
-            "  window {n:3}  {start:6.1}-{end:5.1} s  {} frames  dim {}",
-            frames.len(),
-            vec.len()
-        );
-        records.push(Record {
-            kind: KIND_WINDOW,
-            label: label.clone(),
-            start: start as f32,
-            end: end as f32,
-            vec,
-        });
-        start += STRIDE;
-    }
-    let _ = std::fs::remove_dir_all(&work);
-    if records.is_empty() {
-        bail!("the video is shorter than one window");
-    }
+    println!("Video: {}", video.display());
+    let mut report = |n: usize, total: usize| println!("  window {n:3}/{total}");
+    let records = index::index_video(embedder, &video, &mut report)?;
     let count = records.len();
     store.append(records)?;
     println!("Indexed {count} windows into {}", store_path_hint());
