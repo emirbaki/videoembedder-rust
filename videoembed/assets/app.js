@@ -234,10 +234,19 @@ function play(path, start) {
   else player.addEventListener("loadedmetadata", seek, { once: true });
 }
 
+async function quit() {
+  try {
+    await api("/api/quit", {});
+  } catch (err) {
+    note(err.message);
+  }
+}
+
 function boot() {
   $("pick").addEventListener("click", pickFolder);
   $("start").addEventListener("click", startIndex);
   $("search-form").addEventListener("submit", runSearch);
+  $("quit").addEventListener("click", quit);
   refreshState().catch((err) => note(err.message));
   refreshVideos().catch((err) => note(err.message));
 }
