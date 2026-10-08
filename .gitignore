@@ -1,0 +1,17 @@
+# Build output
+/videoembed/target/
+
+# Model weights. About 825 MB.
+/models/*.gguf
+
+# Downloaded tools. About 1 GB.
+/tools/dl/
+
+# The generated vector index. It is local to one machine.
+/videoembed/store/
+
+# Generated test output
+/spike/__pycache__/
+/spike/search_work/
+/spike/rust_work/
+/spike/work/

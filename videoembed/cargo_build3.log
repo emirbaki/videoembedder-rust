@@ -1,0 +1,6 @@
+     Locking 1 package to latest Rust 1.98.1 compatible version
+      Adding llama-cpp-sys-2 v0.1.158 (D:\MLProjelerim\videoembedder-rust\vendor\llama-cpp-sys-2)
+   Compiling llama-cpp-sys-2 v0.1.158 (D:\MLProjelerim\videoembedder-rust\vendor\llama-cpp-sys-2)
+error: failed to remove D:\MLProjelerim\videoembedder-rust\videoembed\target\debug\build\llama-cpp-sys-2-2cd7e310ed130bfd\build_script_build-2cd7e310ed130bfd.5swhauy7981vc8ulufeuauhzd.0afj4js.rcgu.o: Dosya başka bir işlem tarafından kullanıldığından bu işlem dosyaya erişemiyor. (os error 32)
+
+error: could not compile `llama-cpp-sys-2` (build script) due to 1 previous error
