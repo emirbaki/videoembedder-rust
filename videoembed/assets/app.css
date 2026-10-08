@@ -1,0 +1,99 @@
+:root {
+  color-scheme: dark;
+  --line: #30363d;
+  --dim: #8b949e;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+header h1 { font-size: 1.1rem; margin: 0; }
+header #status { color: var(--dim); font-size: 0.85rem; }
+header #quit { margin-left: auto; }
+
+main {
+  display: grid;
+  gap: 1.5rem;
+  padding: 1.5rem;
+  max-width: 70rem;
+}
+
+section { border: 1px solid var(--line); border-radius: 8px; padding: 1rem; }
+h2 { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin: 0 0 0.75rem; }
+
+button {
+  font: inherit;
+  color: inherit;
+  background: #21262d;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+}
+button:hover { background: #30363d; }
+button:disabled { opacity: 0.45; cursor: default; }
+
+input[type="search"] {
+  font: inherit;
+  color: inherit;
+  background: #010409;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  width: 24rem;
+  max-width: 100%;
+}
+
+#folder { font-family: ui-monospace, monospace; font-size: 0.85rem; }
+
+.bar { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; margin-top: 0.75rem; }
+#progress-bar { height: 100%; width: 0; background: #2f81f7; }
+#progress-text { font-size: 0.85rem; color: var(--dim); margin: 0.4rem 0 0; }
+
+.message { color: #f85149; font-size: 0.9rem; }
+
+#groups { list-style: none; margin: 0; padding: 0; }
+#groups li { padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
+#groups strong { display: block; font-family: ui-monospace, monospace; font-size: 0.8rem; color: var(--dim); }
+
+.hit { margin: 0.35rem 0.35rem 0 0; font-variant-numeric: tabular-nums; }
+
+#player { width: 100%; max-height: 26rem; background: #000; border-radius: 6px; }
+
+.track {
+  position: relative;
+  height: 2rem;
+  margin-bottom: 0.5rem;
+  background: #161b22;
+  border-radius: 4px;
+}
+.track-name { position: absolute; left: 0.5rem; top: 0.45rem; font-size: 0.72rem; color: var(--dim); }
+.mark {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  padding: 0;
+  background: #2f81f7aa;
+  border: 1px solid #2f81f7;
+  border-radius: 2px;
+}
+.mark:hover { background: #2f81f7; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+td { padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); }
+td:first-child { font-family: ui-monospace, monospace; word-break: break-all; }
+td:last-child { text-align: right; }
