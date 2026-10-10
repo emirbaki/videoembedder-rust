@@ -477,13 +477,23 @@ fn engine_loop(
             // keeps the server on the device it had.
             match embedder.prepare(&models, device) {
                 Ok((device, model, mtmd)) => {
+                    // The new model must hold a context before the old model
+                    // leaves. A device with no room for the cache then never
+                    // takes over, and the old device keeps serving. The probe
+                    // runs first, because a swap with no context after it
+                    // leaves the server with no answer for any request.
+                    if let Err(err) = embedder.probe(&model) {
+                        let _ = answer.send(Err(JobError::from(err)));
+                        continue;
+                    }
                     // The context borrows the old model, so it goes first.
                     drop(ctx);
                     embedder.swap(device, model, mtmd);
                     ctx = match embedder.new_context() {
                         Ok(next) => next,
                         Err(err) => {
-                            // A model with no context serves nothing.
+                            // The probe passed, so this is a fault of the
+                            // runtime, and no device serves now.
                             fail(&progress, &err);
                             let _ = answer.send(Err(JobError::from(err)));
                             break;

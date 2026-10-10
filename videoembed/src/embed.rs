@@ -176,6 +176,17 @@ impl Embedder {
         Ok((device, model, mtmd))
     }
 
+    /// Prove that one model holds a context. The probe context goes at once.
+    ///
+    /// A switch calls this before the old model leaves. A device with no room
+    /// for the key and value cache then never takes over, and the old device
+    /// keeps serving. The caller must call this before [`Embedder::swap`],
+    /// because a context borrows the model.
+    pub fn probe(&self, model: &LlamaModel) -> Result<()> {
+        model.new_context(&self.backend, context_params())?;
+        Ok(())
+    }
+
     /// Take a model pair from [`Embedder::prepare`].
     ///
     /// Every context of the old model is dead from here: a context borrows the
