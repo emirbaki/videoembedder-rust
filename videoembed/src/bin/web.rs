@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use llama_cpp_2::context::LlamaContext;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use videoembed::embed::{Embedder, QUERY_PREFIX};
 use videoembed::index::{self, Group, Progress};
-use videoembed::media;
-use videoembed::store::{KIND_WINDOW, Record, Store, normalize_label};
+use videoembed::store::{Record, Store, normalize_label};
 
 type Reply = Response<Box<dyn Read + Send>>;
 
@@ -70,7 +70,7 @@ struct State {
 #[derive(Serialize)]
 struct VideoRow {
     path: String,
-    windows: usize,
+    items: usize,
 }
 
 #[derive(Serialize)]
@@ -81,6 +81,7 @@ struct Rows {
 #[derive(Serialize)]
 struct SearchAnswer {
     groups: Vec<Group>,
+    baseline: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,256 +345,236 @@ fn make_key() -> String {
     format!("{:x}{:x}", now ^ (pid << 64), pid.rotate_left(17))
 }
 
-struct IndexJob {
+/// The indexing work of the server. One `step` call does one media item.
+struct WebJob {
     files: Vec<PathBuf>,
     file_at: usize,
-    plan: Vec<(f64, f64)>,
-    at: usize,
+    run: Option<index::IndexRun>,
     records: Vec<Record>,
-    on_file: bool,
     indexed: usize,
 }
 
-/// The engine thread. It owns the model and the store.
-struct Engine {
-    embedder: Embedder,
-    store: Store,
-    progress: Arc<Mutex<Progress>>,
-    pending: Option<IndexJob>,
-    key: String,
+/// Group the store records by video path. Every video kind counts.
+fn videos(store: &Store) -> Vec<VideoRow> {
+    let mut rows: Vec<VideoRow> = Vec::new();
+    for record in &store.records {
+        if !videoembed::store::is_video(record.kind) {
+            continue;
+        }
+        match rows.iter_mut().find(|row| row.path == record.label) {
+            Some(row) => row.items += 1,
+            None => rows.push(VideoRow {
+                path: record.label.clone(),
+                items: 1,
+            }),
+        }
+    }
+    rows
 }
 
-impl Engine {
-    fn start(models: &Path, store_path: &Path, progress: Arc<Mutex<Progress>>) -> Result<Self> {
-        let embedder = Embedder::load(models)?;
-        let store = Store::open(store_path)?;
-        Ok(Self {
-            embedder,
-            store,
-            progress,
-            pending: None,
-            key: make_key(),
-        })
-    }
-
-    /// Answer jobs forever. A running index gives one window per turn.
-    fn run(mut self, jobs: Receiver<Job>) {
-        loop {
-            if self.pending.is_some() {
-                self.step_job();
-                while let Ok(job) = jobs.try_recv() {
-                    self.handle(job);
-                }
-            } else {
-                match jobs.recv() {
-                    Ok(job) => self.handle(job),
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-
-    fn handle(&mut self, job: Job) {
-        match job {
-            Job::State(answer) => {
-                let _ = answer.send(self.state());
-            }
-            Job::Videos(answer) => {
-                let _ = answer.send(self.videos());
-            }
-            Job::Holds { path, answer } => {
-                let _ = answer.send(self.store.holds_video(&path));
-            }
-            Job::Forget { path, answer } => {
-                let outcome = self.store.forget(&path).map_err(JobError::from);
-                let _ = answer.send(outcome);
-            }
-            Job::Search { query, answer } => {
-                let _ = answer.send(self.search(&query));
-            }
-            Job::StartIndex { folder, answer } => {
-                let _ = answer.send(self.start_index(&folder));
-            }
-        }
-    }
-
-    fn state(&self) -> State {
-        State {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            records: self.store.records.len(),
-            videos: self.videos().len(),
-            key: self.key.clone(),
-        }
-    }
-
-    fn videos(&self) -> Vec<VideoRow> {
-        let mut rows: Vec<VideoRow> = Vec::new();
-        for record in &self.store.records {
-            if record.kind != KIND_WINDOW {
-                continue;
-            }
-            match rows.iter_mut().find(|row| row.path == record.label) {
-                Some(row) => row.windows += 1,
-                None => rows.push(VideoRow {
-                    path: record.label.clone(),
-                    windows: 1,
-                }),
-            }
-        }
-        rows
-    }
-
-    fn search(&self, query: &str) -> Result<SearchAnswer, JobError> {
-        if self.store.records.is_empty() {
-            return Ok(SearchAnswer { groups: Vec::new() });
-        }
-        let text = format!("{QUERY_PREFIX}{query}");
-        let vec = self.embedder.embed_text(&text).map_err(JobError::from)?;
-        let ranked = self.store.rank(&vec);
-        Ok(SearchAnswer {
-            groups: index::group_hits(&self.store.records, &ranked, 0.0),
-        })
-    }
-
-    fn start_index(&mut self, folder: &Path) -> Result<usize, JobError> {
-        if self.pending.is_some() {
-            return Err(JobError::Busy);
-        }
-        if !folder.is_dir() {
-            return Err(JobError::Message(format!(
-                "{} is not a folder",
-                folder.display()
-            )));
-        }
-        let files = index::list_videos(folder).map_err(JobError::from)?;
-        if files.is_empty() {
-            return Err(JobError::Message(format!(
-                "no video files under {}",
-                folder.display()
-            )));
-        }
-        let count = files.len();
-        {
-            let mut progress = self.progress.lock().unwrap();
-            *progress = Progress {
-                running: true,
-                folder: folder.display().to_string(),
-                file_count: count,
-                ..Progress::default()
-            };
-        }
-        self.pending = Some(IndexJob {
-            files,
-            file_at: 0,
-            plan: Vec::new(),
-            at: 0,
-            records: Vec::new(),
-            on_file: false,
-            indexed: 0,
-        });
-        Ok(count)
-    }
-
-    /// One window of work, or the move to the next file.
-    fn step_job(&mut self) {
-        let Some(mut job) = self.pending.take() else {
-            return;
-        };
-
-        if !job.on_file {
-            if job.file_at >= job.files.len() {
-                self.progress.lock().unwrap().running = false;
-                return;
-            }
-            let video = job.files[job.file_at].clone();
-            match self.open_file(&video, job.file_at + 1) {
-                Ok(plan) => {
-                    job.plan = plan;
-                    job.at = 0;
-                    job.records.clear();
-                    job.on_file = true;
-                }
-                Err(err) => {
-                    self.fail(&err);
-                    job.file_at += 1;
-                }
-            }
-            self.pending = Some(job);
+/// Answer jobs forever. A running index does one media item per turn.
+fn engine_loop(
+    embedder: Embedder,
+    mut store: Store,
+    progress: Arc<Mutex<Progress>>,
+    key: String,
+    jobs: Receiver<Job>,
+) {
+    let mut ctx = match embedder.new_context() {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            eprintln!("no context: {err:#}");
             return;
         }
-
-        let video = job.files[job.file_at].clone();
-        let (start, end) = job.plan[job.at];
-        if let Err(err) = self.one_window(&video, start, end, &mut job.records) {
-            self.fail(&err);
-        }
-        job.at += 1;
-        {
-            let mut progress = self.progress.lock().unwrap();
-            progress.window = job.at;
-            progress.indexed = job.indexed + job.records.len();
-        }
-        if job.at >= job.plan.len() {
-            let records = std::mem::take(&mut job.records);
-            job.indexed += records.len();
-            if let Err(err) = self.store.append(records) {
-                self.fail(&err);
+    };
+    let mut pending: Option<WebJob> = None;
+    loop {
+        if pending.is_some() {
+            step_job(
+                &embedder,
+                &mut ctx,
+                &mut store,
+                &progress,
+                pending.as_mut().unwrap(),
+            );
+            while let Ok(job) = jobs.try_recv() {
+                handle(job, &embedder, &mut store, &progress, &key, &mut pending);
             }
-            job.file_at += 1;
-            job.on_file = false;
+        } else {
+            match jobs.recv() {
+                Ok(job) => handle(job, &embedder, &mut store, &progress, &key, &mut pending),
+                Err(_) => break,
+            }
         }
-        self.pending = Some(job);
-    }
-
-    /// Probe the duration and drop the old records of this file.
-    ///
-    /// The probe runs first, so a broken file keeps its old index.
-    fn open_file(&mut self, video: &Path, number: usize) -> Result<Vec<(f64, f64)>> {
-        let duration = media::probe_duration(video)?;
-        let plan = index::windows(duration);
-        if plan.is_empty() {
-            bail!("{} is shorter than one window", video.display());
-        }
-        let label = normalize_label(&video.to_string_lossy());
-        self.store.forget(&label)?;
-        {
-            let mut progress = self.progress.lock().unwrap();
-            progress.file = label;
-            progress.file_index = number;
-            progress.window = 0;
-            progress.window_count = plan.len();
-            progress.error = None;
-        }
-        Ok(plan)
-    }
-
-    fn one_window(
-        &self,
-        video: &Path,
-        start: f64,
-        end: f64,
-        records: &mut Vec<Record>,
-    ) -> Result<()> {
-        let dir = index::work_dir(records.len());
-        let outcome = media::extract_window(video, start, end, &dir)
-            .and_then(|(frames, audio)| self.embedder.embed_window(&frames, &audio));
-        let _ = std::fs::remove_dir_all(&dir);
-        records.push(Record {
-            kind: KIND_WINDOW,
-            label: normalize_label(&video.to_string_lossy()),
-            start: start as f32,
-            end: end as f32,
-            vec: outcome?,
-        });
-        Ok(())
-    }
-
-    fn fail(&self, err: &anyhow::Error) {
-        self.progress.lock().unwrap().error = Some(format!("{err:#}"));
     }
 }
 
 fn handle(
+    job: Job,
+    embedder: &Embedder,
+    store: &mut Store,
+    progress: &Arc<Mutex<Progress>>,
+    key: &str,
+    pending: &mut Option<WebJob>,
+) {
+    match job {
+        Job::State(answer) => {
+            let count = videos(store).len();
+            let _ = answer.send(State {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                records: store.records.len(),
+                videos: count,
+                key: key.to_string(),
+            });
+        }
+        Job::Videos(answer) => {
+            let _ = answer.send(videos(store));
+        }
+        Job::Holds { path, answer } => {
+            let _ = answer.send(store.holds_video(&path));
+        }
+        Job::Forget { path, answer } => {
+            let outcome = store.forget(&path).map_err(JobError::from);
+            let _ = answer.send(outcome);
+        }
+        Job::Search { query, answer } => {
+            let _ = answer.send(search(embedder, store, &query));
+        }
+        Job::StartIndex { folder, answer } => {
+            let _ = answer.send(start_index(progress, pending, &folder));
+        }
+    }
+}
+
+fn search(embedder: &Embedder, store: &Store, query: &str) -> Result<SearchAnswer, JobError> {
+    if store.records.is_empty() {
+        return Ok(SearchAnswer {
+            groups: Vec::new(),
+            baseline: 0.0,
+        });
+    }
+    let text = format!("{QUERY_PREFIX}{query}");
+    let vec = embedder.embed_text(&text).map_err(JobError::from)?;
+    let ranked = store.rank(&vec);
+    let baseline = index::median(&ranked);
+    Ok(SearchAnswer {
+        groups: index::group_hits(&store.records, &ranked, baseline),
+        baseline,
+    })
+}
+
+fn start_index(
+    progress: &Arc<Mutex<Progress>>,
+    pending: &mut Option<WebJob>,
+    folder: &Path,
+) -> Result<usize, JobError> {
+    if pending.is_some() {
+        return Err(JobError::Busy);
+    }
+    if !folder.is_dir() {
+        return Err(JobError::Message(format!(
+            "{} is not a folder",
+            folder.display()
+        )));
+    }
+    let files = index::list_videos(folder).map_err(JobError::from)?;
+    if files.is_empty() {
+        return Err(JobError::Message(format!(
+            "no video files under {}",
+            folder.display()
+        )));
+    }
+    let count = files.len();
+    {
+        let mut held = progress.lock().unwrap();
+        *held = Progress {
+            running: true,
+            folder: folder.display().to_string(),
+            file_count: count,
+            ..Progress::default()
+        };
+    }
+    *pending = Some(WebJob {
+        files,
+        file_at: 0,
+        run: None,
+        records: Vec::new(),
+        indexed: 0,
+    });
+    Ok(count)
+}
+
+/// One media item of work, or the move to the next file.
+fn step_job(
+    embedder: &Embedder,
+    ctx: &mut LlamaContext<'_>,
+    store: &mut Store,
+    progress: &Arc<Mutex<Progress>>,
+    job: &mut WebJob,
+) {
+    if job.run.is_none() {
+        if job.file_at >= job.files.len() {
+            progress.lock().unwrap().running = false;
+            return;
+        }
+        let video = job.files[job.file_at].clone();
+        match index::IndexRun::start(&video) {
+            Ok(run) => {
+                let label = normalize_label(&video.to_string_lossy());
+                if let Err(err) = store.forget(&label) {
+                    fail(progress, &err);
+                }
+                let total = run.total();
+                {
+                    let mut held = progress.lock().unwrap();
+                    held.file = label;
+                    held.file_index = job.file_at + 1;
+                    held.window = 0;
+                    held.window_count = total;
+                    held.error = None;
+                }
+                job.records.clear();
+                job.run = Some(run);
+            }
+            Err(err) => {
+                fail(progress, &err);
+                job.file_at += 1;
+            }
+        }
+        return;
+    }
+
+    let outcome = job.run.as_mut().unwrap().step(embedder, ctx);
+    let mut finished = false;
+    match outcome {
+        Ok(Some(record)) => job.records.push(record),
+        Ok(None) => finished = true,
+        Err(err) => {
+            fail(progress, &err);
+            finished = true;
+        }
+    }
+
+    if finished {
+        let records = std::mem::take(&mut job.records);
+        job.indexed += records.len();
+        if let Err(err) = store.append(records) {
+            fail(progress, &err);
+        }
+        job.run = None;
+        job.file_at += 1;
+    } else {
+        let mut held = progress.lock().unwrap();
+        held.window = job.run.as_ref().map(|r| r.done()).unwrap_or(0);
+        held.indexed = job.indexed + job.records.len();
+    }
+}
+
+fn fail(progress: &Arc<Mutex<Progress>>, err: &anyhow::Error) {
+    progress.lock().unwrap().error = Some(format!("{err:#}"));
+}
+
+fn handle_request(
     request: Request,
     jobs: &Sender<Job>,
     progress: &Arc<Mutex<Progress>>,
@@ -771,27 +752,34 @@ fn main() -> Result<()> {
     let store_path = PathBuf::from("store/index.vei");
     let progress = Arc::new(Mutex::new(Progress::default()));
     let (jobs_tx, jobs_rx) = channel::<Job>();
-    let (ready_tx, ready_rx) = channel::<Result<String, String>>();
+    let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+    let key = make_key();
 
     let engine_progress = Arc::clone(&progress);
+    let engine_key = key.clone();
     std::thread::spawn(move || {
-        let engine = match Engine::start(&models, &store_path, engine_progress) {
-            Ok(engine) => engine,
+        let embedder = match Embedder::load(&models) {
+            Ok(embedder) => embedder,
             Err(err) => {
                 let _ = ready_tx.send(Err(format!("{err:#}")));
                 return;
             }
         };
-        // The ready signal carries the video key, so both threads share one value.
-        let _ = ready_tx.send(Ok(engine.key.clone()));
-        engine.run(jobs_rx);
+        let store = match Store::open(&store_path) {
+            Ok(store) => store,
+            Err(err) => {
+                let _ = ready_tx.send(Err(format!("{err:#}")));
+                return;
+            }
+        };
+        let _ = ready_tx.send(Ok(()));
+        engine_loop(embedder, store, engine_progress, engine_key, jobs_rx);
     });
 
-    // The model and the store must be ready before the server answers one call.
-    let key = match ready_rx.recv().context("the engine thread stopped early")? {
-        Ok(key) => key,
+    match ready_rx.recv().context("the engine thread stopped early")? {
+        Ok(()) => {}
         Err(message) => bail!("the engine failed to start: {message}"),
-    };
+    }
 
     let server = Server::http(ADDRESS).map_err(|err| anyhow!("{err}"))?;
     println!("videoembed is at http://{ADDRESS}/");
@@ -803,7 +791,7 @@ fn main() -> Result<()> {
         let progress = Arc::clone(&progress);
         let key = key.clone();
         std::thread::spawn(move || {
-            if let Err(err) = handle(request, &jobs, &progress, &key) {
+            if let Err(err) = handle_request(request, &jobs, &progress, &key) {
                 eprintln!("A request failed: {err:#}");
             }
         });
@@ -897,5 +885,44 @@ mod tests {
         assert_eq!(mime_of(Path::new("a.mp4")), "video/mp4");
         assert_eq!(mime_of(Path::new("a.MKV")), "video/x-matroska");
         assert_eq!(mime_of(Path::new("a.txt")), "application/octet-stream");
+    }
+
+    #[test]
+    fn a_video_row_counts_frames_and_audio_together() {
+        let dir = std::env::temp_dir().join(format!("vei_web_rows_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir.join("index.vei")).unwrap();
+        store
+            .append(vec![
+                Record {
+                    kind: videoembed::store::KIND_FRAME,
+                    label: "a.mp4".into(),
+                    start: 0.0,
+                    end: 0.25,
+                    vec: vec![1.0, 0.0],
+                },
+                Record {
+                    kind: videoembed::store::KIND_AUDIO,
+                    label: "a.mp4".into(),
+                    start: 0.0,
+                    end: 1.0,
+                    vec: vec![1.0, 0.0],
+                },
+                Record {
+                    kind: videoembed::store::KIND_NOTE,
+                    label: "a note".into(),
+                    start: 0.0,
+                    end: 0.0,
+                    vec: vec![1.0, 0.0],
+                },
+            ])
+            .unwrap();
+
+        let rows = videos(&store);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "a.mp4");
+        assert_eq!(rows[0].items, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
