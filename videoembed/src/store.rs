@@ -114,7 +114,7 @@ impl Store {
         self.write()
     }
 
-    /// Remove every window record of one video path.
+    /// Remove every video record of one video path.
     ///
     /// The path separators do not matter, like `holds_video`.
     pub fn forget(&mut self, path: &str) -> Result<usize> {

@@ -1,10 +1,10 @@
-//! The embedding model. Text and window embedding live here.
+//! The embedding model. Text, image, and audio embedding live here.
 //!
-//! A window holds frames and one audio clip. The model must see them together,
-//! in one batch, so that one pooling step covers the whole window.
+//! One call embeds one image or one audio clip. The media and the marker text
+//! go into one batch, so that one pooling step covers the whole item.
 
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use llama_cpp_2::context::LlamaContext;
@@ -103,44 +103,10 @@ impl Embedder {
         unit(ctx.embeddings_seq_ith(0)?)
     }
 
-    /// Make one context. A caller that embeds many windows keeps this context
-    /// and passes it to `embed_window_in`, so the GPU key/value cache stays put.
+    /// Make one context. A caller that embeds many items keeps this context
+    /// and passes it to `embed_image_in`, so the GPU key/value cache stays put.
     pub fn new_context(&self) -> Result<LlamaContext<'_>> {
         Ok(self.model.new_context(&self.backend, context_params())?)
-    }
-
-    /// Embed one window. Frames and audio go into one batch.
-    ///
-    /// This call makes its own context. Use it for one window. A loop uses
-    /// `new_context` and `embed_window_in` instead.
-    pub fn embed_window(&self, frames: &[PathBuf], audio: &Path) -> Result<Vec<f32>> {
-        let mut ctx = self.new_context()?;
-        self.embed_window_in(&mut ctx, frames, audio)
-    }
-
-    /// Embed one window in a caller-owned context.
-    ///
-    /// The context holds the key/value cache of every earlier call. This method
-    /// clears that cache first, so one window never sees another window.
-    pub fn embed_window_in(
-        &self,
-        ctx: &mut LlamaContext<'_>,
-        frames: &[PathBuf],
-        audio: &Path,
-    ) -> Result<Vec<f32>> {
-        ctx.clear_kv_cache();
-        let mut bitmaps = Vec::with_capacity(frames.len() + 1);
-        for frame in frames {
-            let path = frame.to_str().context("frame path is not utf8")?;
-            bitmaps.push(MtmdBitmap::from_file(&self.mtmd, path, false)?);
-        }
-        // A few windows decode to an empty audio clip. Then keep the frames only.
-        let audio_path = audio.to_str().context("audio path is not utf8")?;
-        match MtmdBitmap::from_file(&self.mtmd, audio_path, false) {
-            Ok(bitmap) => bitmaps.push(bitmap),
-            Err(_) => println!("  (no audio for this window)"),
-        }
-        self.embed_joint(ctx, &bitmaps)
     }
 
     /// Embed one image. Returns a unit vector.

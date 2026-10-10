@@ -1,6 +1,6 @@
-//! The folder scan, the window plan, and the progress object.
+//! The folder scan, the frame and audio plan, and the index run.
 //!
-//! One window is 2 s long. The stride is 1 s, so windows overlap.
+//! One frame covers 0.25 s. One audio clip covers 1 s.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,15 +14,9 @@ use crate::embed::Embedder;
 use crate::media;
 use crate::store::{self, Record};
 
-/// Window length in seconds.
-pub const WINDOW: f64 = 2.0;
-/// Window step in seconds.
-pub const STRIDE: f64 = 1.0;
-/// Small slack for the last window near the end of a video.
-pub const EPS: f64 = 0.05;
-/// A window below this score never enters a result group.
+/// An item below this score never enters a result group.
 pub const FLOOR: f32 = 0.4;
-/// The most windows one video may add to one group.
+/// The most items one video may add to one group.
 pub const GROUP_CAP: usize = 50;
 /// The number of frames one ffmpeg call cuts.
 pub const FRAME_BATCH: usize = 120;
@@ -69,7 +63,7 @@ pub struct Progress {
     pub error: Option<String>,
 }
 
-/// One matching window inside a video.
+/// One matching item inside a video.
 #[derive(Clone, Debug, Serialize)]
 pub struct Hit {
     pub start: f32,
@@ -141,18 +135,7 @@ pub fn audio_starts(duration: f64) -> Vec<f64> {
     plan
 }
 
-/// Cut a duration into windows. Each pair is a start and an end.
-pub fn windows(duration: f64) -> Vec<(f64, f64)> {
-    let mut plan = Vec::new();
-    let mut start = 0.0;
-    while start + WINDOW <= duration + EPS {
-        plan.push((start, start + WINDOW));
-        start += STRIDE;
-    }
-    plan
-}
-
-/// A fresh working folder for one window of ffmpeg output.
+/// A fresh working folder for one batch of ffmpeg output.
 pub fn work_dir(at: usize) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -455,7 +438,7 @@ mod tests {
 
     fn record(label: &str, start: f32, end: f32) -> Record {
         Record {
-            kind: crate::store::KIND_WINDOW,
+            kind: crate::store::KIND_FRAME,
             label: label.to_string(),
             start,
             end,
@@ -493,21 +476,6 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].to_string_lossy().contains("doğum günü"));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn windows_cover_a_thirty_second_video() {
-        let plan = windows(30.0);
-        assert_eq!(plan.len(), 29);
-        assert_eq!(plan[0], (0.0, 2.0));
-        assert_eq!(plan[28], (28.0, 30.0));
-    }
-
-    #[test]
-    fn a_video_shorter_than_one_window_has_no_plan() {
-        assert!(windows(1.0).is_empty());
-        assert_eq!(windows(2.0).len(), 1);
-        assert_eq!(windows(5.0).len(), 4);
     }
 
     #[test]
@@ -621,18 +589,21 @@ mod tests {
     ///
     /// `index_video` needs the model, so it has no unit test of its own. This
     /// test pins the callback contract that it obeys: the number counts from 1,
-    /// and it reaches the window count on the last window.
+    /// and it reaches the item count on the last item.
     #[test]
-    fn the_callback_numbering_matches_the_window_plan() {
-        let plan = windows(30.0);
+    fn the_callback_numbering_matches_the_item_plan() {
+        let plan: Vec<f64> = frames(30.0)
+            .into_iter()
+            .chain(audio_starts(30.0))
+            .collect();
         let mut seen: Vec<(usize, usize)> = Vec::new();
         let mut report = |n: usize, total: usize| seen.push((n, total));
         for (n, _) in plan.iter().enumerate() {
             report(n + 1, plan.len());
         }
-        assert_eq!(seen.len(), 29);
-        assert_eq!(seen[0], (1, 29));
-        assert_eq!(seen[28], (29, 29));
+        assert_eq!(seen.len(), 150);
+        assert_eq!(seen[0], (1, 150));
+        assert_eq!(seen[149], (150, 150));
     }
 
     #[test]

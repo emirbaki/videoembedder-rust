@@ -1,9 +1,9 @@
-//! ffmpeg helpers. Cut one window into frames and one wav file.
+//! ffmpeg helpers. Probe a video and cut frames and audio clips.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
 pub const FFMPEG: &str =
     "D:/MLProjelerim/videoembedder-rust/tools/dl/ff/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe";
@@ -179,89 +179,6 @@ fn read_media(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
         .collect();
     files.sort();
     Ok(files)
-}
-
-/// Cut one window into JPEG frames at 1 fps and a 16 kHz mono WAV.
-///
-/// The seek flag comes before the input. The length flag comes after it.
-/// The two ffmpeg calls run together, because each one waits on a process.
-pub fn extract_window(
-    video: &Path,
-    start: f64,
-    end: f64,
-    dir: &Path,
-) -> Result<(Vec<PathBuf>, PathBuf)> {
-    std::fs::create_dir_all(dir)?;
-    let ss = format!("{start}");
-    let span = format!("{}", end - start);
-    let source = video.to_string_lossy().to_string();
-
-    let frames_pattern = dir.join("f%02d.jpg").to_string_lossy().to_string();
-    let frames_args = vec![
-        "-y".into(),
-        "-ss".into(),
-        ss.clone(),
-        "-i".into(),
-        source.clone(),
-        "-t".into(),
-        span.clone(),
-        "-vf".into(),
-        "fps=1".into(),
-        "-q:v".into(),
-        "2".into(),
-        frames_pattern,
-    ];
-
-    let wav = dir.join("clip.wav");
-    let audio_args = vec![
-        "-y".into(),
-        "-ss".into(),
-        ss,
-        "-i".into(),
-        source,
-        "-t".into(),
-        span,
-        "-vn".into(),
-        "-ac".into(),
-        "1".into(),
-        "-ar".into(),
-        "16000".into(),
-        "-f".into(),
-        "wav".into(),
-        wav.to_string_lossy().to_string(),
-    ];
-
-    // Both closures own their argument list, so the two calls do not share state.
-    let (frames_out, audio_out) = std::thread::scope(|scope| {
-        let frames = scope.spawn(move || run_ffmpeg(frames_args, "extracting frames"));
-        let audio = scope.spawn(move || run_ffmpeg(audio_args, "extracting audio"));
-        let f = frames
-            .join()
-            .unwrap_or_else(|_| Err(anyhow!("the frames ffmpeg thread stopped")));
-        let a = audio
-            .join()
-            .unwrap_or_else(|_| Err(anyhow!("the audio ffmpeg thread stopped")));
-        (f, a)
-    });
-    frames_out?;
-    audio_out?;
-
-    Ok((read_frames(dir)?, wav))
-}
-
-/// List the frame files of a window dir in name order.
-pub fn read_frames(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut frames: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| {
-            matches!(
-                p.extension().and_then(|x| x.to_str()),
-                Some("jpg" | "jpeg" | "png")
-            )
-        })
-        .collect();
-    frames.sort();
-    Ok(frames)
 }
 
 #[cfg(test)]
