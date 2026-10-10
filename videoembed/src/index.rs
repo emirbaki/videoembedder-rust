@@ -29,6 +29,12 @@ pub const FRAME_STEP: f64 = 0.25;
 /// The length of one audio clip in seconds.
 pub const AUDIO_SECONDS: f64 = 1.0;
 
+/// The largest gap between two hits that still joins one moment.
+///
+/// The gap is one frame step. Hits of one run of frames touch, so the gap is
+/// zero. A run with one frame missing has a gap of one step.
+pub const MOMENT_GAP: f32 = FRAME_STEP as f32;
+
 /// The median score of one ranked list. An empty list gives 0.0.
 ///
 /// The median is the baseline of the store for one query. A hit shows its
@@ -479,7 +485,46 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
             .collect();
         group.cells.sort_by(|a, b| a.start.total_cmp(&b.start));
     }
+
+    // A run of touching hits reads as one moment. The cap counts moments, not
+    // frames, so one video may show many moments.
+    for group in groups.iter_mut() {
+        let hits = std::mem::take(&mut group.hits);
+        let mut moments = merge_hits(hits);
+        moments.truncate(GROUP_CAP);
+        group.hits = moments;
+    }
     groups
+}
+
+/// Join hits that touch into one moment.
+///
+/// The moment spans the whole run. Its score and its margin come from the best
+/// hit of the run, so a moment never claims more than one hit earned.
+pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
+    if hits.len() < 2 {
+        return hits;
+    }
+    let mut by_time = hits;
+    by_time.sort_by(|a, b| a.start.total_cmp(&b.start));
+
+    let mut moments: Vec<Hit> = Vec::new();
+    for hit in by_time {
+        match moments.last_mut() {
+            Some(last) if hit.start - last.end <= MOMENT_GAP => {
+                if hit.score > last.score {
+                    last.score = hit.score;
+                    last.margin = hit.margin;
+                }
+                if hit.end > last.end {
+                    last.end = hit.end;
+                }
+            }
+            _ => moments.push(hit),
+        }
+    }
+    moments.sort_by(|a, b| b.score.total_cmp(&a.score));
+    moments
 }
 
 #[cfg(test)]
@@ -593,7 +638,10 @@ mod tests {
         assert_eq!(groups[0].video, "b.mp4");
         assert_eq!(groups[0].score, 0.9);
         assert_eq!(groups[0].duration, 8.0);
-        assert_eq!(groups[0].hits.len(), 2);
+        // The two records of b.mp4 touch, so the moment covers the whole run.
+        assert_eq!(groups[0].hits.len(), 1);
+        assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
+        assert!((groups[0].hits[0].end - 8.0).abs() < 1e-6);
         assert_eq!(groups[1].video, "a.mp4");
         assert_eq!(groups[1].hits.len(), 1);
     }
@@ -614,7 +662,13 @@ mod tests {
         let groups = group_hits(&records, &ranked, 0.50);
 
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].hits.len(), 2, "the floor keeps two hits");
+        // Two hits reach the floor. They touch, so they read as one moment
+        // over the whole span. The middle record stays below the floor, and
+        // the moment spans it.
+        assert_eq!(groups[0].hits.len(), 1, "two hits joined into one moment");
+        assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
+        assert!((groups[0].hits[0].end - 0.75).abs() < 1e-6);
+        assert!((groups[0].hits[0].score - 0.80).abs() < 1e-6);
 
         let cells = &groups[0].cells;
         assert_eq!(cells.len(), 3, "the bar needs every record");
@@ -663,8 +717,10 @@ mod tests {
 
     #[test]
     fn group_hits_caps_each_group_at_fifty() {
+        // The records must not touch. Touching records merge into one moment,
+        // and the cap would never bite.
         let records: Vec<Record> = (0..60)
-            .map(|i| record("a.mp4", i as f32, i as f32 + 4.0))
+            .map(|i| record("a.mp4", i as f32 * 10.0, i as f32 * 10.0 + 4.0))
             .collect();
         let ranked: Vec<(usize, f32)> = (0..60).map(|i| (i, 0.9 - i as f32 * 0.001)).collect();
 
@@ -672,7 +728,7 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].hits.len(), 50);
-        assert_eq!(groups[0].duration, 63.0);
+        assert_eq!(groups[0].duration, 594.0);
     }
 
     #[test]
@@ -701,7 +757,9 @@ mod tests {
 
     #[test]
     fn group_hits_reports_the_margin_over_the_baseline() {
-        let records = vec![record("a.mp4", 0.0, 4.0), record("a.mp4", 4.0, 8.0)];
+        // The two records must not touch. Touching records merge, and the
+        // second hit would not exist.
+        let records = vec![record("a.mp4", 0.0, 4.0), record("a.mp4", 10.0, 14.0)];
         let ranked = vec![(1, 0.70), (0, 0.65)];
         let groups = group_hits(&records, &ranked, 0.60);
         assert_eq!(groups[0].hits[0].score, 0.70);
@@ -793,5 +851,85 @@ mod tests {
             run.total() < frames(video_len).len() + audio_starts(format).len(),
             "the plan asks for a clip past the end of the audio track"
         );
+    }
+
+    /// A run of touching frames is one moment, not many hits.
+    #[test]
+    fn touching_hits_join_one_moment() {
+        let hits = vec![
+            Hit { start: 0.0, end: 0.25, score: 0.70, margin: 0.10 },
+            Hit { start: 0.25, end: 0.5, score: 0.80, margin: 0.20 },
+            Hit { start: 0.5, end: 0.75, score: 0.60, margin: 0.05 },
+        ];
+        let moments = merge_hits(hits);
+
+        assert_eq!(moments.len(), 1, "the run is one moment");
+        assert!((moments[0].start - 0.0).abs() < 1e-6);
+        assert!((moments[0].end - 0.75).abs() < 1e-6);
+        assert!((moments[0].score - 0.80).abs() < 1e-6);
+        assert!((moments[0].margin - 0.20).abs() < 1e-6);
+    }
+
+    /// Two runs with a hole between them stay apart.
+    #[test]
+    fn a_gap_of_two_frame_steps_keeps_two_moments() {
+        let hits = vec![
+            Hit { start: 0.0, end: 0.25, score: 0.80, margin: 0.20 },
+            Hit { start: 1.0, end: 1.25, score: 0.70, margin: 0.10 },
+        ];
+        let moments = merge_hits(hits);
+
+        assert_eq!(moments.len(), 2, "the hole splits the run");
+    }
+
+    /// The first hit of the list is the best moment.
+    #[test]
+    fn the_moments_come_back_best_first() {
+        let hits = vec![
+            Hit { start: 0.0, end: 0.25, score: 0.60, margin: 0.01 },
+            Hit { start: 2.0, end: 2.25, score: 0.90, margin: 0.30 },
+        ];
+        let moments = merge_hits(hits);
+
+        assert_eq!(moments.len(), 2);
+        assert!((moments[0].score - 0.90).abs() < 1e-6);
+        assert!((moments[1].score - 0.60).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_hit_stays_one_hit() {
+        let hits = vec![Hit { start: 1.0, end: 1.25, score: 0.5, margin: 0.0 }];
+        assert_eq!(merge_hits(hits).len(), 1);
+        assert!(merge_hits(Vec::new()).is_empty());
+    }
+
+    /// Audio records are 1 s long and they touch, so they join.
+    ///
+    /// A store from before the frame records holds audio only. The merge then
+    /// gives one moment over the whole matching run. That is the honest answer
+    /// for a 1 s grid, so the behaviour is pinned here.
+    #[test]
+    fn touching_audio_hits_join_one_moment() {
+        let hits = vec![
+            Hit { start: 0.0, end: 1.0, score: 0.70, margin: 0.10 },
+            Hit { start: 1.0, end: 2.0, score: 0.75, margin: 0.15 },
+            Hit { start: 2.0, end: 3.0, score: 0.72, margin: 0.12 },
+        ];
+        assert_eq!(merge_hits(hits).len(), 1);
+    }
+
+    /// The merge runs before the cap, so one video may show many moments.
+    #[test]
+    fn a_group_joins_its_run_of_frames_into_one_moment() {
+        let records: Vec<Record> = (0..4)
+            .map(|i| record("a.mp4", i as f32 * 0.25, i as f32 * 0.25 + 0.25))
+            .collect();
+        let ranked = vec![(0, 0.90), (1, 0.85), (2, 0.80), (3, 0.75)];
+        let groups = group_hits(&records, &ranked, 0.50);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hits.len(), 1, "four touching frames make one moment");
+        assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
+        assert!((groups[0].hits[0].end - 1.0).abs() < 1e-6);
     }
 }
