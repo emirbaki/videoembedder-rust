@@ -451,7 +451,7 @@ impl Engine {
         let vec = self.embedder.embed_text(&text).map_err(JobError::from)?;
         let ranked = self.store.rank(&vec);
         Ok(SearchAnswer {
-            groups: index::group_hits(&self.store.records, &ranked),
+            groups: index::group_hits(&self.store.records, &ranked, 0.0),
         })
     }
 

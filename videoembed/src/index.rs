@@ -18,10 +18,6 @@ use crate::store::{self, KIND_WINDOW, Record};
 pub const WINDOW: f64 = 2.0;
 /// Window step in seconds.
 pub const STRIDE: f64 = 1.0;
-/// The fine window length in seconds, for the refine step.
-pub const FINE_WINDOW: f64 = 1.0;
-/// The fine window step in seconds, for the refine step.
-pub const FINE_STRIDE: f64 = 0.5;
 /// Small slack for the last window near the end of a video.
 pub const EPS: f64 = 0.05;
 /// A window below this score never enters a result group.
@@ -30,6 +26,24 @@ pub const FLOOR: f32 = 0.4;
 pub const GROUP_CAP: usize = 50;
 /// The number of cut windows the cutter thread holds ahead of the embedder.
 pub const AHEAD: usize = 4;
+
+/// The median score of one ranked list. An empty list gives 0.0.
+///
+/// The median is the baseline of the store for one query. A hit shows its
+/// score minus this value, because an embedding score alone has no scale.
+pub fn median(ranked: &[(usize, f32)]) -> f32 {
+    if ranked.is_empty() {
+        return 0.0;
+    }
+    let mut scores: Vec<f32> = ranked.iter().map(|(_, score)| *score).collect();
+    scores.sort_by(f32::total_cmp);
+    let n = scores.len();
+    if n % 2 == 1 {
+        scores[n / 2]
+    } else {
+        (scores[n / 2 - 1] + scores[n / 2]) / 2.0
+    }
+}
 
 const VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mkv", "mov", "avi", "webm"];
 
@@ -53,6 +67,7 @@ pub struct Hit {
     pub start: f32,
     pub end: f32,
     pub score: f32,
+    pub margin: f32,
 }
 
 /// The hits of one video.
@@ -102,55 +117,6 @@ pub fn windows(duration: f64) -> Vec<(f64, f64)> {
         start += STRIDE;
     }
     plan
-}
-
-/// The fine windows inside one span. Each pair is a start and an end.
-///
-/// The caller passes a span that already sits inside the video. A span shorter
-/// than one fine window gets one window. An empty span gets none.
-pub fn fine_windows(lo: f64, hi: f64) -> Vec<(f64, f64)> {
-    let mut plan = Vec::new();
-    if hi <= lo {
-        return plan;
-    }
-    let mut start = lo;
-    while start + FINE_WINDOW <= hi + EPS {
-        plan.push((start, start + FINE_WINDOW));
-        start += FINE_STRIDE;
-    }
-    if plan.is_empty() {
-        plan.push((lo, lo + FINE_WINDOW));
-    }
-    plan
-}
-
-/// Refine one hit. Embed the fine windows in the span and keep the best.
-///
-/// `query` is the full prefixed query text, the same text the rank uses.
-/// Returns None when every fine window fails.
-pub fn refine_hit(
-    embedder: &Embedder,
-    video: &Path,
-    query: &str,
-    start: f64,
-    end: f64,
-) -> Result<Option<(f64, f64, f32)>> {
-    let query_vec = embedder.embed_text(query)?;
-    let mut best: Option<(f64, f64, f32)> = None;
-    for (n, (lo, hi)) in fine_windows(start, end).into_iter().enumerate() {
-        let dir = work_dir(n);
-        let outcome = media::extract_window(video, lo, hi, &dir)
-            .and_then(|(frames, audio)| embedder.embed_window(&frames, &audio));
-        let _ = std::fs::remove_dir_all(&dir);
-        let Ok(vec) = outcome else {
-            continue;
-        };
-        let score = crate::embed::dot(&query_vec, &vec);
-        if best.map(|held| score > held.2).unwrap_or(true) {
-            best = Some((lo, hi, score));
-        }
-    }
-    Ok(best)
 }
 
 /// A fresh working folder for one window of ffmpeg output.
@@ -219,10 +185,10 @@ pub fn index_video(
 /// Group the ranked records by video.
 ///
 /// `ranked` comes from `Store::rank`, so it is sorted by score, best first.
-pub fn group_hits(records: &[Record], ranked: &[(usize, f32)]) -> Vec<Group> {
+pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) -> Vec<Group> {
     let mut durations: HashMap<&str, f32> = HashMap::new();
     for record in records {
-        if record.kind != KIND_WINDOW {
+        if !crate::store::is_video(record.kind) {
             continue;
         }
         let held = durations.entry(record.label.as_str()).or_insert(0.0);
@@ -237,13 +203,14 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)]) -> Vec<Group> {
             break;
         }
         let record = &records[*index];
-        if record.kind != KIND_WINDOW {
+        if !crate::store::is_video(record.kind) {
             continue;
         }
         let hit = Hit {
             start: record.start,
             end: record.end,
             score: *score,
+            margin: *score - baseline,
         };
         match groups.iter_mut().find(|g| g.video == record.label) {
             Some(group) => {
@@ -337,25 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn fine_windows_step_a_four_second_span() {
-        let plan = fine_windows(0.0, 4.0);
-        assert_eq!(plan.len(), 7);
-        assert_eq!(plan[0], (0.0, 1.0));
-        assert_eq!(plan[6], (3.0, 4.0));
-    }
-
-    #[test]
-    fn a_span_shorter_than_the_fine_window_gets_one_window() {
-        assert_eq!(fine_windows(5.0, 5.6), vec![(5.0, 6.0)]);
-    }
-
-    #[test]
-    fn an_empty_span_has_no_fine_window() {
-        assert!(fine_windows(4.0, 4.0).is_empty());
-        assert!(fine_windows(4.0, 3.0).is_empty());
-    }
-
-    #[test]
     fn the_progress_object_matches_the_spec() {
         let json = serde_json::to_value(Progress::default()).unwrap();
         assert_eq!(json["running"], false);
@@ -374,7 +322,7 @@ mod tests {
         ];
         let ranked = vec![(2, 0.9), (3, 0.7), (0, 0.5), (1, 0.2)];
 
-        let groups = group_hits(&records, &ranked);
+        let groups = group_hits(&records, &ranked, 0.0);
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].video, "b.mp4");
@@ -392,7 +340,7 @@ mod tests {
             .collect();
         let ranked: Vec<(usize, f32)> = (0..60).map(|i| (i, 0.9 - i as f32 * 0.001)).collect();
 
-        let groups = group_hits(&records, &ranked);
+        let groups = group_hits(&records, &ranked, 0.0);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].hits.len(), 50);
@@ -402,8 +350,35 @@ mod tests {
     #[test]
     fn group_hits_returns_nothing_when_every_score_is_below_the_floor() {
         let records = vec![record("a.mp4", 0.0, 4.0)];
-        assert!(group_hits(&records, &[(0, 0.39)]).is_empty());
-        assert!(group_hits(&[], &[]).is_empty());
+        assert!(group_hits(&records, &[(0, 0.39)], 0.0).is_empty());
+        assert!(group_hits(&[], &[], 0.0).is_empty());
+    }
+
+    #[test]
+    fn the_median_of_an_odd_list_is_the_middle_value() {
+        let ranked = vec![(0, 0.1), (1, 0.9), (2, 0.5)];
+        assert!((median(&ranked) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_median_of_an_even_list_is_the_middle_pair() {
+        let ranked = vec![(0, 0.1), (1, 0.3), (2, 0.5), (3, 0.9)];
+        assert!((median(&ranked) - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_median_of_an_empty_list_is_zero() {
+        assert_eq!(median(&[]), 0.0);
+    }
+
+    #[test]
+    fn group_hits_reports_the_margin_over_the_baseline() {
+        let records = vec![record("a.mp4", 0.0, 4.0), record("a.mp4", 4.0, 8.0)];
+        let ranked = vec![(1, 0.70), (0, 0.65)];
+        let groups = group_hits(&records, &ranked, 0.60);
+        assert_eq!(groups[0].hits[0].score, 0.70);
+        assert!((groups[0].hits[0].margin - 0.10).abs() < 1e-6);
+        assert!((groups[0].hits[1].margin - 0.05).abs() < 1e-6);
     }
 
     /// A contract pin for `index_video`.
