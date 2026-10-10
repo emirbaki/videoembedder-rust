@@ -5,14 +5,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
+use llama_cpp_2::context::LlamaContext;
 use serde::Serialize;
 
 use crate::embed::Embedder;
 use crate::media;
-use crate::store::{self, KIND_WINDOW, Record};
+use crate::store::{self, Record};
 
 /// Window length in seconds.
 pub const WINDOW: f64 = 2.0;
@@ -24,8 +24,10 @@ pub const EPS: f64 = 0.05;
 pub const FLOOR: f32 = 0.4;
 /// The most windows one video may add to one group.
 pub const GROUP_CAP: usize = 50;
-/// The number of cut windows the cutter thread holds ahead of the embedder.
-pub const AHEAD: usize = 4;
+/// The number of frames one ffmpeg call cuts.
+pub const FRAME_BATCH: usize = 120;
+/// The number of audio clips one ffmpeg call cuts.
+pub const AUDIO_BATCH: usize = 60;
 /// Frames a second in the frame plan.
 pub const FRAME_RATE: f64 = 4.0;
 /// The time step between two frames in seconds.
@@ -157,59 +159,218 @@ pub fn work_dir(at: usize) -> PathBuf {
     std::env::temp_dir().join(format!("vei_{}_{n}_{at}", std::process::id()))
 }
 
-/// Index one video. Embed every window and return its records.
+/// The phase of an index run.
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    Frames,
+    Audio,
+    Done,
+}
+
+/// A stepwise index run for one video.
 ///
-/// The callback runs after each window with the window number, counting from 1,
-/// and the window count of the whole video.
+/// The run cuts media in batches, so the temp disk stays bounded. The caller
+/// drives it: one `step` call embeds one frame or one audio clip.
+pub struct IndexRun {
+    video: PathBuf,
+    label: String,
+    duration: f64,
+    frames: Vec<f64>,
+    audios: Vec<f64>,
+    frame_at: usize,
+    audio_at: usize,
+    phase: Phase,
+    dir: PathBuf,
+    files: Vec<PathBuf>,
+    batch_from: usize,
+    done: usize,
+}
+
+impl IndexRun {
+    /// Probe the video and build the frame and the audio plan.
+    pub fn start(video: &Path) -> Result<Self> {
+        let duration = media::probe_duration(video)?;
+        let frames = frames(duration);
+        if frames.is_empty() {
+            bail!("{} is shorter than one frame", video.display());
+        }
+        Ok(Self {
+            video: video.to_path_buf(),
+            label: store::normalize_label(&video.to_string_lossy()),
+            duration,
+            frames,
+            audios: audio_starts(duration),
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::new(),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+        })
+    }
+
+    /// The number of records this run will make.
+    pub fn total(&self) -> usize {
+        self.frames.len() + self.audios.len()
+    }
+
+    /// The number of records made so far.
+    pub fn done(&self) -> usize {
+        self.done
+    }
+
+    /// Embed one item. Returns None when the run is complete.
+    pub fn step(
+        &mut self,
+        embedder: &Embedder,
+        ctx: &mut LlamaContext<'_>,
+    ) -> Result<Option<Record>> {
+        if self.phase == Phase::Done {
+            return Ok(None);
+        }
+        if self.remaining_in_batch() == 0 {
+            self.cut_batch()?;
+            if self.phase == Phase::Done {
+                return Ok(None);
+            }
+        }
+        let local = self.at() - self.batch_from;
+        let path = self.files[local].clone();
+        let start = self.at_time();
+        let (kind, end, vec) = match self.phase {
+            Phase::Frames => (
+                store::KIND_FRAME,
+                start + FRAME_STEP,
+                embedder.embed_image_in(ctx, &path)?,
+            ),
+            Phase::Audio => (
+                store::KIND_AUDIO,
+                start + AUDIO_SECONDS,
+                embedder.embed_audio_in(ctx, &path)?,
+            ),
+            Phase::Done => unreachable!(),
+        };
+        self.advance();
+        self.done += 1;
+        Ok(Some(Record {
+            kind,
+            label: self.label.clone(),
+            start: start as f32,
+            end: end.min(self.duration) as f32,
+            vec,
+        }))
+    }
+
+    fn plan(&self) -> &[f64] {
+        match self.phase {
+            Phase::Frames => &self.frames,
+            Phase::Audio => &self.audios,
+            Phase::Done => &[],
+        }
+    }
+
+    fn at(&self) -> usize {
+        match self.phase {
+            Phase::Frames => self.frame_at,
+            Phase::Audio => self.audio_at,
+            Phase::Done => 0,
+        }
+    }
+
+    fn at_time(&self) -> f64 {
+        self.plan().get(self.at()).copied().unwrap_or(0.0)
+    }
+
+    fn remaining_in_batch(&self) -> usize {
+        self.files.len().saturating_sub(self.at() - self.batch_from)
+    }
+
+    fn advance(&mut self) {
+        match self.phase {
+            Phase::Frames => {
+                self.frame_at += 1;
+                if self.frame_at >= self.frames.len() {
+                    self.phase = Phase::Audio;
+                    self.audio_at = 0;
+                    self.files.clear();
+                    self.batch_from = 0;
+                }
+            }
+            Phase::Audio => {
+                self.audio_at += 1;
+                if self.audio_at >= self.audios.len() {
+                    self.phase = Phase::Done;
+                }
+            }
+            Phase::Done => {}
+        }
+    }
+
+    fn cut_batch(&mut self) -> Result<()> {
+        self.clear_dir();
+        if self.phase == Phase::Done {
+            return Ok(());
+        }
+        let at = self.at();
+        let (count, step) = match self.phase {
+            Phase::Frames => (FRAME_BATCH, FRAME_STEP),
+            Phase::Audio => (AUDIO_BATCH, AUDIO_SECONDS),
+            Phase::Done => unreachable!(),
+        };
+        let from = self.plan()[at];
+        let last = (at + count).min(self.plan().len()) - 1;
+        let to = (self.plan()[last] + step).min(self.duration);
+        self.dir = work_dir(at);
+        std::fs::create_dir_all(&self.dir)?;
+        self.files = match self.phase {
+            Phase::Frames => media::extract_frames(&self.video, from, to, FRAME_RATE, &self.dir)?,
+            Phase::Audio => media::extract_audio(&self.video, from, to, &self.dir)?,
+            Phase::Done => unreachable!(),
+        };
+        self.batch_from = at;
+        if self.files.is_empty() {
+            if self.phase == Phase::Audio {
+                // A video without an audio track is normal.
+                self.phase = Phase::Done;
+                return Ok(());
+            }
+            bail!("no frames came from {}", self.video.display());
+        }
+        Ok(())
+    }
+
+    fn clear_dir(&mut self) {
+        if !self.dir.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+        self.files.clear();
+    }
+}
+
+impl Drop for IndexRun {
+    fn drop(&mut self) {
+        self.clear_dir();
+    }
+}
+
+/// Index one video. Embed every frame and every audio clip.
 ///
-/// One thread cuts the windows ahead of this thread. The cut for window n+1
-/// then overlaps the embed for window n. Each cut holds its own folder, and the
-/// cutter sends that folder with the frames, so both sides agree on the path.
+/// The callback runs after each record with the number made so far, counting
+/// from 1, and the record count of the whole video.
 pub fn index_video(
     embedder: &Embedder,
     video: &Path,
-    on_window: &mut dyn FnMut(usize, usize),
+    on_step: &mut dyn FnMut(usize, usize),
 ) -> Result<Vec<Record>> {
-    let duration = media::probe_duration(video)?;
-    let plan = windows(duration);
-    if plan.is_empty() {
-        bail!("{} is shorter than one window", video.display());
-    }
-    let label = store::normalize_label(&video.to_string_lossy());
-    let total = plan.len();
-
-    /// One cut window: its folder, its frames, and its audio.
-    type Cut = (PathBuf, Vec<PathBuf>, PathBuf);
-
-    let (sender, receiver) = mpsc::sync_channel::<(usize, f64, f64, Result<Cut>)>(AHEAD);
-    let source = video.to_path_buf();
-    let cutter = std::thread::spawn(move || {
-        for (n, (start, end)) in plan.into_iter().enumerate() {
-            let dir = work_dir(n);
-            let cut = media::extract_window(&source, start, end, &dir)
-                .map(|(frames, audio)| (dir, frames, audio));
-            if sender.send((n, start, end, cut)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut records = Vec::with_capacity(total);
+    let mut run = IndexRun::start(video)?;
+    let total = run.total();
     let mut ctx = embedder.new_context()?;
-    for (n, start, end, cut) in receiver {
-        let (dir, frames, audio) = cut?;
-        let vec = embedder.embed_window_in(&mut ctx, &frames, &audio)?;
-        let _ = std::fs::remove_dir_all(&dir);
-        records.push(Record {
-            kind: KIND_WINDOW,
-            label: label.clone(),
-            start: start as f32,
-            end: end as f32,
-            vec,
-        });
-        on_window(n + 1, total);
+    let mut records = Vec::with_capacity(total);
+    while let Some(record) = run.step(embedder, &mut ctx)? {
+        records.push(record);
+        on_step(run.done(), total);
     }
-    let _ = cutter.join();
     Ok(records)
 }
 
@@ -279,7 +440,7 @@ mod tests {
 
     fn record(label: &str, start: f32, end: f32) -> Record {
         Record {
-            kind: KIND_WINDOW,
+            kind: crate::store::KIND_WINDOW,
             label: label.to_string(),
             start,
             end,
@@ -457,5 +618,20 @@ mod tests {
         assert_eq!(seen.len(), 29);
         assert_eq!(seen[0], (1, 29));
         assert_eq!(seen[28], (29, 29));
+    }
+
+    #[test]
+    fn start_counts_the_frames_and_the_audio_clips_of_the_test_video() {
+        let video =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../spike/testvideo_nolabels.mp4");
+        if !video.exists() || !Path::new(crate::media::FFPROBE).exists() {
+            eprintln!("skipped: ffprobe or the test video is missing");
+            return;
+        }
+        let run = IndexRun::start(&video).unwrap();
+        let d = crate::media::probe_duration(&video).unwrap();
+        let want = frames(d).len() + audio_starts(d).len();
+        assert_eq!(run.total(), want);
+        assert!(run.total() > 100, "got {}", run.total());
     }
 }
