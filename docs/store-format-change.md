@@ -89,13 +89,12 @@ keep consistent.
 
 **Shape C, an embedded database.** A store such as SQLite with a vector
 extension, or `redb` with a vector index crate. It brings transactions, ids,
-and a mature format. It also brings a new dependency, a build step on Windows,
-and a migration for every existing store. The project rule is one binary with
-CUDA as an option, so a heavy dependency works against that rule.
+and a mature format. It also brings a new dependency, a wider file set, and a migration for every
+existing store. A database holds no vector type, so the search stays ours.
 
 | | A: flat file v2 | B: log and sidecar | C: embedded database |
 | --- | --- | --- | --- |
-| New dependency | none | none | one, with a C build |
+| New dependency | none | none | one crate, and a wider file set |
 | Format change | small | medium | large |
 | Append cost | full rewrite | one record | one record |
 | Delete by id | yes, with a rewrite | yes, cheap | yes |
@@ -104,32 +103,81 @@ CUDA as an option, so a heavy dependency works against that rule.
 | Migration of an old store | a read of `VEI1`, then a write of `VEI2` | same | a full import |
 | Risk | low | medium | high |
 
-## 6. The recommendation
+## 6. Why SQLite is the risk it is
 
-Shape A now, and shape B when a store passes a size where one rewrite hurts.
+Google chose SQLite. The comparison doc records the shape: the app stores
+through a MediaPipe `SqliteVectorStore`, in the table `rag_vector_store`, and
+the record id is `"<projectId>/<startTimeMs>-<endTimeMs>"`
+(`docs/google-gallery-comparison.md` section 2.3). The reason fits Google's
+case, and it does not transfer to this one.
 
-The reasons: the items in scope need fields, not a new engine. Shape A adds the
-fields and keeps every current test. The spec puts the ANN index and the shard
-work in Route B, so the store stays a single file for the local tool. The fp16
-vector lands inside shape A, and it halves the disk and the memory at once.
+Why Google took it:
 
-Shape B waits for one of two signals: a store that holds several long videos,
-or a delete that must not rewrite the file. Shape C waits for a server, where
-transactions and many writers matter.
+1. SQLite is part of Android, so the app adds no library for the store.
+2. The id holds the project and the time range, so a second pass over one video
+   overwrites the same rows. That is an upsert with no bookkeeping.
+3. A delete on the id prefix removes the records of one project in one call.
+4. A filter on `parent_id` scopes a search to one project.
 
-## 7. Open questions
+Why the same choice costs this project:
+
+| Risk | Detail | Weight |
+| --- | --- | --- |
+| The search does not get faster | SQLite holds no vector type. The engine still scores every row. The brute force and the ANN work stay with us in every shape. | High |
+| Every store call site changes | `open`, `append`, `forget`, `rank`, and the finished list move to SQL. The current tests need a rewrite, not an edit. | Medium |
+| The file set widens | A database brings its own file, plus a journal or a write-ahead log. The store holds two files today (`index.vei` and `index.done`), and it would hold four or five. | Medium |
+| The migration | Every existing store must import. A fault in the middle leaves two stores, and the run must know which one serves. | Medium |
+| A new crate to audit | `rusqlite` reaches SQLite through C. The toolchain is already here, because llama.cpp builds with CMake and a C++ compiler. | Low |
+
+Notice two facts. The store is two files today, so a wider file set is not a new
+idea for this project. And the build step is the weakest of the five reasons,
+because the C toolchain is already in the build. The sharpest reason is the
+first: SQLite buys the writes, and it buys nothing for the search.
+
+## 7. The alternatives, if the one-file rule goes
+
+The real fork is not the file count. The fork is which layer owns the vectors.
+
+| Alternative | What it gives | Cost |
+| --- | --- | --- |
+| SQLite, with a vector extension | An id, an upsert, a prefix delete, and a vector search | One crate, an extension build, a wider file set |
+| A pure-Rust key-value store (`redb` or `sled`), plus an ANN crate | No C, transactions, a real index | Two crates, and our own layout for the vectors |
+| A memory-mapped vector file, plus an ANN crate (`hnsw_rs` or `usearch`) | The file format stays ours, and the search scales | We build the metadata side: id, plan, finished list |
+| A columnar vector format (Lance) | A format made for vectors, with an ANN path | A large dependency, and an unfamiliar file |
+| DuckDB, with a vector extension | SQL, plus an index | A large dependency, and a server-grade engine |
+
+If the count stays under about one million records, brute force holds, and the
+shape is only about the writes and the metadata. The spec names that line: brute
+force is fine to about one million vectors
+(`docs/superpowers/specs/2026-10-10-videoembed-product-routes.md:121`). If the
+count passes it, the ANN crate decides the design, and the database behind it is
+the smaller choice.
+
+## 8. The recommendation
+
+Shape A now. Shape B when one of two signals arrives: a store that holds several
+long videos, or a delete that must not rewrite the file. Shape C only when the
+search needs an index, and then the choice of the index crate matters more than
+the choice of the database.
+
+The reason for A: the four items need fields, not a new engine. Shape A adds the
+fields and keeps every current test. The fp16 vector lands in the same change,
+and it halves the disk and the memory at once.
+
+## 9. Open questions
 
 1. Which shape: A, B, or C?
-2. Does window mode land in the same change, or after the format is done? Two
+2. Does the store stay one file, or does the file set widen?
+3. Does window mode land in the same change, or after the format is done? Two
    steps are safer, because the format change alone is testable on its own.
-3. Does the store need a source fingerprint (size and mtime)? Today a changed
+4. Does the store need a source fingerprint (size and mtime)? Today a changed
    file with the same path stays marked as finished, so the run skips it.
-4. Do the plans repeat inside every record, or do they get one row for each
+5. Do the plans repeat inside every record, or do they get one row for each
    video?
-5. Does the `.done` list fold into the store in shape A too, or does it stay a
+6. Does the `.done` list fold into the store in shape A too, or does it stay a
    sidecar until shape B?
 
-## 8. What stays the same
+## 10. What stays the same
 
 - The label rule, `normalize_label`, and the slash form of a path.
 - The kind list, and `is_video`.
