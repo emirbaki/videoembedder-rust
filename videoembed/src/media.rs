@@ -163,7 +163,41 @@ pub fn extract_audio(video: &Path, from: f64, to: f64, dir: &Path) -> Result<Vec
         pattern,
     ];
     run_ffmpeg(args, "extracting audio")?;
-    read_media(dir, &["wav"])
+    let found = read_media(dir, &["wav"])?;
+    // Drop a segment with no samples, so the index skips it instead of
+    // stopping on it.
+    let mut kept = Vec::new();
+    for path in found {
+        match std::fs::read(&path) {
+            Ok(bytes) if wav_has_samples(&bytes) => kept.push(path),
+            Ok(_) => {}
+            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+        }
+    }
+    Ok(kept)
+}
+
+/// True when a wav file holds audio samples.
+///
+/// The data chunk size tells the truth. The stream duration of a video does
+/// not always do so, and a cut past the real end of the audio gives a file
+/// with a header and no samples.
+fn wav_has_samples(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(512)];
+    let Some(at) = head.windows(4).position(|window| window == b"data") else {
+        return false;
+    };
+    let size_at = at + 4;
+    if size_at + 4 > head.len() {
+        return false;
+    }
+    let size = u32::from_le_bytes([
+        head[size_at],
+        head[size_at + 1],
+        head[size_at + 2],
+        head[size_at + 3],
+    ]);
+    size > 0
 }
 
 /// List the files of one dir with one of the given extensions, in name order.
@@ -184,6 +218,33 @@ fn read_media(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wav with an empty data chunk holds no audio.
+    ///
+    /// ffmpeg writes such a file when a cut lands past the real end of the
+    /// audio. The encoder refuses the file, and the index run stops.
+    #[test]
+    fn a_wav_with_no_samples_is_refused() {
+        let mut empty = Vec::new();
+        empty.extend_from_slice(b"RIFF");
+        empty.extend_from_slice(&34u32.to_le_bytes());
+        empty.extend_from_slice(b"WAVEfmt ");
+        empty.extend_from_slice(&[0u8; 12]);
+        empty.extend_from_slice(b"data");
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        assert!(!wav_has_samples(&empty));
+
+        let mut full = empty.clone();
+        let at = full.len() - 4;
+        full[at..].copy_from_slice(&32000u32.to_le_bytes());
+        assert!(wav_has_samples(&full));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_wav_holds_no_samples() {
+        assert!(!wav_has_samples(b""));
+        assert!(!wav_has_samples(b"not a wav at all"));
+    }
 
     fn ready() -> bool {
         Path::new(FFMPEG).exists() && Path::new(FFPROBE).exists()
