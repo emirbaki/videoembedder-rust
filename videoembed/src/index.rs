@@ -26,6 +26,12 @@ pub const FLOOR: f32 = 0.4;
 pub const GROUP_CAP: usize = 50;
 /// The number of cut windows the cutter thread holds ahead of the embedder.
 pub const AHEAD: usize = 4;
+/// Frames a second in the frame plan.
+pub const FRAME_RATE: f64 = 4.0;
+/// The time step between two frames in seconds.
+pub const FRAME_STEP: f64 = 0.25;
+/// The length of one audio clip in seconds.
+pub const AUDIO_SECONDS: f64 = 1.0;
 
 /// The median score of one ranked list. An empty list gives 0.0.
 ///
@@ -106,6 +112,31 @@ pub fn is_video(path: &Path) -> bool {
         .and_then(|part| part.to_str())
         .map(|part| VIDEO_EXTENSIONS.contains(&part.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// The start time of every frame. One frame each 0.25 s.
+///
+/// A frame needs its full step inside the video. A video shorter than one step
+/// has no frame, so a caller refuses it.
+pub fn frames(duration: f64) -> Vec<f64> {
+    let mut plan = Vec::new();
+    let mut t = 0.0;
+    while t + FRAME_STEP <= duration {
+        plan.push(t);
+        t += FRAME_STEP;
+    }
+    plan
+}
+
+/// The start time of every one-second audio clip.
+pub fn audio_starts(duration: f64) -> Vec<f64> {
+    let mut plan = Vec::new();
+    let mut t = 0.0;
+    while t + AUDIO_SECONDS <= duration {
+        plan.push(t);
+        t += AUDIO_SECONDS;
+    }
+    plan
 }
 
 /// Cut a duration into windows. Each pair is a start and an end.
@@ -301,6 +332,35 @@ mod tests {
         assert!(windows(1.0).is_empty());
         assert_eq!(windows(2.0).len(), 1);
         assert_eq!(windows(5.0).len(), 4);
+    }
+
+    #[test]
+    fn frames_cover_a_thirty_second_video_at_four_a_second() {
+        let plan = frames(30.0);
+        assert_eq!(plan.len(), 120);
+        assert_eq!(plan[0], 0.0);
+        assert!((plan[1] - 0.25).abs() < 1e-9);
+        assert!((plan[119] - 29.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_video_shorter_than_one_frame_has_no_frame() {
+        assert!(frames(0.2).is_empty());
+        assert_eq!(frames(0.25).len(), 1);
+    }
+
+    #[test]
+    fn audio_starts_cover_a_thirty_second_video() {
+        let plan = audio_starts(30.0);
+        assert_eq!(plan.len(), 30);
+        assert_eq!(plan[0], 0.0);
+        assert_eq!(plan[29], 29.0);
+    }
+
+    #[test]
+    fn a_video_shorter_than_one_second_has_no_audio_clip() {
+        assert!(audio_starts(0.5).is_empty());
+        assert_eq!(audio_starts(1.0).len(), 1);
     }
 
     #[test]
