@@ -143,6 +143,31 @@ impl Embedder {
         self.embed_joint(ctx, &bitmaps)
     }
 
+    /// Embed one image. Returns a unit vector.
+    ///
+    /// This call makes its own context. Use it for one image. A loop uses
+    /// `new_context` and `embed_image_in` instead.
+    pub fn embed_image(&self, frame: &Path) -> Result<Vec<f32>> {
+        let mut ctx = self.new_context()?;
+        self.embed_image_in(&mut ctx, frame)
+    }
+
+    /// Embed one image in a caller-owned context.
+    pub fn embed_image_in(&self, ctx: &mut LlamaContext<'_>, frame: &Path) -> Result<Vec<f32>> {
+        ctx.clear_kv_cache();
+        let path = frame.to_str().context("frame path is not utf8")?;
+        let bitmap = MtmdBitmap::from_file(&self.mtmd, path, false)?;
+        self.embed_joint(ctx, &[bitmap])
+    }
+
+    /// Embed one audio clip in a caller-owned context.
+    pub fn embed_audio_in(&self, ctx: &mut LlamaContext<'_>, clip: &Path) -> Result<Vec<f32>> {
+        ctx.clear_kv_cache();
+        let path = clip.to_str().context("audio path is not utf8")?;
+        let bitmap = MtmdBitmap::from_file(&self.mtmd, path, false)?;
+        self.embed_joint(ctx, &[bitmap])
+    }
+
     /// One batch holds every token and every media row. One decode follows.
     fn embed_joint(&self, ctx: &mut LlamaContext<'_>, bitmaps: &[MtmdBitmap]) -> Result<Vec<f32>> {
         let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
