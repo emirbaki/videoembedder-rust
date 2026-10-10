@@ -103,19 +103,27 @@ function showProgress(p) {
   $("progress").hidden = !p.running && p.indexed === 0 && !p.error;
   const width = p.window_count > 0 ? (p.window * 100) / p.window_count : 0;
   $("progress-bar").style.width = width + "%";
+  // The speed line is set first, so an error cannot leave stale text.
+  $("speed").textContent = p.elapsed_ms > 0
+    ? ((p.elapsed_ms / 1000).toFixed(1) + " s of work, " + p.backend)
+    : "";
 
   if (p.error !== null) {
     $("progress-text").textContent = p.error;
     return;
   }
   if (p.running) {
+    const rate = p.per_second > 0 ? " - " + p.per_second.toFixed(2) + " items a second" : "";
     $("progress-text").textContent =
       "File " + p.file_index + "/" + p.file_count +
       ", item " + p.window + "/" + p.window_count +
-      " - " + p.file;
-    return;
+      " - " + p.file + rate;
+  } else {
+    const rate = p.per_second > 0 ? " at " + p.per_second.toFixed(2) + " items a second" : "";
+    $("progress-text").textContent =
+      "Done. " + p.indexed + " records indexed" + rate +
+      ". " + p.backend + ", model load " + p.load_ms + " ms.";
   }
-  $("progress-text").textContent = "Done. " + p.indexed + " records indexed.";
 }
 
 async function pollProgress() {

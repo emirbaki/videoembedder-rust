@@ -19,6 +19,11 @@ use videoembed::store::{Record, Store, normalize_label};
 type Reply = Response<Box<dyn Read + Send>>;
 
 const ADDRESS: &str = "127.0.0.1:8787";
+/// The compute backend of this build. The page shows the name.
+#[cfg(feature = "cuda")]
+const BACKEND: &str = "CUDA";
+#[cfg(not(feature = "cuda"))]
+const BACKEND: &str = "CPU";
 /// The most bytes one request body may hold.
 const MAX_BODY: usize = 1024 * 1024;
 const PAGE: &str = include_str!("../../assets/index.html");
@@ -352,6 +357,7 @@ struct WebJob {
     run: Option<index::IndexRun>,
     records: Vec<Record>,
     indexed: usize,
+    started: std::time::Instant,
 }
 
 /// Group the store records by video path. Every video kind counts.
@@ -491,6 +497,7 @@ fn start_index(
             running: true,
             folder: folder.display().to_string(),
             file_count: count,
+            backend: BACKEND.to_string(),
             ..Progress::default()
         };
     }
@@ -500,6 +507,7 @@ fn start_index(
         run: None,
         records: Vec::new(),
         indexed: 0,
+        started: std::time::Instant::now(),
     });
     Ok(count)
 }
@@ -556,9 +564,13 @@ fn step_job(
         job.run = None;
         job.file_at += 1;
     } else {
+        let done = job.indexed + job.records.len();
+        let seconds = job.started.elapsed().as_secs_f64();
         let mut held = progress.lock().unwrap();
         held.window = job.run.as_ref().map(|r| r.done()).unwrap_or(0);
-        held.indexed = job.indexed + job.records.len();
+        held.indexed = done;
+        held.elapsed_ms = (seconds * 1000.0) as u64;
+        held.per_second = index::per_second(done, seconds);
     }
 }
 
@@ -762,6 +774,7 @@ fn main() -> Result<()> {
     let engine_progress = Arc::clone(&progress);
     let engine_key = key.clone();
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let embedder = match Embedder::load(&models) {
             Ok(embedder) => embedder,
             Err(err) => {
@@ -769,6 +782,12 @@ fn main() -> Result<()> {
                 return;
             }
         };
+        let load_ms = started.elapsed().as_millis() as u64;
+        {
+            let mut held = engine_progress.lock().unwrap();
+            held.backend = BACKEND.to_string();
+            held.load_ms = load_ms;
+        }
         let store = match Store::open(&store_path) {
             Ok(store) => store,
             Err(err) => {

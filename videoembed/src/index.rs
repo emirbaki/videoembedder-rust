@@ -67,6 +67,14 @@ pub struct Progress {
     pub window_count: usize,
     pub indexed: usize,
     pub error: Option<String>,
+    /// The compute backend of this build, "CPU" or "CUDA".
+    pub backend: String,
+    /// The milliseconds to load the model.
+    pub load_ms: u64,
+    /// The milliseconds of the running job.
+    pub elapsed_ms: u64,
+    /// The items of the running job for each second.
+    pub per_second: f32,
 }
 
 /// One matching item inside a video.
@@ -394,6 +402,16 @@ pub fn index_video(
         on_step(run.done(), total);
     }
     Ok(records)
+}
+
+/// The items of one job for each second.
+///
+/// A time of zero or less gives 0.0, so a fast job cannot divide by zero.
+pub fn per_second(items: usize, seconds: f64) -> f32 {
+    if seconds <= 0.0 {
+        return 0.0;
+    }
+    (items as f64 / seconds) as f32
 }
 
 /// Group the ranked records by video.
@@ -931,5 +949,29 @@ mod tests {
         assert_eq!(groups[0].hits.len(), 1, "four touching frames make one moment");
         assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
         assert!((groups[0].hits[0].end - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_rate_is_items_a_second() {
+        assert!((per_second(20, 10.0) - 2.0).abs() < 1e-6);
+        assert!((per_second(207, 29.0) - 7.137_931).abs() < 1e-4);
+    }
+
+    /// A zero time must not divide by zero.
+    #[test]
+    fn a_zero_time_gives_a_zero_rate() {
+        assert_eq!(per_second(10, 0.0), 0.0);
+        assert_eq!(per_second(10, -1.0), 0.0);
+        assert_eq!(per_second(0, 10.0), 0.0);
+    }
+
+    /// The page reads these fields, so the shape is a contract.
+    #[test]
+    fn the_progress_carries_the_speed_fields() {
+        let json = serde_json::to_value(Progress::default()).unwrap();
+        assert_eq!(json["backend"], "");
+        assert_eq!(json["load_ms"], 0);
+        assert_eq!(json["elapsed_ms"], 0);
+        assert_eq!(json["per_second"], 0.0);
     }
 }
