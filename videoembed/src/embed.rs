@@ -25,6 +25,32 @@ const N_CTX: u32 = 8192;
 const N_BATCH: u32 = 8192;
 const N_UBATCH: u32 = 2048;
 
+/// Offload every layer of the text model to the GPU.
+///
+/// The value sits above the layer count, so llama.cpp keeps every layer on the
+/// card. A build without the `cuda` feature ignores it.
+const N_GPU_LAYERS: u32 = 999;
+
+/// The model parameters. A `cuda` build offloads every layer.
+fn model_params() -> LlamaModelParams {
+    let base = LlamaModelParams::default();
+    if cfg!(feature = "cuda") {
+        base.with_n_gpu_layers(N_GPU_LAYERS)
+    } else {
+        base
+    }
+}
+
+/// The multimodal parameters. A `cuda` build runs the media encoder on the GPU.
+fn mtmd_params() -> MtmdContextParams {
+    MtmdContextParams {
+        use_gpu: cfg!(feature = "cuda"),
+        n_threads: 8,
+        print_timings: false,
+        ..Default::default()
+    }
+}
+
 fn context_params() -> LlamaContextParams {
     LlamaContextParams::default()
         .with_embeddings(true)
@@ -49,18 +75,13 @@ impl Embedder {
         let model = LlamaModel::load_from_file(
             &backend,
             &models.join("embeddinggemma-2-Q8_0.gguf"),
-            &LlamaModelParams::default(),
+            &model_params(),
         )?;
         let mmproj = models.join("mmproj-embeddinggemma-2-Q8_0.gguf");
         let mtmd = MtmdContext::init_from_file(
             mmproj.to_str().context("model path is not utf8")?,
             &model,
-            &MtmdContextParams {
-                use_gpu: false,
-                n_threads: 8,
-                print_timings: false,
-                ..Default::default()
-            },
+            &mtmd_params(),
         )?;
         Ok(Self {
             backend,
@@ -82,8 +103,32 @@ impl Embedder {
         unit(ctx.embeddings_seq_ith(0)?)
     }
 
+    /// Make one context. A caller that embeds many windows keeps this context
+    /// and passes it to `embed_window_in`, so the GPU key/value cache stays put.
+    pub fn new_context(&self) -> Result<LlamaContext<'_>> {
+        Ok(self.model.new_context(&self.backend, context_params())?)
+    }
+
     /// Embed one window. Frames and audio go into one batch.
+    ///
+    /// This call makes its own context. Use it for one window. A loop uses
+    /// `new_context` and `embed_window_in` instead.
     pub fn embed_window(&self, frames: &[PathBuf], audio: &Path) -> Result<Vec<f32>> {
+        let mut ctx = self.new_context()?;
+        self.embed_window_in(&mut ctx, frames, audio)
+    }
+
+    /// Embed one window in a caller-owned context.
+    ///
+    /// The context holds the key/value cache of every earlier call. This method
+    /// clears that cache first, so one window never sees another window.
+    pub fn embed_window_in(
+        &self,
+        ctx: &mut LlamaContext<'_>,
+        frames: &[PathBuf],
+        audio: &Path,
+    ) -> Result<Vec<f32>> {
+        ctx.clear_kv_cache();
         let mut bitmaps = Vec::with_capacity(frames.len() + 1);
         for frame in frames {
             let path = frame.to_str().context("frame path is not utf8")?;
@@ -95,12 +140,11 @@ impl Embedder {
             Ok(bitmap) => bitmaps.push(bitmap),
             Err(_) => println!("  (no audio for this window)"),
         }
-        self.embed_joint(&bitmaps)
+        self.embed_joint(ctx, &bitmaps)
     }
 
     /// One batch holds every token and every media row. One decode follows.
-    fn embed_joint(&self, bitmaps: &[MtmdBitmap]) -> Result<Vec<f32>> {
-        let ctx = self.model.new_context(&self.backend, context_params())?;
+    fn embed_joint(&self, ctx: &mut LlamaContext<'_>, bitmaps: &[MtmdBitmap]) -> Result<Vec<f32>> {
         let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
         let input = MtmdInputText {
             text: mtmd_default_marker().repeat(refs.len()),
@@ -119,9 +163,9 @@ impl Embedder {
         if batch.is_null() {
             bail!("llama_batch_ext_init returned null");
         }
-        let filled = self.fill_batch(&ctx, &chunks, batch, n_embd_inp);
+        let filled = self.fill_batch(ctx, &chunks, batch, n_embd_inp);
         let raw = match filled {
-            Ok(()) => unsafe { pooled(&ctx) },
+            Ok(()) => unsafe { pooled(ctx) },
             Err(err) => Err(err),
         };
         unsafe { sys::llama_batch_ext_free(batch) };

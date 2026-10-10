@@ -12,7 +12,7 @@ the window 21.0-23.0 s with a score of 0.78.
 |---|---|
 | Console app | Works. |
 | Web UI | Works. See the Web UI section. |
-| GPU | Not used. The model runs on the CPU. |
+| GPU | Optional. The `cuda` feature runs the model on an NVIDIA card. |
 
 ## How it works
 
@@ -66,6 +66,23 @@ The first build takes about ten minutes. It compiles `llama.cpp`.
 
 An MSVC file lock can stop the build with `os error 32`. Wait ten seconds and
 run the same command again.
+
+### Build with a CUDA card
+
+Add the `cuda` feature to run the model on an NVIDIA card:
+
+```bash
+cd videoembed
+CMAKE_GENERATOR="Visual Studio 17 2022" CMAKE_BUILD_PARALLEL_LEVEL=20 \
+  CMAKE_CUDA_ARCHITECTURES=86 cargo build --release --features cuda
+```
+
+Set `CMAKE_CUDA_ARCHITECTURES` to the code of your card. The RTX 3050 Ti is
+`86`. Leave the value out and the build makes every architecture, which takes
+about seven times longer.
+
+On a 30 s clip the CUDA build indexes 29 windows in 7 s. The CPU build takes
+119 s. The two sets of vectors agree at a cosine of 0.9998.
 
 ## Run
 

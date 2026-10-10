@@ -3,6 +3,10 @@ name = "videoembed"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Run the text model and the media encoder on an NVIDIA card.
+cuda = ["llama-cpp-2/cuda", "llama-cpp-sys-2/cuda"]
+
 [dependencies]
 llama-cpp-2 = { version = "0.1.158", features = ["mtmd"] }
 llama-cpp-sys-2 = { version = "0.1.158" }

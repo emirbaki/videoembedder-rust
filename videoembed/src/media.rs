@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 pub const FFMPEG: &str =
     "D:/MLProjelerim/videoembedder-rust/tools/dl/ff/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe";
@@ -51,6 +51,7 @@ fn run_ffmpeg(args: Vec<String>, what: &str) -> Result<()> {
 /// Cut one window into JPEG frames at 1 fps and a 16 kHz mono WAV.
 ///
 /// The seek flag comes before the input. The length flag comes after it.
+/// The two ffmpeg calls run together, because each one waits on a process.
 pub fn extract_window(
     video: &Path,
     start: f64,
@@ -63,45 +64,54 @@ pub fn extract_window(
     let source = video.to_string_lossy().to_string();
 
     let frames_pattern = dir.join("f%02d.jpg").to_string_lossy().to_string();
-    run_ffmpeg(
-        vec![
-            "-y".into(),
-            "-ss".into(),
-            ss.clone(),
-            "-i".into(),
-            source.clone(),
-            "-t".into(),
-            span.clone(),
-            "-vf".into(),
-            "fps=1".into(),
-            "-q:v".into(),
-            "2".into(),
-            frames_pattern,
-        ],
-        "extracting frames",
-    )?;
+    let frames_args = vec![
+        "-y".into(),
+        "-ss".into(),
+        ss.clone(),
+        "-i".into(),
+        source.clone(),
+        "-t".into(),
+        span.clone(),
+        "-vf".into(),
+        "fps=1".into(),
+        "-q:v".into(),
+        "2".into(),
+        frames_pattern,
+    ];
 
     let wav = dir.join("clip.wav");
-    run_ffmpeg(
-        vec![
-            "-y".into(),
-            "-ss".into(),
-            ss,
-            "-i".into(),
-            source,
-            "-t".into(),
-            span,
-            "-vn".into(),
-            "-ac".into(),
-            "1".into(),
-            "-ar".into(),
-            "16000".into(),
-            "-f".into(),
-            "wav".into(),
-            wav.to_string_lossy().to_string(),
-        ],
-        "extracting audio",
-    )?;
+    let audio_args = vec![
+        "-y".into(),
+        "-ss".into(),
+        ss,
+        "-i".into(),
+        source,
+        "-t".into(),
+        span,
+        "-vn".into(),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        "16000".into(),
+        "-f".into(),
+        "wav".into(),
+        wav.to_string_lossy().to_string(),
+    ];
+
+    // Both closures own their argument list, so the two calls do not share state.
+    let (frames_out, audio_out) = std::thread::scope(|scope| {
+        let frames = scope.spawn(move || run_ffmpeg(frames_args, "extracting frames"));
+        let audio = scope.spawn(move || run_ffmpeg(audio_args, "extracting audio"));
+        let f = frames
+            .join()
+            .unwrap_or_else(|_| Err(anyhow!("the frames ffmpeg thread stopped")));
+        let a = audio
+            .join()
+            .unwrap_or_else(|_| Err(anyhow!("the audio ffmpeg thread stopped")));
+        (f, a)
+    });
+    frames_out?;
+    audio_out?;
 
     Ok((read_frames(dir)?, wav))
 }

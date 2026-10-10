@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -27,6 +28,8 @@ pub const EPS: f64 = 0.05;
 pub const FLOOR: f32 = 0.4;
 /// The most windows one video may add to one group.
 pub const GROUP_CAP: usize = 50;
+/// The number of cut windows the cutter thread holds ahead of the embedder.
+pub const AHEAD: usize = 4;
 
 const VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mkv", "mov", "avi", "webm"];
 
@@ -161,6 +164,10 @@ pub fn work_dir(at: usize) -> PathBuf {
 ///
 /// The callback runs after each window with the window number, counting from 1,
 /// and the window count of the whole video.
+///
+/// One thread cuts the windows ahead of this thread. The cut for window n+1
+/// then overlaps the embed for window n. Each cut holds its own folder, and the
+/// cutter sends that folder with the frames, so both sides agree on the path.
 pub fn index_video(
     embedder: &Embedder,
     video: &Path,
@@ -172,22 +179,40 @@ pub fn index_video(
         bail!("{} is shorter than one window", video.display());
     }
     let label = store::normalize_label(&video.to_string_lossy());
-    let mut records = Vec::with_capacity(plan.len());
-    for (n, (start, end)) in plan.iter().enumerate() {
-        let dir = work_dir(n);
-        let outcome = media::extract_window(video, *start, *end, &dir)
-            .and_then(|(frames, audio)| embedder.embed_window(&frames, &audio));
+    let total = plan.len();
+
+    /// One cut window: its folder, its frames, and its audio.
+    type Cut = (PathBuf, Vec<PathBuf>, PathBuf);
+
+    let (sender, receiver) = mpsc::sync_channel::<(usize, f64, f64, Result<Cut>)>(AHEAD);
+    let source = video.to_path_buf();
+    let cutter = std::thread::spawn(move || {
+        for (n, (start, end)) in plan.into_iter().enumerate() {
+            let dir = work_dir(n);
+            let cut = media::extract_window(&source, start, end, &dir)
+                .map(|(frames, audio)| (dir, frames, audio));
+            if sender.send((n, start, end, cut)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut records = Vec::with_capacity(total);
+    let mut ctx = embedder.new_context()?;
+    for (n, start, end, cut) in receiver {
+        let (dir, frames, audio) = cut?;
+        let vec = embedder.embed_window_in(&mut ctx, &frames, &audio)?;
         let _ = std::fs::remove_dir_all(&dir);
-        let vec = outcome?;
         records.push(Record {
             kind: KIND_WINDOW,
             label: label.clone(),
-            start: *start as f32,
-            end: *end as f32,
+            start: start as f32,
+            end: end as f32,
             vec,
         });
-        on_window(n + 1, plan.len());
+        on_window(n + 1, total);
     }
+    let _ = cutter.join();
     Ok(records)
 }
 
