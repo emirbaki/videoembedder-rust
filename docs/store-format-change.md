@@ -178,6 +178,50 @@ with a real index, DuckDB with the VSS extension, and a small ANN library over
 our own file. LanceDB and DuckDB each bring a large dependency. That weight buys
 an index, and the index only matters near the top of the range in section 3.
 
+### 7.2 The blob column or the vec0 table
+
+Two ways put a vector in SQLite.
+
+The blob way: an ordinary table holds the vector in a `BLOB` column, and the
+engine scores the rows in Rust. One table holds the metadata and the vector, so
+one query answers a scoped search, and our own `dot` runs on unit vectors.
+
+The `vec0` way: the sqlite-vec extension holds the vectors in a virtual table,
+and the search runs inside SQLite, in C. The vector leaves the records table, so
+the path and the kind come back through a join on the id.
+
+| | The blob way | The vec0 way |
+| --- | --- | --- |
+| The scan runs | In Rust | In SQLite, in C |
+| The metric | Our `dot`, on unit vectors | The extension distance, with cosine |
+| The vector sits | In the record row | In a second table, keyed by the id |
+| A scoped search | One query, then a scan of those rows | A partition key, or a filter on the join |
+| The extension | None | sqlite-vec, built and loaded on each connection |
+| The index | None | None. `vec0` is brute force, with optional quantization |
+
+The last row is the one that matters here. `vec0` is still an exhaustive scan.
+It moves the scan from Rust into C, and binary quantization can shrink it. It
+adds no graph and no tree.
+
+### 7.3 An ANN library beside the database
+
+Yes, an ANN library can index the same vectors. The pattern is a database as the
+source of truth, with an index beside it:
+
+1. The database holds the rows, the ids, the plans, and the finished list.
+2. The index holds the vectors alone, under the same ids.
+3. A query asks the index for the nearest ids, then reads those rows from the
+   database.
+
+`hnsw_rs` or `usearch` fills that role in Rust, in the process, with no server.
+The cost is one more thing to keep in step. An append must reach both, a delete
+must reach both, and a fault between the two writes leaves an index that holds a
+record the database dropped. A rebuild from the database repairs it.
+
+This pairing stands apart from the `vec0` question. The database writes the
+rows, and the index is a cache over them. The open choice is when the index
+earns its cost: near one million records, by the estimate in section 3.
+
 ## 8. The scoped search, with and without SQL
 
 Item 6 lets a user search one video only. The store must answer one question:
@@ -217,7 +261,9 @@ What follows from that decision:
 3. The vector leaves the record as an fp16 blob, so the disk and the memory both
    halve.
 4. An ANN index waits. Below about one million records the engine scores every
-   row, and the index earns its cost only near the top of that range.
+   row, and the index earns its cost only near the top of that range. The index
+   is a library beside the database when it comes (section 7.3), not a second
+   engine.
 
 The engine choice stays open. SQLite carries the smallest weight and it matches
 Google's design. An embedded vector database (LanceDB) or DuckDB each carry a
