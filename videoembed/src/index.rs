@@ -72,6 +72,17 @@ pub struct Hit {
     pub margin: f32,
 }
 
+/// One slice of a video, with the score of the whole slice.
+///
+/// A group holds one cell for every video record, also the ones below the
+/// floor. The web bar draws the cells, so the bar covers the whole video.
+#[derive(Clone, Debug, Serialize)]
+pub struct Cell {
+    pub start: f32,
+    pub end: f32,
+    pub score: f32,
+}
+
 /// The hits of one video.
 #[derive(Clone, Debug, Serialize)]
 pub struct Group {
@@ -79,6 +90,7 @@ pub struct Group {
     pub duration: f32,
     pub score: f32,
     pub hits: Vec<Hit>,
+    pub cells: Vec<Cell>,
 }
 
 /// List the video files under one folder, in name order.
@@ -382,6 +394,15 @@ pub fn index_video(
 ///
 /// `ranked` comes from `Store::rank`, so it is sorted by score, best first.
 pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) -> Vec<Group> {
+    // The score of every record, at the index of that record. `ranked` holds
+    // every record, so the bar can read a score below the floor too.
+    let mut score_of = vec![0.0f32; records.len()];
+    for (index, score) in ranked {
+        if let Some(slot) = score_of.get_mut(*index) {
+            *slot = *score;
+        }
+    }
+
     let mut durations: HashMap<&str, f32> = HashMap::new();
     for record in records {
         if !crate::store::is_video(record.kind) {
@@ -424,9 +445,39 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
                     duration,
                     score: *score,
                     hits: vec![hit],
+                    cells: Vec::new(),
                 });
             }
         }
+    }
+
+    // One cell for every record of every grouped video, in time order. The
+    // floor picks the hits. The bar shows all of them.
+    //
+    // A frame cell is 0.25 s and an audio cell is 1 s, so the two overlap. The
+    // bar takes the frames when the video has them, because they are finer.
+    for group in groups.iter_mut() {
+        let has_frames = records.iter().any(|record| {
+            record.kind == crate::store::KIND_FRAME && record.label == group.video
+        });
+        group.cells = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                let right_kind = if has_frames {
+                    record.kind == crate::store::KIND_FRAME
+                } else {
+                    crate::store::is_video(record.kind)
+                };
+                right_kind && record.label == group.video
+            })
+            .map(|(index, record)| Cell {
+                start: record.start,
+                end: record.end,
+                score: score_of[index],
+            })
+            .collect();
+        group.cells.sort_by(|a, b| a.start.total_cmp(&b.start));
     }
     groups
 }
@@ -442,14 +493,18 @@ mod tests {
         dir
     }
 
-    fn record(label: &str, start: f32, end: f32) -> Record {
+    fn record_of(kind: u8, label: &str, start: f32, end: f32) -> Record {
         Record {
-            kind: crate::store::KIND_FRAME,
+            kind,
             label: label.to_string(),
             start,
             end,
             vec: vec![1.0, 0.0],
         }
+    }
+
+    fn record(label: &str, start: f32, end: f32) -> Record {
+        record_of(crate::store::KIND_FRAME, label, start, end)
     }
 
     #[test]
@@ -541,6 +596,69 @@ mod tests {
         assert_eq!(groups[0].hits.len(), 2);
         assert_eq!(groups[1].video, "a.mp4");
         assert_eq!(groups[1].hits.len(), 1);
+    }
+
+    /// The bar needs every record, not only the ones above the floor.
+    ///
+    /// The floor picks the hit list. The bar shows the whole video, so a
+    /// weak part of the video still takes its place on the bar.
+    #[test]
+    fn a_group_carries_one_cell_for_every_video_record() {
+        let records = vec![
+            record("a.mp4", 0.0, 0.25),
+            record("a.mp4", 0.25, 0.5),
+            record("a.mp4", 0.5, 0.75),
+        ];
+        // The third record stays below the floor. It must still reach the bar.
+        let ranked = vec![(0, 0.80), (2, 0.45), (1, 0.30)];
+        let groups = group_hits(&records, &ranked, 0.50);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hits.len(), 2, "the floor keeps two hits");
+
+        let cells = &groups[0].cells;
+        assert_eq!(cells.len(), 3, "the bar needs every record");
+        assert!((cells[0].start - 0.0).abs() < 1e-6);
+        assert!((cells[0].score - 0.80).abs() < 1e-6);
+        assert!((cells[1].start - 0.25).abs() < 1e-6);
+        assert!((cells[1].score - 0.30).abs() < 1e-6);
+        assert!((cells[2].start - 0.5).abs() < 1e-6);
+        assert!((cells[2].score - 0.45).abs() < 1e-6);
+    }
+
+    /// The bar takes the finest records of the video.
+    ///
+    /// A frame cell is 0.25 s and an audio cell is 1 s, so the two overlap.
+    /// One bar holds one of them, and the frames give the finer picture.
+    #[test]
+    fn the_bar_uses_the_frames_when_the_video_has_them() {
+        let records = vec![
+            record_of(crate::store::KIND_FRAME, "a.mp4", 0.0, 0.25),
+            record_of(crate::store::KIND_FRAME, "a.mp4", 0.25, 0.5),
+            record_of(crate::store::KIND_AUDIO, "a.mp4", 0.0, 1.0),
+        ];
+        let ranked = vec![(0, 0.80), (2, 0.70), (1, 0.60)];
+        let groups = group_hits(&records, &ranked, 0.50);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].cells.len(), 2, "the frames cover the bar");
+        assert!((groups[0].cells[0].end - 0.25).abs() < 1e-6);
+        assert!((groups[0].cells[1].end - 0.5).abs() < 1e-6);
+    }
+
+    /// A video with no frame record still gets a bar.
+    #[test]
+    fn the_bar_falls_back_to_the_audio_records_of_an_old_store() {
+        let records = vec![
+            record_of(crate::store::KIND_AUDIO, "a.mp4", 0.0, 1.0),
+            record_of(crate::store::KIND_AUDIO, "a.mp4", 1.0, 2.0),
+        ];
+        let ranked = vec![(0, 0.80), (1, 0.70)];
+        let groups = group_hits(&records, &ranked, 0.50);
+
+        assert_eq!(groups[0].cells.len(), 2);
+        assert!((groups[0].cells[0].score - 0.80).abs() < 1e-6);
+        assert!((groups[0].cells[1].score - 0.70).abs() < 1e-6);
     }
 
     #[test]

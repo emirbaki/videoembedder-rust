@@ -148,14 +148,14 @@ async function runSearch(event) {
   note("");
   try {
     const answer = await api("/api/search", { query });
-    renderGroups(answer.groups);
+    renderGroups(answer.groups, answer.baseline);
   } catch (err) {
     note(err.message);
-    renderGroups([]);
+    renderGroups([], null);
   }
 }
 
-function renderGroups(groups) {
+function renderGroups(groups, baseline) {
   const list = $("groups");
   list.textContent = "";
   const timeline = $("timeline");
@@ -185,35 +185,114 @@ function renderGroups(groups) {
     }
 
     list.appendChild(item);
-    timeline.appendChild(timelineBar(group));
+    timeline.appendChild(timelineBar(group, baseline));
   }
 }
 
-function timelineBar(group) {
-  const bar = document.createElement("div");
-  bar.className = "track";
+// The colour of one cell. Grey is weak, green is strong.
+function strengthColor(t) {
+  const weak = [48, 54, 61];
+  const strong = [63, 185, 80];
+  const mix = weak.map((w, i) => Math.round(w + (strong[i] - w) * t));
+  return "rgb(" + mix.join(",") + ")";
+}
+
+// The highest score of the cells.
+function topScore(cells) {
+  let high = -Infinity;
+  for (const cell of cells) {
+    if (cell.score > high) high = cell.score;
+  }
+  return high;
+}
+
+// The most cells one gradient may hold. A long video keeps its strongest cell
+// in each group of cells.
+const CELL_CAP = 600;
+
+function barCells(cells) {
+  if (cells.length <= CELL_CAP) return cells;
+  const step = cells.length / CELL_CAP;
+  const out = [];
+  for (let at = 0; at < cells.length; at += step) {
+    const from = Math.floor(at);
+    const to = Math.min(Math.floor(at + step), cells.length);
+    let best = cells[from];
+    for (let j = from; j < to; j++) {
+      if (cells[j].score > best.score) best = cells[j];
+    }
+    out.push(best);
+  }
+  return out;
+}
+
+// One colour stop at the middle of each cell. The browser blends between the
+// stops, so the bar runs from grey to green without hard steps.
+//
+// The scale is the margin over the store median. A cell at the median is grey,
+// and the best cell of the video is green. A video with no real match stays
+// grey the whole way, because no cell rises above the median.
+function barGradient(cells, span, baseline) {
+  const base = Number.isFinite(baseline) ? baseline : 0;
+  const high = topScore(cells);
+  const width = high - base;
+  const middle = (cell) => (cell.start + cell.end) / 2;
+  // A CSS gradient reads left to right, so the stops must climb. Cells of
+  // different lengths can interleave, and the midpoint sets the order.
+  const stops = cells
+    .slice()
+    .sort((a, b) => middle(a) - middle(b))
+    .map((cell) => {
+      const raw = width > 1e-6 ? (cell.score - base) / width : 0;
+      const t = Math.max(0, Math.min(1, raw));
+      const at = ((middle(cell) / span) * 100).toFixed(3);
+      return strengthColor(t) + " " + at + "%";
+    });
+  return "linear-gradient(to right, " + stops.join(", ") + ")";
+}
+
+function timelineBar(group, baseline) {
+  const track = document.createElement("div");
+  track.className = "track";
 
   const name = document.createElement("span");
   name.className = "track-name";
   name.textContent = group.video;
-  bar.appendChild(name);
+  track.appendChild(name);
 
-  // The store holds no true duration. The largest window end is the axis.
-  const last = group.hits.length > 0 ? group.hits[group.hits.length - 1].end : 0;
+  const wrap = document.createElement("div");
+  wrap.className = "bar-wrap";
+
+  // The store holds no true duration. The largest record end is the axis.
+  const cells = group.cells || [];
+  const last = cells.length > 0 ? cells[cells.length - 1].end : 0;
   const span = group.duration > 0 ? group.duration : last > 0 ? last : 1;
+  const shown = barCells(cells);
 
-  for (const hit of group.hits) {
-    const mark = document.createElement("button");
-    mark.type = "button";
-    mark.className = "mark";
-    mark.style.left = (hit.start / span) * 100 + "%";
-    mark.style.width = ((hit.end - hit.start) / span) * 100 + "%";
-    mark.title = hit.score.toFixed(3) + " (" + hit.margin.toFixed(3) + ")  " +
-      hit.start.toFixed(2) + " s";
-    mark.addEventListener("click", () => play(group.video, hit.start));
-    bar.appendChild(mark);
+  const bar = document.createElement("button");
+  bar.type = "button";
+  bar.className = "match-bar";
+  bar.style.background = barGradient(shown, span, baseline);
+  bar.title = "Click to seek. Green is a strong match.";
+  bar.addEventListener("click", (event) => {
+    const box = bar.getBoundingClientRect();
+    const at = ((event.clientX - box.left) / box.width) * span;
+    play(group.video, Math.max(0, Math.min(at, span)));
+  });
+  wrap.appendChild(bar);
+
+  const best = group.hits[0];
+  if (best) {
+    const peak = document.createElement("span");
+    peak.className = "peak";
+    peak.style.left = (best.start / span) * 100 + "%";
+    peak.title = best.score.toFixed(3) + " (" + best.margin.toFixed(3) + ")  " +
+      best.start.toFixed(2) + " s";
+    wrap.appendChild(peak);
   }
-  return bar;
+
+  track.appendChild(wrap);
+  return track;
 }
 
 function play(path, start) {
