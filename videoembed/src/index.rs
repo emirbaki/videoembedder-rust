@@ -67,8 +67,10 @@ pub struct Progress {
     pub window_count: usize,
     pub indexed: usize,
     pub error: Option<String>,
-    /// The compute backend of this build, "CPU" or "CUDA".
-    pub backend: String,
+    /// The device of the loaded model, "GPU" or "CPU".
+    pub device: String,
+    /// True when this machine can put layers on a card.
+    pub gpu_available: bool,
     /// The milliseconds to load the model.
     pub load_ms: u64,
     /// The milliseconds of the running job.
@@ -1002,7 +1004,8 @@ mod tests {
     #[test]
     fn the_progress_carries_the_speed_fields() {
         let json = serde_json::to_value(Progress::default()).unwrap();
-        assert_eq!(json["backend"], "");
+        assert_eq!(json["device"], "");
+        assert_eq!(json["gpu_available"], false);
         assert_eq!(json["load_ms"], 0);
         assert_eq!(json["elapsed_ms"], 0);
         assert_eq!(json["per_second"], 0.0);

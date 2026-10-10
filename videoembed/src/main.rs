@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let models = models_dir();
     let store_path = PathBuf::from("store/index.vei");
     println!("Loading models from {}", models.display());
-    let embedder = Embedder::load(&models)?;
+    let embedder = Embedder::load(&models, None)?;
     let mut store = Store::open(&store_path)?;
     println!(
         "Store: {} ({} records)",

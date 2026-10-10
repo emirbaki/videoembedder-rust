@@ -533,14 +533,17 @@ fn start_index(
     flag.store(false, Ordering::Relaxed);
     {
         let mut held = progress.lock().unwrap();
-        // The model load time belongs to the server, not to this job. Hold it,
+        // The model state belongs to the server, not to this job. Hold it,
         // because the page shows it after the job ends.
+        let device = held.device.clone();
+        let gpu_available = held.gpu_available;
         let load_ms = held.load_ms;
         *held = Progress {
             running: true,
             folder: folder.display().to_string(),
             file_count: count,
-            backend: BACKEND.to_string(),
+            device,
+            gpu_available,
             load_ms,
             ..Progress::default()
         };
@@ -935,7 +938,7 @@ fn main() -> Result<()> {
     let engine_key = key.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let embedder = match Embedder::load(&models) {
+        let embedder = match Embedder::load(&models, None) {
             Ok(embedder) => embedder,
             Err(err) => {
                 let _ = ready_tx.send(Err(format!("{err:#}")));
@@ -945,9 +948,11 @@ fn main() -> Result<()> {
         let load_ms = started.elapsed().as_millis() as u64;
         {
             let mut held = engine_progress.lock().unwrap();
-            held.backend = BACKEND.to_string();
+            held.device = embedder.device().as_str().to_string();
+            held.gpu_available = embedder.supports_gpu();
             held.load_ms = load_ms;
         }
+        println!("Backend: {} on {}", BACKEND, embedder.device().as_str());
         let store = match Store::open(&store_path) {
             Ok(store) => store,
             Err(err) => {

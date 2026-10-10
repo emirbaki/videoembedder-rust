@@ -109,13 +109,18 @@ async function stopIndex() {
   }
 }
 
+// The active mode, and a word about the card when the build has none.
+function deviceLabel(p) {
+  return p.device + (p.gpu_available ? "" : " - this build has no card");
+}
+
 function showProgress(p) {
   $("progress").hidden = !p.running && p.indexed === 0 && !p.error;
   const width = p.window_count > 0 ? (p.window * 100) / p.window_count : 0;
   $("progress-bar").style.width = width + "%";
   // The speed line is set first, so an error cannot leave stale text.
   $("speed").textContent = p.elapsed_ms > 0
-    ? ((p.elapsed_ms / 1000).toFixed(1) + " s of work, " + p.backend)
+    ? ((p.elapsed_ms / 1000).toFixed(1) + " s of work, " + deviceLabel(p))
     : "";
 
   if (p.error !== null) {
@@ -132,7 +137,7 @@ function showProgress(p) {
     const rate = p.per_second > 0 ? " at " + p.per_second.toFixed(2) + " items a second" : "";
     $("progress-text").textContent =
       "Done. " + p.indexed + " records indexed" + rate +
-      ". " + p.backend + ", model load " + p.load_ms + " ms.";
+      ". " + deviceLabel(p) + ", model load " + p.load_ms + " ms.";
   }
 }
 

@@ -31,20 +31,72 @@ const N_UBATCH: u32 = 2048;
 /// card. A build without the `cuda` feature ignores it.
 const N_GPU_LAYERS: u32 = 999;
 
-/// The model parameters. A `cuda` build offloads every layer.
-fn model_params() -> LlamaModelParams {
-    let base = LlamaModelParams::default();
-    if cfg!(feature = "cuda") {
-        base.with_n_gpu_layers(N_GPU_LAYERS)
-    } else {
-        base
+/// Where the model runs. The user picks this, and a switch reloads the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    /// Every layer on the card, and the media encoder too.
+    Gpu,
+    /// Every layer on the processor, and the media encoder too.
+    Cpu,
+}
+
+impl Device {
+    /// The one name for this mode. The console, the page, and the JSON use it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpu => "GPU",
+            Self::Cpu => "CPU",
+        }
+    }
+
+    /// Read a mode from its name. The case and the space do not matter.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "gpu" => Some(Self::Gpu),
+            "cpu" => Some(Self::Cpu),
+            _ => None,
+        }
     }
 }
 
-/// The multimodal parameters. A `cuda` build runs the media encoder on the GPU.
-fn mtmd_params() -> MtmdContextParams {
+/// True when this machine can put layers on a card.
+///
+/// The question goes to llama.cpp. A build without the `cuda` feature answers
+/// false, and a CUDA build on a machine with no card answers false too.
+pub fn gpu_available(backend: &LlamaBackend) -> bool {
+    backend.supports_gpu_offload()
+}
+
+/// The device to load on. `None` asks for the card when it is there.
+///
+/// A named device that this machine cannot serve is an error, never a quiet
+/// fall back, because the user asked for it.
+fn choose_device(backend: &LlamaBackend, asked: Option<Device>) -> Result<Device> {
+    let available = gpu_available(backend);
+    match asked {
+        Some(Device::Gpu) if !available => bail!("this build cannot put layers on a card"),
+        Some(device) => Ok(device),
+        None => Ok(if available { Device::Gpu } else { Device::Cpu }),
+    }
+}
+
+/// The model parameters for one mode. The GPU keeps every layer on the card.
+///
+/// The CPU mode asks for zero layers in words. The default is -1, and
+/// llama.cpp reads a negative count as every layer, so the default would
+/// offload the whole model in a CUDA build.
+fn model_params(device: Device) -> LlamaModelParams {
+    let base = LlamaModelParams::default();
+    match device {
+        Device::Gpu => base.with_n_gpu_layers(N_GPU_LAYERS),
+        Device::Cpu => base.with_n_gpu_layers(0),
+    }
+}
+
+/// The multimodal parameters for one mode.
+fn mtmd_params(device: Device) -> MtmdContextParams {
     MtmdContextParams {
-        use_gpu: cfg!(feature = "cuda"),
+        use_gpu: device == Device::Gpu,
         n_threads: 8,
         print_timings: false,
         ..Default::default()
@@ -63,31 +115,74 @@ fn context_params() -> LlamaContextParams {
 
 pub struct Embedder {
     backend: LlamaBackend,
+    device: Device,
     model: LlamaModel,
     mtmd: MtmdContext,
 }
 
 impl Embedder {
-    /// Load the text model and the multimodal projection.
-    pub fn load(models: &Path) -> Result<Self> {
+    /// Load the text model and the multimodal projection on one device.
+    ///
+    /// A `None` device asks for the card when it is there, and the processor
+    /// otherwise.
+    pub fn load(models: &Path, asked: Option<Device>) -> Result<Self> {
         send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
         let backend = LlamaBackend::init()?;
+        let device = choose_device(&backend, asked)?;
+        let (model, mtmd) = Self::open(models, &backend, device)?;
+        Ok(Self {
+            backend,
+            device,
+            model,
+            mtmd,
+        })
+    }
+
+    /// Load the model and the projection for one mode.
+    ///
+    /// The caller keeps the backend. `LlamaBackend::init` runs one time in a
+    /// process, so a switch of mode must not ask for a second one.
+    fn open(
+        models: &Path,
+        backend: &LlamaBackend,
+        device: Device,
+    ) -> Result<(LlamaModel, MtmdContext)> {
         let model = LlamaModel::load_from_file(
-            &backend,
+            backend,
             &models.join("embeddinggemma-2-Q8_0.gguf"),
-            &model_params(),
+            &model_params(device),
         )?;
         let mmproj = models.join("mmproj-embeddinggemma-2-Q8_0.gguf");
         let mtmd = MtmdContext::init_from_file(
             mmproj.to_str().context("model path is not utf8")?,
             &model,
-            &mtmd_params(),
+            &mtmd_params(device),
         )?;
-        Ok(Self {
-            backend,
-            model,
-            mtmd,
-        })
+        Ok((model, mtmd))
+    }
+
+    /// Load the model again on another device.
+    ///
+    /// The old model stays in place until the new one is ready, so a failure
+    /// leaves a working embedder. The caller must drop every context first,
+    /// because a context borrows the model.
+    pub fn reload(&mut self, models: &Path, device: Device) -> Result<()> {
+        let device = choose_device(&self.backend, Some(device))?;
+        let (model, mtmd) = Self::open(models, &self.backend, device)?;
+        self.model = model;
+        self.mtmd = mtmd;
+        self.device = device;
+        Ok(())
+    }
+
+    /// The device this embedder runs on.
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    /// True when this machine can put layers on a card.
+    pub fn supports_gpu(&self) -> bool {
+        gpu_available(&self.backend)
     }
 
     /// Embed one text. Returns a unit vector.
@@ -279,4 +374,81 @@ pub fn unit(raw: &[f32]) -> Result<Vec<f32>> {
 /// Cosine similarity of two unit vectors.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The console, the page, and the JSON field use these two names.
+    #[test]
+    fn a_device_round_trips_through_its_name() {
+        assert_eq!(Device::Gpu.as_str(), "GPU");
+        assert_eq!(Device::Cpu.as_str(), "CPU");
+        assert_eq!(Device::parse("GPU"), Some(Device::Gpu));
+        assert_eq!(Device::parse("gpu"), Some(Device::Gpu));
+        assert_eq!(Device::parse("Cpu"), Some(Device::Cpu));
+        assert_eq!(Device::parse(" cpu "), Some(Device::Cpu));
+        assert_eq!(Device::parse("npu"), None);
+        assert_eq!(Device::parse(""), None);
+    }
+
+    /// The GPU mode keeps every layer on the card. The CPU mode keeps none.
+    #[test]
+    fn the_gpu_mode_offloads_every_layer() {
+        assert_eq!(
+            model_params(Device::Gpu).n_gpu_layers(),
+            N_GPU_LAYERS as i32
+        );
+        assert_eq!(model_params(Device::Cpu).n_gpu_layers(), 0);
+    }
+
+    /// The media encoder follows the same device as the text model.
+    #[test]
+    fn the_media_encoder_follows_the_device() {
+        assert!(mtmd_params(Device::Gpu).use_gpu);
+        assert!(!mtmd_params(Device::Cpu).use_gpu);
+    }
+
+    /// One backend for every test in this run.
+    ///
+    /// `LlamaBackend::init` works one time in a process, and its drop frees
+    /// the backend. The static holds the one handle for the whole run.
+    fn test_backend() -> &'static LlamaBackend {
+        static BACKEND: std::sync::OnceLock<LlamaBackend> = std::sync::OnceLock::new();
+        BACKEND.get_or_init(|| LlamaBackend::init().expect("the backend starts"))
+    }
+
+    /// The default build carries no CUDA kernels, so it has no card.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn a_cpu_build_has_no_card() {
+        assert!(!gpu_available(test_backend()));
+    }
+
+    /// The card wins when the user names none, and a named device must exist.
+    #[test]
+    fn a_named_device_must_be_here() {
+        let backend = test_backend();
+        let card = gpu_available(backend);
+        assert_eq!(
+            choose_device(backend, None).unwrap(),
+            if card { Device::Gpu } else { Device::Cpu }
+        );
+        assert_eq!(
+            choose_device(backend, Some(Device::Cpu)).unwrap(),
+            Device::Cpu
+        );
+        if card {
+            assert_eq!(
+                choose_device(backend, Some(Device::Gpu)).unwrap(),
+                Device::Gpu
+            );
+        } else {
+            assert!(
+                choose_device(backend, Some(Device::Gpu)).is_err(),
+                "a card that is not here is an error, not a fall back"
+            );
+        }
+    }
 }
