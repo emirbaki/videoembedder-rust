@@ -23,7 +23,7 @@ function note(text) {
 async function refreshState() {
   const state = await api("/api/state");
   key = state.key;
-  $("status").textContent = state.records + " windows, " + state.videos + " videos";
+  $("status").textContent = state.records + " records, " + state.videos + " videos";
 }
 
 async function refreshVideos() {
@@ -46,7 +46,7 @@ async function refreshVideos() {
     name.textContent = video.path;
 
     const count = document.createElement("td");
-    count.textContent = video.windows + " windows";
+    count.textContent = video.items + " items";
 
     const act = document.createElement("td");
     const drop = document.createElement("button");
@@ -111,11 +111,11 @@ function showProgress(p) {
   if (p.running) {
     $("progress-text").textContent =
       "File " + p.file_index + "/" + p.file_count +
-      ", window " + p.window + "/" + p.window_count +
+      ", item " + p.window + "/" + p.window_count +
       " - " + p.file;
     return;
   }
-  $("progress-text").textContent = "Done. " + p.indexed + " windows indexed.";
+  $("progress-text").textContent = "Done. " + p.indexed + " records indexed.";
 }
 
 async function pollProgress() {
@@ -162,7 +162,7 @@ function renderGroups(groups) {
   timeline.textContent = "";
 
   if (groups.length === 0) {
-    note("No window scored above 0.4.");
+    note("No record scored above the floor.");
     return;
   }
   note("");
@@ -178,7 +178,8 @@ function renderGroups(groups) {
       row.type = "button";
       row.className = "hit";
       row.textContent =
-        hit.score.toFixed(3) + "  " + hit.start.toFixed(1) + "-" + hit.end.toFixed(1) + " s";
+        hit.score.toFixed(3) + " (" + hit.margin.toFixed(3) + ")  " +
+        hit.start.toFixed(2) + "-" + hit.end.toFixed(2) + " s";
       row.addEventListener("click", () => play(group.video, hit.start));
       item.appendChild(row);
     }
@@ -207,7 +208,8 @@ function timelineBar(group) {
     mark.className = "mark";
     mark.style.left = (hit.start / span) * 100 + "%";
     mark.style.width = ((hit.end - hit.start) / span) * 100 + "%";
-    mark.title = hit.score.toFixed(3) + "  " + hit.start.toFixed(1) + " s";
+    mark.title = hit.score.toFixed(3) + " (" + hit.margin.toFixed(3) + ")  " +
+      hit.start.toFixed(2) + " s";
     mark.addEventListener("click", () => play(group.video, hit.start));
     bar.appendChild(mark);
   }

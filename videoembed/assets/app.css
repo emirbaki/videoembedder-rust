@@ -93,6 +93,8 @@ input[type="search"] {
 }
 .mark:hover { background: #2f81f7; }
 
+.legend { font-size: 0.78rem; color: var(--dim); margin: 0 0 0.6rem; }
+
 table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 td { padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); }
 td:first-child { font-family: ui-monospace, monospace; word-break: break-all; }
