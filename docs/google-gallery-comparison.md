@@ -244,6 +244,15 @@ The merged moment does not measure the grid. It spans every touching hit above t
 
 **4. A speed report.** The work is small and the payoff is trust. Show items a second, the wall-clock time, and the backend. Time with a monotonic clock. Report cold and warm runs apart, as Google does. Keep the raw samples so variance stays visible.
 
+**Measurement (2026-10-11).** The run-time mode picks GPU or CPU for the loaded model. One release binary with the `cuda` feature serves both modes. The `web` server indexed `spike/testvideo_nolabels.mp4` on each device in turn. The run holds 143 items.
+
+| device | load | work | items a second |
+| --- | --- | --- | --- |
+| GPU | 2.13 s | 7.57 s | 18.88 |
+| CPU | 1.26 s | 232.30 s | 0.62 |
+
+The card is about 31 times faster on this clip. The card costs about a second more at load. Both modes returned 143 records for the same 143 items.
+
 ## 6. What to keep as it is
 
 - The task prefixes. Google does not have them. Do not trade them away for parity.
