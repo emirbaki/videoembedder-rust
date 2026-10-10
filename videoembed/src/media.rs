@@ -33,6 +33,35 @@ pub fn probe_duration(video: &Path) -> Result<f64> {
         .context("ffprobe duration is not a number")
 }
 
+/// Read the length of one stream in seconds. The kind is "v" or "a".
+///
+/// `Ok(None)` means the file holds no stream of that kind, or the stream
+/// reports no length. A missing stream length is normal in some files.
+pub fn probe_stream_duration(video: &Path, kind: &str) -> Result<Option<f64>> {
+    let out = Command::new(FFPROBE)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            kind,
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(video)
+        .output()
+        .context("run ffprobe")?;
+    if !out.status.success() {
+        bail!("ffprobe failed for {}", video.display());
+    }
+    let text = String::from_utf8(out.stdout).context("ffprobe output is not utf8")?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .next())
+}
+
 fn run_ffmpeg(args: Vec<String>, what: &str) -> Result<()> {
     let mut full: Vec<String> = vec![
         "-hide_banner".into(),
@@ -251,6 +280,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vei_media_{}_{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn the_stream_probe_separates_the_video_and_the_audio_length() {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        }
+        let format = probe_duration(&video).unwrap();
+        let video_len = probe_stream_duration(&video, "v").unwrap().unwrap();
+        let audio_len = probe_stream_duration(&video, "a").unwrap().unwrap();
+
+        assert!(video_len > 0.0);
+        assert!(audio_len > 0.0);
+        // The test video holds about 23 s of audio inside a 30 s file.
+        assert!(audio_len < format, "audio {audio_len} format {format}");
+        // A missing stream kind gives None, not an error.
+        assert!(probe_stream_duration(&video, "s").unwrap().is_none());
     }
 
     #[test]

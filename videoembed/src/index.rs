@@ -188,9 +188,24 @@ pub struct IndexRun {
 
 impl IndexRun {
     /// Probe the video and build the frame and the audio plan.
+    ///
+    /// The plan follows the length of each stream, not the length of the file.
+    /// A clip past the end of its stream holds no media, and the encoder then
+    /// refuses it. A short audio track is normal, so the audio plan is often
+    /// shorter than the frame plan.
     pub fn start(video: &Path) -> Result<Self> {
         let duration = media::probe_duration(video)?;
-        let frames = frames(duration);
+        let video_len = media::probe_stream_duration(video, "v")?
+            .unwrap_or(duration)
+            .min(duration);
+        let audio_len = if media::has_audio(video) {
+            media::probe_stream_duration(video, "a")?
+                .unwrap_or(duration)
+                .min(duration)
+        } else {
+            0.0
+        };
+        let frames = frames(video_len);
         if frames.is_empty() {
             bail!("{} is shorter than one frame", video.display());
         }
@@ -199,7 +214,7 @@ impl IndexRun {
             label: store::normalize_label(&video.to_string_lossy()),
             duration,
             frames,
-            audios: audio_starts(duration),
+            audios: audio_starts(audio_len),
             frame_at: 0,
             audio_at: 0,
             phase: Phase::Frames,
@@ -628,10 +643,29 @@ mod tests {
             eprintln!("skipped: ffprobe or the test video is missing");
             return;
         }
+        let format = crate::media::probe_duration(&video).unwrap();
+        let video_len = crate::media::probe_stream_duration(&video, "v")
+            .unwrap()
+            .unwrap_or(format)
+            .min(format);
+        let audio_len = match crate::media::probe_stream_duration(&video, "a").unwrap() {
+            Some(len) => len.min(format),
+            None => 0.0,
+        };
         let run = IndexRun::start(&video).unwrap();
-        let d = crate::media::probe_duration(&video).unwrap();
-        let want = frames(d).len() + audio_starts(d).len();
-        assert_eq!(run.total(), want);
+
+        assert_eq!(
+            run.total(),
+            frames(video_len).len() + audio_starts(audio_len).len()
+        );
         assert!(run.total() > 100, "got {}", run.total());
+        // The test video holds about 23 s of audio inside a 30 s file. A clip
+        // past the end of the audio track holds no sound, so the plan stops at
+        // the track length.
+        assert!(audio_len + 1.0 < format, "the track is not short here");
+        assert!(
+            run.total() < frames(video_len).len() + audio_starts(format).len(),
+            "the plan asks for a clip past the end of the audio track"
+        );
     }
 }
