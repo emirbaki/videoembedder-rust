@@ -5,6 +5,7 @@
 //!
 //! A write goes to a temp file first. Then the temp file replaces the store.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,21 @@ pub fn normalize_label(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// The finished list beside the store. `store/index.vei` gives `store/index.done`.
+fn done_path(store: &Path) -> PathBuf {
+    store.with_extension("done")
+}
+
+/// Read the finished list. A missing file gives an empty set.
+fn read_done(store: &Path) -> HashSet<String> {
+    let text = std::fs::read_to_string(done_path(store)).unwrap_or_default();
+    text.lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(normalize_label)
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct Record {
     pub kind: u8,
@@ -47,6 +63,8 @@ pub struct Store {
     path: PathBuf,
     pub dim: usize,
     pub records: Vec<Record>,
+    /// The video paths that finished an index run.
+    done: HashSet<String>,
 }
 
 impl Store {
@@ -57,10 +75,13 @@ impl Store {
                 path: path.to_path_buf(),
                 dim: 0,
                 records: Vec::new(),
+                done: read_done(path),
             });
         }
         let bytes = std::fs::read(path).context("read the store")?;
-        Self::decode(path.to_path_buf(), &bytes)
+        let mut store = Self::decode(path.to_path_buf(), &bytes)?;
+        store.done = read_done(&store.path);
+        Ok(store)
     }
 
     fn decode(path: PathBuf, bytes: &[u8]) -> Result<Self> {
@@ -90,7 +111,12 @@ impl Store {
                 vec,
             });
         }
-        Ok(Self { path, dim, records })
+        Ok(Self {
+            path,
+            dim,
+            records,
+            done: HashSet::new(),
+        })
     }
 
     /// Append records and write the store.
@@ -125,8 +151,40 @@ impl Store {
         let removed = before - self.records.len();
         if removed > 0 {
             self.write()?;
+            self.done.remove(&want);
+            self.write_done()?;
         }
         Ok(removed)
+    }
+
+    /// True when this video finished an index run.
+    ///
+    /// The path separators do not matter, like `holds_video`.
+    pub fn is_done(&self, label: &str) -> bool {
+        self.done.contains(&normalize_label(label))
+    }
+
+    /// Record that this video finished an index run.
+    pub fn mark_done(&mut self, label: &str) -> Result<()> {
+        self.done.insert(normalize_label(label));
+        self.write_done()
+    }
+
+    /// The finished set, one path on each line.
+    fn write_done(&self) -> Result<()> {
+        let mut out = String::new();
+        for label in &self.done {
+            out.push_str(label);
+            out.push('\n');
+        }
+        let path = done_path(&self.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("done.tmp");
+        std::fs::write(&tmp, out).context("write the finished list")?;
+        std::fs::rename(&tmp, &path).context("replace the finished list")?;
+        Ok(())
     }
 
     /// Build the store bytes. `write` sends them to the file.
@@ -223,6 +281,7 @@ fn encode_for_test(dim: usize, records: &[Record]) -> Vec<u8> {
         path: PathBuf::from("unused.vei"),
         dim,
         records: records.to_vec(),
+        done: HashSet::new(),
     };
     store.encode()
 }
@@ -241,11 +300,18 @@ mod tests {
         }
     }
 
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vei_store_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     fn store_of(records: Vec<Record>) -> Store {
         Store {
             path: PathBuf::from("unused.vei"),
             dim: 2,
             records,
+            done: HashSet::new(),
         }
     }
 
@@ -301,6 +367,7 @@ mod tests {
             path: dir.join("index.vei"),
             dim: 2,
             records: vec![frame, audio, record("D:/video/b.mp4")],
+            done: HashSet::new(),
         };
         let removed = store.forget("D:/video/a.mp4").unwrap();
         assert_eq!(removed, 2);
@@ -330,6 +397,7 @@ mod tests {
             path: dir.join("index.vei"),
             dim: 2,
             records: vec![record("D:\\video\\a.mp4"), record("D:\\video\\b.mp4")],
+            done: HashSet::new(),
         };
         let removed = store.forget("D:/video/a.mp4").unwrap();
         assert_eq!(removed, 1);
@@ -358,5 +426,49 @@ mod tests {
             Err(err) => err,
         };
         assert!(format!("{err:#}").contains("broken.vei"));
+    }
+
+    /// A finished video is known after the store reopens.
+    #[test]
+    fn a_finished_video_survives_a_reopen() {
+        let dir = scratch("done");
+        let path = dir.join("index.vei");
+        let mut store = Store::open(&path).unwrap();
+        store.mark_done("a.mp4").unwrap();
+
+        assert!(store.is_done("a.mp4"));
+        assert!(!store.is_done("b.mp4"));
+
+        let again = Store::open(&path).unwrap();
+        assert!(again.is_done("a.mp4"), "the mark must reach the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A video that is forgotten must index again.
+    #[test]
+    fn forget_clears_the_finished_mark() {
+        let dir = scratch("done_forget");
+        let path = dir.join("index.vei");
+        let mut store = Store::open(&path).unwrap();
+        store.append(vec![record("a.mp4")]).unwrap();
+        store.mark_done("a.mp4").unwrap();
+
+        store.forget("a.mp4").unwrap();
+
+        assert!(!store.is_done("a.mp4"));
+        let again = Store::open(&path).unwrap();
+        assert!(!again.is_done("a.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mark ignores the slash direction, like every other path test.
+    #[test]
+    fn a_windows_path_form_still_matches_the_mark() {
+        let dir = scratch("done_slash");
+        let path = dir.join("index.vei");
+        let mut store = Store::open(&path).unwrap();
+        store.mark_done(r"sub\a.mp4").unwrap();
+        assert!(store.is_done("sub/a.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

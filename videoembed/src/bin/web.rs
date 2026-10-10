@@ -362,6 +362,7 @@ struct WebJob {
     records: Vec<Record>,
     indexed: usize,
     started: std::time::Instant,
+    label: String,
 }
 
 /// Group the store records by video path. Every video kind counts.
@@ -529,11 +530,11 @@ fn start_index(
         records: Vec::new(),
         indexed: 0,
         started: std::time::Instant::now(),
+        label: String::new(),
     });
     Ok(count)
 }
 
-/// One media item of work, or the move to the next file.
 /// One media item of work. True means the whole job has finished or stopped.
 fn step_job(
     embedder: &Embedder,
@@ -560,10 +561,15 @@ fn step_job(
         match index::IndexRun::start(&video) {
             Ok(run) => {
                 let label = normalize_label(&video.to_string_lossy());
+                if store.is_done(&label) {
+                    job.file_at += 1;
+                    return false;
+                }
                 if let Err(err) = store.forget(&label) {
                     fail(progress, &err);
                 }
-                begin_file(progress, label, job.file_at + 1, run.total());
+                begin_file(progress, label.clone(), job.file_at + 1, run.total());
+                job.label = label;
                 job.records.clear();
                 job.run = Some(run);
             }
@@ -590,6 +596,9 @@ fn step_job(
         let records = std::mem::take(&mut job.records);
         job.indexed += records.len();
         if let Err(err) = store.append(records) {
+            fail(progress, &err);
+        }
+        if let Err(err) = store.mark_done(&job.label) {
             fail(progress, &err);
         }
         job.run = None;
