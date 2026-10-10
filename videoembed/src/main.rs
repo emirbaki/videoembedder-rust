@@ -89,7 +89,7 @@ fn split_command(line: &str) -> (&str, &str) {
     }
 }
 
-/// Cut one video into windows, embed each window, and append the records.
+/// Cut one video into frames and audio clips, embed each one, and append.
 fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
     if rest.is_empty() {
         bail!("usage: index <video path>");
@@ -99,11 +99,11 @@ fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
         bail!("{} is not a file", video.display());
     }
     println!("Video: {}", video.display());
-    let mut report = |n: usize, total: usize| println!("  window {n:3}/{total}");
+    let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
     let records = index::index_video(embedder, &video, &mut report)?;
     let count = records.len();
     store.append(records)?;
-    println!("Indexed {count} windows into {}", store_path_hint());
+    println!("Indexed {count} records into {}", store_path_hint());
     Ok(())
 }
 
@@ -135,22 +135,27 @@ fn search(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
     }
     let query = embedder.embed_text(&format!("{QUERY_PREFIX}{rest}"))?;
     let ranked = store.rank(&query);
+    let baseline = index::median(&ranked);
     println!("Top results for: {rest}");
+    println!("Baseline (median of the store): {baseline:.3}");
     for (rank, (i, score)) in ranked.iter().take(10).enumerate() {
         let record = &store.records[*i];
+        let margin = score - baseline;
         let bar = bar(*score);
         match record.kind {
             KIND_NOTE => println!(
-                "{:2}. {:.3} {} note: {}",
+                "{:2}. {:.3} ({:+.3}) {} note: {}",
                 rank + 1,
                 score,
+                margin,
                 bar,
                 record.label
             ),
             _ => println!(
-                "{:2}. {:.3} {} {}  [{:.1}-{:.1} s]",
+                "{:2}. {:.3} ({:+.3}) {} {}  [{:.2}-{:.2} s]",
                 rank + 1,
                 score,
+                margin,
                 bar,
                 record.label,
                 record.start,
@@ -174,6 +179,9 @@ fn list(store: &Store) {
             notes += 1;
             continue;
         }
+        if !videoembed::store::is_video(record.kind) {
+            continue;
+        }
         match videos.iter_mut().find(|(name, _)| *name == record.label) {
             Some((_, count)) => *count += 1,
             None => videos.push((record.label.clone(), 1)),
@@ -181,7 +189,7 @@ fn list(store: &Store) {
     }
     println!("Videos ({}):", videos.len());
     for (name, count) in videos {
-        println!("  {name}  ({count} windows)");
+        println!("  {name}  ({count} records)");
     }
     println!("Notes: {notes}");
     println!("Total records: {}", store.records.len());
@@ -192,7 +200,7 @@ fn forget(store: &mut Store, rest: &str) -> Result<()> {
         bail!("usage: forget <video path>");
     }
     let removed = store.forget(rest)?;
-    println!("Removed {removed} windows for {rest}");
+    println!("Removed {removed} records for {rest}");
     Ok(())
 }
 
