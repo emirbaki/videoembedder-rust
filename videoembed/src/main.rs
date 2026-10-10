@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-use videoembed::embed::{DOC_PREFIX, Embedder, QUERY_PREFIX};
+use videoembed::embed::{DOC_PREFIX, Embedder, QUERY_PREFIX, dot};
 use videoembed::index;
-use videoembed::store::{KIND_NOTE, Record, Store};
+use videoembed::store::{KIND_FRAME, KIND_NOTE, Record, Store};
 
 fn main() -> Result<()> {
     let models = models_dir();
@@ -23,6 +23,7 @@ fn main() -> Result<()> {
         store.records.len()
     );
     println!("Commands: index <path> | note <text> | search <query> | list | forget <path> | quit");
+    println!("Measure the time grid: measure <query> | <another query>");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
@@ -67,6 +68,7 @@ fn run(embedder: &Embedder, store: &mut Store, line: &str) -> Result<()> {
         "index" => index(embedder, store, rest),
         "note" => note(embedder, store, rest),
         "search" => search(embedder, store, rest),
+        "measure" => measure(embedder, store, rest),
         "list" => {
             list(store);
             Ok(())
@@ -87,6 +89,68 @@ fn split_command(line: &str) -> (&str, &str) {
         Some(at) => (&line[..at], line[at..].trim()),
         None => (line, ""),
     }
+}
+
+/// Show where the best answer lands on a coarser time grid.
+///
+/// The frames are already embedded. A factor of 4 turns the 4 fps grid into a
+/// 1 fps grid, so the run costs one text embedding for each query. The run
+/// does not measure the audio packing or the timestamp text of the Google
+/// design. It measures the time grid alone.
+fn measure(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
+    let queries: Vec<&str> = rest
+        .split('|')
+        .map(|query| query.trim())
+        .filter(|query| !query.is_empty())
+        .collect();
+    if queries.is_empty() {
+        bail!("usage: measure <query> | <query> ...");
+    }
+    let vectors: Vec<Vec<f32>> = queries
+        .iter()
+        .map(|query| embedder.embed_text(&format!("{QUERY_PREFIX}{query}")))
+        .collect::<Result<Vec<_>>>()?;
+
+    println!(
+        "{:>6}  {:>7}  {:>6}  query: best frame, then the moment",
+        "factor", "grid", "frames"
+    );
+    for factor in [1usize, 2, 4, 8] {
+        let thin = index::thin_frames(&store.records, factor);
+        let frames = thin.iter().filter(|r| r.kind == KIND_FRAME).count();
+        if frames == 0 {
+            println!("{factor:>6}  no frame records");
+            continue;
+        }
+        let grid = index::FRAME_STEP * factor as f64;
+        let mut line = Vec::new();
+        for (at, query) in queries.iter().enumerate() {
+            let mut ranked: Vec<(usize, f32)> = thin
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, dot(&vectors[at], &r.vec)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let baseline = index::median(&ranked);
+            let groups = index::group_hits(&thin, &ranked, baseline);
+            // The best frame tells the grid cost. The moment tells what a
+            // person sees, and it spans every touching hit above the floor.
+            let best = ranked
+                .first()
+                .map(|(index, _)| format!("{:.2} s", thin[*index].start))
+                .unwrap_or_else(|| "none".to_string());
+            let moment = match groups.first().and_then(|g| g.hits.first()) {
+                Some(hit) => format!("{:.2}-{:.2} s", hit.start, hit.end),
+                None => "none".to_string(),
+            };
+            line.push(format!("{query}: {best} ({moment})"));
+        }
+        println!("{factor:>6}  {grid:>6.2}s  {frames:>6}  {}", line.join("  |  "));
+    }
+    println!();
+    println!("A factor of 4 makes a 1.00 s grid and a factor of 8 makes a 2.00 s grid.");
+    println!("The run does not measure the audio packing or the timestamp text.");
+    Ok(())
 }
 
 /// Cut one video into frames and audio clips, embed each one, and append.

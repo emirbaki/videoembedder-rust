@@ -545,6 +545,39 @@ pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
     moments
 }
 
+/// Keep one frame of every group of `factor` frames of each video.
+///
+/// The thinning measures the cost of a coarser time grid. Every other record
+/// stays, so the audio keeps its one second grid.
+pub fn thin_frames(records: &[Record], factor: usize) -> Vec<Record> {
+    if factor < 2 {
+        return records.to_vec();
+    }
+    // The frames of each video, in time order. A store may hold the frames of
+    // one video twice, so the order is taken from the start time.
+    let mut order: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if record.kind == crate::store::KIND_FRAME {
+            order.entry(record.label.as_str()).or_default().push(index);
+        }
+    }
+    let mut keep = vec![true; records.len()];
+    for indexes in order.values_mut() {
+        indexes.sort_by(|a, b| records[*a].start.total_cmp(&records[*b].start));
+        for (at, index) in indexes.iter().enumerate() {
+            if at % factor != 0 {
+                keep[*index] = false;
+            }
+        }
+    }
+    records
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| keep[*index])
+        .map(|(_, record)| record.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,5 +1006,48 @@ mod tests {
         assert_eq!(json["load_ms"], 0);
         assert_eq!(json["elapsed_ms"], 0);
         assert_eq!(json["per_second"], 0.0);
+    }
+
+    /// A factor of four keeps one frame of every four, and keeps the audio.
+    #[test]
+    fn thinning_keeps_one_frame_of_each_group() {
+        let mut records: Vec<Record> = (0..8)
+            .map(|i| record("a.mp4", i as f32 * 0.25, i as f32 * 0.25 + 0.25))
+            .collect();
+        records.push(record_of(crate::store::KIND_AUDIO, "a.mp4", 0.0, 1.0));
+        records.push(record_of(crate::store::KIND_AUDIO, "a.mp4", 1.0, 2.0));
+
+        let thin = thin_frames(&records, 4);
+
+        assert_eq!(thin.len(), 4, "two frames and two audio records");
+        let frames: Vec<f32> = thin
+            .iter()
+            .filter(|r| r.kind == crate::store::KIND_FRAME)
+            .map(|r| r.start)
+            .collect();
+        assert_eq!(frames, vec![0.0, 1.0]);
+    }
+
+    /// A factor of one keeps every record.
+    #[test]
+    fn a_factor_of_one_keeps_everything() {
+        let records = vec![record("a.mp4", 0.0, 0.25), record("a.mp4", 0.25, 0.5)];
+        assert_eq!(thin_frames(&records, 1).len(), 2);
+        assert_eq!(thin_frames(&records, 0).len(), 2);
+    }
+
+    /// Each video thins on its own, so a short video keeps its first frame.
+    #[test]
+    fn each_video_thins_on_its_own() {
+        let records = vec![
+            record("a.mp4", 0.0, 0.25),
+            record("b.mp4", 0.0, 0.25),
+            record("a.mp4", 0.25, 0.5),
+            record("b.mp4", 0.25, 0.5),
+        ];
+        let thin = thin_frames(&records, 2);
+        assert_eq!(thin.len(), 2);
+        assert!(thin.iter().any(|r| r.label == "a.mp4"));
+        assert!(thin.iter().any(|r| r.label == "b.mp4"));
     }
 }
