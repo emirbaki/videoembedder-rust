@@ -1,7 +1,8 @@
 # The store format change - analysis
 
 Date: 2026-10-11
-Status: the decision is the database. The engine choice is open.
+Status: the decision is SQLite, with the sqlite-vec extension. The schema
+design is open.
 
 ## 1. The items that need the change
 
@@ -249,40 +250,39 @@ So "there is no SQL for a scoped search" means this: the filter is code we
 write, and each filter column becomes an index we maintain by hand. SQLite,
 DuckDB, and LanceDB each carry that work already.
 
-## 9. The decision and the recommendation
+## 9. The decision and what follows
 
 The decision on 2026-10-11: the store moves to a database. The one-file rule
 goes. The shape is not A.
 
-What follows from that decision:
+The engine decision on 2026-10-11: SQLite, with the sqlite-vec extension. The
+blob way and the `vec0` way are not exclusive. SQLite holds the rows, the ids,
+the plans, and the finished list, and one `vec0` table holds the vectors.
 
-1. The engine owns the vectors, the ids, the plans, and the finished list.
+What follows from the two decisions:
+
+1. SQLite owns the rows, the ids, the plans, and the finished list. One `videos`
+   row holds the plan of each video and its finished mark, so `index.done` folds
+   in.
 2. A scoped search becomes a query, not our own filter code.
-3. The vector leaves the record as an fp16 blob, so the disk and the memory both
-   halve.
-4. An ANN index waits. Below about one million records the engine scores every
-   row, and the index earns its cost only near the top of that range. The index
-   is a library beside the database when it comes (section 7.3), not a second
-   engine.
-
-The engine choice stays open. SQLite carries the smallest weight and it matches
-Google's design. An embedded vector database (LanceDB) or DuckDB each carry a
-real index, and each brings a large dependency for an index we do not need yet.
-A pure-Rust key-value store carries no C, and it makes the filters our work
-again.
+3. The vector sits in the `vec0` table, not in the record row. One copy, one id.
+4. An ANN index waits. `vec0` scores every row, and the index earns its cost
+   only near one million records. The index is a library beside the database
+   when it comes (section 7.3), not a second engine.
+5. The `fp16` plan needs a new shape. `vec0` holds a `float[768]` column, so it
+   takes 4 bytes for each value, or a binary form on the quantized path. The
+   extension carries no `fp16` type, so the disk saving comes from a rebuild in
+   `f32` first, and from quantization later.
 
 ## 10. Open questions
 
-1. Which engine: SQLite, an embedded vector database, or a pure-Rust store?
-2. Does window mode land in the same change, or after the format is done? Two
+1. Does window mode land in the same change, or after the format is done? Two
    steps are safer, because the format change alone is testable on its own.
-3. Does the store need a source fingerprint (size and mtime)? Today a changed
+2. Does the store need a source fingerprint (size and mtime)? Today a changed
    file with the same path stays marked as finished, so the run skips it.
-4. Do the plans repeat inside every record, or do they get one row for each
-   video?
-5. Does the import of an old `VEI1` store run once at open, or as its own
+3. Does the import of an old `VEI1` store run once at open, or as its own
    command?
-6. Does the store keep the name `store/index.vei`, or take a new one?
+4. Does the store keep the name `store/index.vei`, or take a new one?
 
 ## 11. What stays the same
 
