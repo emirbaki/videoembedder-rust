@@ -3,31 +3,33 @@
 //! Type a command at the prompt. Each command works one step at a time.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use videoembed::embed::{DOC_PREFIX, Embedder, QUERY_PREFIX, dot};
+use videoembed::embed::{DOC_PREFIX, Device, Embedder, QUERY_PREFIX, dot};
 use videoembed::index;
 use videoembed::store::{KIND_FRAME, KIND_NOTE, Record, Store};
 
 fn main() -> Result<()> {
     let models = models_dir();
     let store_path = PathBuf::from("store/index.vei");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (asked, args) = split_device(args);
     println!("Loading models from {}", models.display());
-    let embedder = Embedder::load(&models, None)?;
+    let mut embedder = Embedder::load(&models, asked)?;
     let mut store = Store::open(&store_path)?;
     println!(
         "Store: {} ({} records)",
         store_path.display(),
         store.records.len()
     );
-    println!("Commands: index <path> | note <text> | search <query> | list | forget <path> | quit");
+    println!("Commands: index <path> | note <text> | search <query> | list | forget <path> | device gpu|cpu | quit");
     println!("Measure the time grid: measure <query> | <another query>");
+    println!("Start with --gpu or --cpu to pick the mode. The default is the card when it is here.");
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
-        run(&embedder, &mut store, &args.join(" "))?;
+        run(&mut embedder, &models, &mut store, &args.join(" "))?;
         return Ok(());
     }
 
@@ -43,11 +45,27 @@ fn main() -> Result<()> {
         if line.is_empty() {
             continue;
         }
-        if let Err(err) = run(&embedder, &mut store, line) {
+        if let Err(err) = run(&mut embedder, &models, &mut store, line) {
             println!("Error: {err:#}");
         }
     }
     Ok(())
+}
+
+/// Take the mode flag out of the arguments.
+///
+/// `--gpu` and `--cpu` name the device for the model load. Every other word
+/// stays in the command line, so a foreign flag reaches the command parser.
+fn split_device(args: Vec<String>) -> (Option<Device>, Vec<String>) {
+    let mut asked = None;
+    let mut rest = Vec::new();
+    for word in args {
+        match word.strip_prefix("--").and_then(Device::parse) {
+            Some(device) => asked = Some(device),
+            None => rest.push(word),
+        }
+    }
+    (asked, rest)
 }
 
 fn models_dir() -> PathBuf {
@@ -62,13 +80,14 @@ fn models_dir() -> PathBuf {
     }
 }
 
-fn run(embedder: &Embedder, store: &mut Store, line: &str) -> Result<()> {
+fn run(embedder: &mut Embedder, models: &Path, store: &mut Store, line: &str) -> Result<()> {
     let (command, rest) = split_command(line);
     match command {
         "index" => index(embedder, store, rest),
         "note" => note(embedder, store, rest),
         "search" => search(embedder, store, rest),
         "measure" => measure(embedder, store, rest),
+        "device" => device(embedder, models, rest),
         "list" => {
             list(store);
             Ok(())
@@ -89,6 +108,24 @@ fn split_command(line: &str) -> (&str, &str) {
         Some(at) => (&line[..at], line[at..].trim()),
         None => (line, ""),
     }
+}
+
+/// Load the model again on another device.
+///
+/// The load takes some seconds, and the old model serves until the new one is
+/// ready. A failure leaves the console on the device it had.
+fn device(embedder: &mut Embedder, models: &Path, rest: &str) -> Result<()> {
+    let Some(device) = Device::parse(rest) else {
+        bail!("usage: device gpu | device cpu");
+    };
+    if device == embedder.device() {
+        println!("Already on {}.", device.as_str());
+        return Ok(());
+    }
+    println!("Loading the model on {}.", device.as_str());
+    embedder.reload(models, device)?;
+    println!("Now on {}.", device.as_str());
+    Ok(())
 }
 
 /// Show where the best answer lands on a coarser time grid.
@@ -275,4 +312,33 @@ fn bar(score: f32) -> String {
 
 fn store_path_hint() -> &'static str {
     "store/index.vei"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The start reads the mode from a flag, and the flag leaves the command.
+    #[test]
+    fn the_mode_flag_comes_out_of_the_arguments() {
+        let (asked, rest) = split_device(vec!["index".into(), "a.mp4".into()]);
+        assert_eq!(asked, None);
+        assert_eq!(rest, vec!["index", "a.mp4"]);
+
+        let (asked, rest) = split_device(vec!["--cpu".into(), "index".into()]);
+        assert_eq!(asked, Some(Device::Cpu));
+        assert_eq!(rest, vec!["index"]);
+
+        let (asked, rest) = split_device(vec!["search".into(), "--gpu".into(), "blue".into()]);
+        assert_eq!(asked, Some(Device::Gpu));
+        assert_eq!(rest, vec!["search", "blue"]);
+    }
+
+    /// A word that starts with `--` is not a mode, and it stays in the command.
+    #[test]
+    fn a_foreign_flag_stays_in_the_command() {
+        let (asked, rest) = split_device(vec!["--verbose".into(), "list".into()]);
+        assert_eq!(asked, None);
+        assert_eq!(rest, vec!["--verbose", "list"]);
+    }
 }
