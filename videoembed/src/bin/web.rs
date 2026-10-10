@@ -557,6 +557,15 @@ fn start_index(
     Ok(count)
 }
 
+/// True when one finished run left a whole index for its video.
+///
+/// A finished video takes the finished mark, and the mark keeps it out of
+/// every later run. A run that failed part way holds a partial answer, so it
+/// takes no mark and the next run indexes the video again.
+fn run_left_a_whole_index(outcome: &Result<Option<Record>>) -> bool {
+    matches!(outcome, Ok(None))
+}
+
 /// One media item of work. True means the whole job has finished or stopped.
 fn step_job(
     embedder: &Embedder,
@@ -604,6 +613,7 @@ fn step_job(
     }
 
     let outcome = job.run.as_mut().unwrap().step(embedder, ctx);
+    let whole = run_left_a_whole_index(&outcome);
     let mut finished = false;
     match outcome {
         Ok(Some(record)) => job.records.push(record),
@@ -616,12 +626,18 @@ fn step_job(
 
     if finished {
         let records = std::mem::take(&mut job.records);
-        job.indexed += records.len();
-        if let Err(err) = store.append(records) {
-            fail(progress, &err);
-        }
-        if let Err(err) = store.mark_done(&job.label) {
-            fail(progress, &err);
+        if whole {
+            job.indexed += records.len();
+            if let Err(err) = store.append(records) {
+                fail(progress, &err);
+            }
+            if let Err(err) = store.mark_done(&job.label) {
+                fail(progress, &err);
+            }
+        } else {
+            // The run failed part way. The records of the partial answer go,
+            // as they do when the user stops a job, and the video takes no
+            // finished mark. The next run then indexes the whole video again.
         }
         job.run = None;
         job.file_at += 1;
@@ -1120,5 +1136,26 @@ mod tests {
         assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("a.mp4", 1.5, 320));
         assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("a.mp4", 1.0, 640));
         assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("b.mp4", 1.0, 320));
+    }
+
+    /// Only a run that reached its end may mark its video as finished.
+    ///
+    /// The mark keeps a video out of every later run, so a run that failed
+    /// part way must leave no mark. The video then indexes again.
+    #[test]
+    fn only_a_run_that_reached_its_end_is_whole() {
+        let more_work = Ok(Some(Record {
+            kind: videoembed::store::KIND_FRAME,
+            label: "a.mp4".to_string(),
+            start: 0.0,
+            end: 0.25,
+            vec: vec![1.0, 0.0],
+        }));
+        assert!(!run_left_a_whole_index(&more_work), "the run is not finished");
+        assert!(run_left_a_whole_index(&Ok(None)), "the run reached its end");
+        assert!(
+            !run_left_a_whole_index(&Err(anyhow!("a broken frame"))),
+            "a failed run holds a partial answer"
+        );
     }
 }
