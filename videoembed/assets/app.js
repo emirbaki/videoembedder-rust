@@ -109,12 +109,40 @@ async function stopIndex() {
   }
 }
 
+// Load the model again on the chosen device.
+async function switchDevice() {
+  $("device").disabled = true;
+  note("");
+  try {
+    const answer = await api("/api/device", { device: $("device").value });
+    mode = answer.device === "GPU" ? "gpu" : "cpu";
+    $("device").value = mode;
+  } catch (err) {
+    // The load failed, so the old mode is still the active one.
+    $("device").value = mode;
+    note(err.message);
+  }
+  $("device").disabled = false;
+}
+
 // The active mode, and a word about the card when the build has none.
 function deviceLabel(p) {
   return p.device + (p.gpu_available ? "" : " - this build has no card");
 }
 
+// The active mode, as the control spells it.
+let mode = "gpu";
+
+// The mode of one progress answer, as the control spells it.
+function modeName(p) {
+  return p.device === "GPU" ? "gpu" : "cpu";
+}
+
 function showProgress(p) {
+  // The control shows the active mode, and it waits during a job.
+  mode = modeName(p);
+  $("device").value = mode;
+  $("device").disabled = p.running;
   $("progress").hidden = !p.running && p.indexed === 0 && !p.error;
   const width = p.window_count > 0 ? (p.window * 100) / p.window_count : 0;
   $("progress-bar").style.width = width + "%";
@@ -363,8 +391,10 @@ function boot() {
   $("pick").addEventListener("click", pickFolder);
   $("start").addEventListener("click", startIndex);
   $("stop").addEventListener("click", stopIndex);
+  $("device").addEventListener("change", switchDevice);
   $("search-form").addEventListener("submit", runSearch);
   $("quit").addEventListener("click", quit);
+  api("/api/progress").then(showProgress).catch(() => {});
   refreshState().catch((err) => note(err.message));
   refreshVideos().catch((err) => note(err.message));
 }

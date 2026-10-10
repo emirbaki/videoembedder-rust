@@ -14,7 +14,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use videoembed::embed::{Embedder, QUERY_PREFIX};
+use videoembed::embed::{Device, Embedder, QUERY_PREFIX};
 use videoembed::index::{self, Group, Progress};
 use videoembed::media;
 use videoembed::store::{Record, Store, normalize_label};
@@ -60,6 +60,11 @@ enum Job {
     Search {
         query: String,
         answer: Sender<Result<SearchAnswer, JobError>>,
+    },
+    /// Load the model again on another device. The answer names the new mode.
+    SetDevice {
+        device: Device,
+        answer: Sender<Result<String, JobError>>,
     },
 }
 
@@ -108,6 +113,18 @@ struct PathBody {
 #[derive(Debug, Deserialize)]
 struct QueryBody {
     query: String,
+}
+
+/// The mode a switch asks for, as "gpu" or "cpu".
+#[derive(Debug, Deserialize)]
+struct DeviceBody {
+    device: String,
+}
+
+/// The mode the model now runs on.
+#[derive(Serialize)]
+struct DeviceName {
+    device: String,
 }
 
 #[derive(Serialize)]
@@ -407,7 +424,8 @@ fn videos(store: &Store) -> Vec<VideoRow> {
 
 /// Answer jobs forever. A running index does one media item per turn.
 fn engine_loop(
-    embedder: Embedder,
+    mut embedder: Embedder,
+    models: PathBuf,
     mut store: Store,
     progress: Arc<Mutex<Progress>>,
     key: String,
@@ -423,7 +441,7 @@ fn engine_loop(
     let mut pending: Option<WebJob> = None;
     let stopped = Arc::new(AtomicBool::new(false));
     loop {
-        if pending.is_some() {
+        let request = if pending.is_some() {
             let done = step_job(
                 &embedder,
                 &mut ctx,
@@ -435,13 +453,77 @@ fn engine_loop(
             if done {
                 pending = None;
             }
+            let mut held = None;
             while let Ok(job) = jobs.try_recv() {
-                handle(job, &embedder, &mut store, &progress, &key, &stopped, &mut pending);
+                if let Some(next) = handle(job, &embedder, &mut store, &progress, &key, &stopped, &mut pending) {
+                    match held {
+                        // One load at a time. The loop holds one request.
+                        Some(_) => next.refuse(),
+                        None => held = Some(next),
+                    }
+                }
             }
+            held
         } else {
             match jobs.recv() {
                 Ok(job) => handle(job, &embedder, &mut store, &progress, &key, &stopped, &mut pending),
                 Err(_) => break,
+            }
+        };
+
+        if let Some(Switch::SetDevice { device, answer }) = request {
+            let started = std::time::Instant::now();
+            // The new model loads before the old one leaves, so a failure
+            // keeps the server on the device it had.
+            match embedder.prepare(&models, device) {
+                Ok((device, model, mtmd)) => {
+                    // The context borrows the old model, so it goes first.
+                    drop(ctx);
+                    embedder.swap(device, model, mtmd);
+                    ctx = match embedder.new_context() {
+                        Ok(next) => next,
+                        Err(err) => {
+                            // A model with no context serves nothing.
+                            fail(&progress, &err);
+                            let _ = answer.send(Err(JobError::from(err)));
+                            break;
+                        }
+                    };
+                    let load_ms = started.elapsed().as_millis() as u64;
+                    {
+                        let mut held = progress.lock().unwrap();
+                        held.device = device.as_str().to_string();
+                        held.gpu_available = embedder.supports_gpu();
+                        held.load_ms = load_ms;
+                    }
+                    let _ = answer.send(Ok(device.as_str().to_string()));
+                }
+                Err(err) => {
+                    let _ = answer.send(Err(JobError::from(err)));
+                }
+            }
+        }
+    }
+}
+
+/// A change that the engine loop must make itself.
+///
+/// A job handler sees the store and the model by shared reference. The loop
+/// owns the model and the working context, so a device switch lands there.
+enum Switch {
+    /// Load the model again on another device. The answer names the new mode.
+    SetDevice {
+        device: Device,
+        answer: Sender<Result<String, JobError>>,
+    },
+}
+
+impl Switch {
+    /// Refuse this request, because the loop already holds one.
+    fn refuse(self) {
+        match self {
+            Self::SetDevice { answer, .. } => {
+                let _ = answer.send(Err(JobError::Busy));
             }
         }
     }
@@ -455,7 +537,7 @@ fn handle(
     key: &str,
     stopped: &Arc<AtomicBool>,
     pending: &mut Option<WebJob>,
-) {
+) -> Option<Switch> {
     match job {
         Job::State(answer) => {
             let count = videos(store).len();
@@ -487,7 +569,17 @@ fn handle(
             stopped.store(true, Ordering::Relaxed);
             let _ = answer.send(running);
         }
+        Job::SetDevice { device, answer } => {
+            // The loop owns the model, so the load happens there.
+            match refuse_when_busy(pending) {
+                Ok(()) => return Some(Switch::SetDevice { device, answer }),
+                Err(err) => {
+                    let _ = answer.send(Err(err));
+                }
+            }
+        }
     }
+    None
 }
 
 fn search(embedder: &Embedder, store: &Store, query: &str) -> Result<SearchAnswer, JobError> {
@@ -507,15 +599,24 @@ fn search(embedder: &Embedder, store: &Store, query: &str) -> Result<SearchAnswe
     })
 }
 
+/// Refuse a new action while the engine runs a job.
+///
+/// The engine holds one job. A second index would fight the first, and a
+/// switch of device would drop the model under it.
+fn refuse_when_busy(pending: &Option<WebJob>) -> Result<(), JobError> {
+    if pending.is_some() {
+        return Err(JobError::Busy);
+    }
+    Ok(())
+}
+
 fn start_index(
     progress: &Arc<Mutex<Progress>>,
     pending: &mut Option<WebJob>,
     flag: &Arc<AtomicBool>,
     folder: &Path,
 ) -> Result<usize, JobError> {
-    if pending.is_some() {
-        return Err(JobError::Busy);
-    }
+    refuse_when_busy(pending)?;
     if !folder.is_dir() {
         return Err(JobError::Message(format!(
             "{} is not a folder",
@@ -854,6 +955,31 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
                 _ => request.respond(error_reply(500, "the engine stopped"))?,
             }
         }
+        (true, "/api/device") => {
+            let body: DeviceBody = match read_body(&mut request) {
+                Ok(body) => body,
+                Err((code, message)) => {
+                    request.respond(error_reply(code, &message))?;
+                    return Ok(());
+                }
+            };
+            let Some(device) = Device::parse(&body.device) else {
+                request.respond(error_reply(400, "the device must be gpu or cpu"))?;
+                return Ok(());
+            };
+            let (answer, wait) = channel();
+            let _ = jobs.send(Job::SetDevice { device, answer });
+            match wait.recv() {
+                Ok(Ok(device)) => request.respond(json_reply(&DeviceName { device }))?,
+                Ok(Err(JobError::Busy)) => {
+                    request.respond(error_reply(409, "an index job already runs"))?
+                }
+                Ok(Err(JobError::Message(message))) => {
+                    request.respond(error_reply(400, &message))?
+                }
+                Err(_) => request.respond(error_reply(500, "the engine stopped"))?,
+            }
+        }
         (true, "/api/index") => {
             let body: PathBody = match read_body(&mut request) {
                 Ok(body) => body,
@@ -961,7 +1087,7 @@ fn main() -> Result<()> {
             }
         };
         let _ = ready_tx.send(Ok(()));
-        engine_loop(embedder, store, engine_progress, engine_key, jobs_rx);
+        engine_loop(embedder, models, store, engine_progress, engine_key, jobs_rx);
     });
 
     match ready_rx.recv().context("the engine thread stopped early")? {
@@ -1141,6 +1267,29 @@ mod tests {
         assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("a.mp4", 1.5, 320));
         assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("a.mp4", 1.0, 640));
         assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("b.mp4", 1.0, 320));
+    }
+
+    /// One job with no work, for the tests that need a busy engine.
+    fn test_job() -> WebJob {
+        WebJob {
+            files: Vec::new(),
+            file_at: 0,
+            run: None,
+            records: Vec::new(),
+            indexed: 0,
+            started: std::time::Instant::now(),
+            label: String::new(),
+        }
+    }
+
+    /// The engine holds one job, so a busy engine refuses a new action.
+    ///
+    /// A switch of device drops the model, and a running index holds it.
+    #[test]
+    fn a_busy_engine_refuses_a_new_action() {
+        let none: Option<WebJob> = None;
+        assert!(refuse_when_busy(&none).is_ok());
+        assert!(refuse_when_busy(&Some(test_job())).is_err());
     }
 
     /// Only a run that reached its end may mark its video as finished.

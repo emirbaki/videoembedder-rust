@@ -47,6 +47,18 @@ button {
 button:hover { background: #30363d; }
 button:disabled { opacity: 0.45; cursor: default; }
 
+.device-pick { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.85rem; color: var(--dim); margin-left: 0.5rem; }
+#device {
+  font: inherit;
+  color: inherit;
+  background: #21262d;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+}
+#device:disabled { opacity: 0.45; cursor: default; }
+
 input[type="search"] {
   font: inherit;
   color: inherit;

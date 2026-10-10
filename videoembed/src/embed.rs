@@ -161,17 +161,39 @@ impl Embedder {
         Ok((model, mtmd))
     }
 
+    /// Load the model and the projection for one device, ready to swap in.
+    ///
+    /// The call takes the embedder by shared reference, so a caller may keep a
+    /// context open while the new model loads. The old model stays in place
+    /// until [`Embedder::swap`], so a failure here changes nothing.
+    pub fn prepare(
+        &self,
+        models: &Path,
+        device: Device,
+    ) -> Result<(Device, LlamaModel, MtmdContext)> {
+        let device = choose_device(&self.backend, Some(device))?;
+        let (model, mtmd) = Self::open(models, &self.backend, device)?;
+        Ok((device, model, mtmd))
+    }
+
+    /// Take a model pair from [`Embedder::prepare`].
+    ///
+    /// Every context of the old model is dead from here: a context borrows the
+    /// model, so the caller must drop it before this call.
+    pub fn swap(&mut self, device: Device, model: LlamaModel, mtmd: MtmdContext) {
+        self.model = model;
+        self.mtmd = mtmd;
+        self.device = device;
+    }
+
     /// Load the model again on another device.
     ///
     /// The old model stays in place until the new one is ready, so a failure
     /// leaves a working embedder. The caller must drop every context first,
     /// because a context borrows the model.
     pub fn reload(&mut self, models: &Path, device: Device) -> Result<()> {
-        let device = choose_device(&self.backend, Some(device))?;
-        let (model, mtmd) = Self::open(models, &self.backend, device)?;
-        self.model = model;
-        self.mtmd = mtmd;
-        self.device = device;
+        let (device, model, mtmd) = self.prepare(models, device)?;
+        self.swap(device, model, mtmd);
         Ok(())
     }
 
