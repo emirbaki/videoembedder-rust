@@ -77,6 +77,51 @@ fn run_ffmpeg(args: Vec<String>, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run ffmpeg and give back its standard output.
+///
+/// The frame pipe of `thumb_jpeg` writes the picture bytes there.
+fn run_ffmpeg_out(args: Vec<String>, what: &str) -> Result<Vec<u8>> {
+    let mut full: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+    ];
+    full.extend(args);
+    let out = Command::new(FFMPEG).args(&full).output()?;
+    if !out.status.success() {
+        bail!("ffmpeg failed while {what}");
+    }
+    if out.stdout.is_empty() {
+        bail!("ffmpeg gave no picture while {what}");
+    }
+    Ok(out.stdout)
+}
+
+/// Cut one JPEG frame at a time, scaled to a width. The bytes come back.
+///
+/// The seek flag comes before the input, so ffmpeg seeks fast. A time past the
+/// end of the video gives no frame, and the call refuses.
+pub fn thumb_jpeg(video: &Path, at: f64, width: u32) -> Result<Vec<u8>> {
+    let args = vec![
+        "-y".into(),
+        "-ss".into(),
+        format!("{at}"),
+        "-i".into(),
+        video.to_string_lossy().to_string(),
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        format!("scale={width}:-2"),
+        "-f".into(),
+        "image2pipe".into(),
+        "-vcodec".into(),
+        "mjpeg".into(),
+        "-".into(),
+    ];
+    run_ffmpeg_out(args, "cutting a thumbnail")
+}
+
 /// True when the video holds at least one audio stream.
 ///
 /// A video with no audio track gives false. An ffprobe that fails gives false.
@@ -315,5 +360,35 @@ mod tests {
         let outcome = extract_frames(Path::new("no_such_video.mp4"), 0.0, 1.0, 4.0, &dir);
         assert!(outcome.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A thumbnail is a JPEG, and the bytes start with the JPEG marker.
+    #[test]
+    fn a_thumb_is_a_jpeg() {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        }
+        let bytes = thumb_jpeg(&video, 1.0, 320).unwrap();
+        assert!(bytes.len() > 200, "got {} bytes", bytes.len());
+        assert_eq!(bytes[0], 0xff);
+        assert_eq!(bytes[1], 0xd8);
+    }
+
+    /// A cut past the end gives no frame, so the call must refuse.
+    #[test]
+    fn a_thumb_past_the_end_is_an_error() {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        }
+        assert!(thumb_jpeg(&video, 1000.0, 320).is_err());
+    }
+
+    #[test]
+    fn a_thumb_of_a_missing_file_is_an_error() {
+        assert!(thumb_jpeg(Path::new("no_such_video.mp4"), 0.0, 320).is_err());
     }
 }

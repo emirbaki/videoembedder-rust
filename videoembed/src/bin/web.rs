@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use videoembed::embed::{Embedder, QUERY_PREFIX};
 use videoembed::index::{self, Group, Progress};
+use videoembed::media;
 use videoembed::store::{Record, Store, normalize_label};
 
 type Reply = Response<Box<dyn Read + Send>>;
@@ -28,6 +29,12 @@ const BACKEND: &str = "CUDA";
 const BACKEND: &str = "CPU";
 /// The most bytes one request body may hold.
 const MAX_BODY: usize = 1024 * 1024;
+/// The number of thumbnails kept in memory.
+const THUMB_CAP: usize = 256;
+/// The width of one thumbnail in pixels.
+const THUMB_WIDTH: u32 = 320;
+/// The largest thumbnail width a request may ask for.
+const THUMB_MAX_WIDTH: u32 = 1024;
 const PAGE: &str = include_str!("../../assets/index.html");
 const JS: &str = include_str!("../../assets/app.js");
 const CSS: &str = include_str!("../../assets/app.css");
@@ -226,6 +233,21 @@ fn decode(text: &str) -> String {
     percent_encoding::percent_decode_str(&text.replace('+', " "))
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// One key for one thumbnail. The time is rounded to the tenth of a second.
+fn thumb_key(path: &str, at: f32, width: u32) -> String {
+    format!("{path}|{:.1}|{width}", at)
+}
+
+/// Put one thumbnail in the cache. The oldest entry leaves when it is full.
+fn cache_thumb(cache: &mut HashMap<String, Arc<Vec<u8>>>, key: String, bytes: Vec<u8>) {
+    if cache.len() >= THUMB_CAP && !cache.contains_key(&key) {
+        if let Some(first) = cache.keys().next().cloned() {
+            cache.remove(&first);
+        }
+    }
+    cache.insert(key, Arc::new(bytes));
 }
 
 fn mime_of(path: &Path) -> &'static str {
@@ -640,10 +662,17 @@ fn handle_request(
     jobs: &Sender<Job>,
     progress: &Arc<Mutex<Progress>>,
     key: &str,
+    thumbs: &Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
 ) -> Result<()> {
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
     let post = request.method() == &Method::Post;
+
+    // A thumbnail cuts a frame on this thread, so a search and an index keep
+    // running. The route never waits on the engine loop.
+    if path == "/api/frame" && request.method() == &Method::Get {
+        return serve_frame(request, &url, key, jobs, thumbs);
+    }
 
     match path.as_str() {
         "/" => request.respond(text_reply(200, "text/html; charset=utf-8", PAGE))?,
@@ -701,6 +730,67 @@ fn serve_video(request: Request, path: Option<String>, jobs: &Sender<Job>) -> Re
         Err(err) => {
             let message = format!("{err:#}");
             request.respond(error_reply(500, &message))?;
+        }
+    }
+    Ok(())
+}
+
+/// One thumbnail. The index check runs on the engine. The cut runs here.
+fn serve_frame(
+    request: Request,
+    url: &str,
+    http_key: &str,
+    jobs: &Sender<Job>,
+    thumbs: &Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+) -> Result<()> {
+    // `params` reads the whole URL, so a query alone gives no pair.
+    let args = params(url);
+    if args.get("key").map(String::as_str) != Some(http_key) {
+        request.respond(error_reply(403, "the key is missing"))?;
+        return Ok(());
+    }
+    let path = args.get("path").cloned().unwrap_or_default();
+    if path.is_empty() {
+        request.respond(error_reply(400, "the path is missing"))?;
+        return Ok(());
+    }
+    let at = args
+        .get("t")
+        .and_then(|text| text.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    let Some(at) = at else {
+        request.respond(error_reply(400, "the time is not a number"))?;
+        return Ok(());
+    };
+    let width = args
+        .get("w")
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|value| *value > 0 && *value <= THUMB_MAX_WIDTH)
+        .unwrap_or(THUMB_WIDTH);
+
+    let key = thumb_key(&path, at, width);
+    if let Some(bytes) = thumbs.lock().unwrap().get(&key).cloned() {
+        request.respond(bytes_reply(200, "image/jpeg", bytes.as_ref().clone()))?;
+        return Ok(());
+    }
+
+    let (answer, wait) = channel();
+    let _ = jobs.send(Job::Holds {
+        path: path.clone(),
+        answer,
+    });
+    if !matches!(wait.recv(), Ok(true)) {
+        request.respond(error_reply(403, "that video is not in the index"))?;
+        return Ok(());
+    }
+
+    match media::thumb_jpeg(Path::new(&path), at as f64, width) {
+        Ok(bytes) => {
+            cache_thumb(&mut thumbs.lock().unwrap(), key, bytes.clone());
+            request.respond(bytes_reply(200, "image/jpeg", bytes))?;
+        }
+        Err(err) => {
+            request.respond(error_reply(400, &format!("{err:#}")))?;
         }
     }
     Ok(())
@@ -820,6 +910,7 @@ fn main() -> Result<()> {
     let models = models_dir();
     let store_path = PathBuf::from("store/index.vei");
     let progress = Arc::new(Mutex::new(Progress::default()));
+    let thumbs = Arc::new(Mutex::new(HashMap::new()));
     let (jobs_tx, jobs_rx) = channel::<Job>();
     let (ready_tx, ready_rx) = channel::<Result<(), String>>();
     let key = make_key();
@@ -866,8 +957,9 @@ fn main() -> Result<()> {
         let jobs = jobs_tx.clone();
         let progress = Arc::clone(&progress);
         let key = key.clone();
+        let thumbs = Arc::clone(&thumbs);
         std::thread::spawn(move || {
-            if let Err(err) = handle_request(request, &jobs, &progress, &key) {
+            if let Err(err) = handle_request(request, &jobs, &progress, &key, &thumbs) {
                 eprintln!("A request failed: {err:#}");
             }
         });
@@ -1019,5 +1111,14 @@ mod tests {
         assert_eq!(rows[0].path, "a.mp4");
         assert_eq!(rows[0].items, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two hits at the same time share one cache entry, and a width splits it.
+    #[test]
+    fn the_thumb_key_covers_the_path_the_time_and_the_width() {
+        assert_eq!(thumb_key("a.mp4", 1.0, 320), thumb_key("a.mp4", 1.0, 320));
+        assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("a.mp4", 1.5, 320));
+        assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("a.mp4", 1.0, 640));
+        assert_ne!(thumb_key("a.mp4", 1.0, 320), thumb_key("b.mp4", 1.0, 320));
     }
 }

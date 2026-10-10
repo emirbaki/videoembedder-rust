@@ -196,9 +196,21 @@ function renderGroups(groups, baseline) {
       const row = document.createElement("button");
       row.type = "button";
       row.className = "hit";
-      row.textContent =
+
+      const shot = document.createElement("img");
+      shot.className = "shot";
+      shot.loading = "lazy";
+      shot.alt = "frame at " + hit.start.toFixed(2) + " s";
+      shot.src = "/api/frame?key=" + encodeURIComponent(key) +
+        "&path=" + encodeURIComponent(group.video) +
+        "&t=" + hit.start.toFixed(2) + "&w=320";
+
+      const text = document.createElement("span");
+      text.textContent =
         hit.score.toFixed(3) + " (" + hit.margin.toFixed(3) + ")  " +
         hit.start.toFixed(2) + "-" + hit.end.toFixed(2) + " s";
+
+      row.append(shot, text);
       row.addEventListener("click", () => play(group.video, hit.start));
       item.appendChild(row);
     }
