@@ -289,7 +289,12 @@ impl IndexRun {
             Phase::Frames => {
                 self.frame_at += 1;
                 if self.frame_at >= self.frames.len() {
-                    self.phase = Phase::Audio;
+                    // A video with no audio track has no second phase.
+                    self.phase = if self.audios.is_empty() {
+                        Phase::Done
+                    } else {
+                        Phase::Audio
+                    };
                     self.audio_at = 0;
                     self.files.clear();
                     self.batch_from = 0;
@@ -307,7 +312,8 @@ impl IndexRun {
 
     fn cut_batch(&mut self) -> Result<()> {
         self.clear_dir();
-        if self.phase == Phase::Done {
+        if self.phase == Phase::Done || self.plan().is_empty() {
+            self.phase = Phase::Done;
             return Ok(());
         }
         let at = self.at();
@@ -604,6 +610,37 @@ mod tests {
         assert_eq!(seen.len(), 150);
         assert_eq!(seen[0], (1, 150));
         assert_eq!(seen[149], (150, 150));
+    }
+
+    /// A video with no audio track has an empty audio plan.
+    ///
+    /// The run must then end after the last frame. It must not ask the plan
+    /// for an audio clip, because that plan holds no item.
+    #[test]
+    fn the_run_ends_after_the_frames_when_the_audio_plan_is_empty() {
+        let mut run = IndexRun {
+            video: PathBuf::from("silent.mp4"),
+            label: "silent.mp4".to_string(),
+            duration: 1.0,
+            frames: vec![0.0, 0.25, 0.5, 0.75],
+            audios: Vec::new(),
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::new(),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+        };
+
+        for _ in 0..run.frames.len() {
+            run.advance();
+        }
+
+        assert!(run.phase == Phase::Done);
+        assert_eq!(run.remaining_in_batch(), 0);
+        assert!(run.cut_batch().is_ok());
+        assert!(run.phase == Phase::Done);
     }
 
     #[test]

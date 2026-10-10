@@ -524,15 +524,7 @@ fn step_job(
                 if let Err(err) = store.forget(&label) {
                     fail(progress, &err);
                 }
-                let total = run.total();
-                {
-                    let mut held = progress.lock().unwrap();
-                    held.file = label;
-                    held.file_index = job.file_at + 1;
-                    held.window = 0;
-                    held.window_count = total;
-                    held.error = None;
-                }
+                begin_file(progress, label, job.file_at + 1, run.total());
                 job.records.clear();
                 job.run = Some(run);
             }
@@ -568,6 +560,18 @@ fn step_job(
         held.window = job.run.as_ref().map(|r| r.done()).unwrap_or(0);
         held.indexed = job.indexed + job.records.len();
     }
+}
+
+/// Point the progress at a new file.
+///
+/// The call does not touch the error field. A failure of an earlier file
+/// must reach the page, and the page reads the error field.
+fn begin_file(progress: &Arc<Mutex<Progress>>, label: String, number: usize, total: usize) {
+    let mut held = progress.lock().unwrap();
+    held.file = label;
+    held.file_index = number;
+    held.window = 0;
+    held.window_count = total;
 }
 
 fn fail(progress: &Arc<Mutex<Progress>>, err: &anyhow::Error) {
@@ -802,6 +806,25 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure of one file must survive the start of the next file.
+    ///
+    /// The page reads the error field for the whole run. A new file that
+    /// clears the field hides the failure of the file before it.
+    #[test]
+    fn a_new_file_keeps_the_error_of_an_earlier_file() {
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        progress.lock().unwrap().error = Some("clip two failed".to_string());
+
+        begin_file(&progress, "clip-three.mp4".to_string(), 3, 12);
+
+        let held = progress.lock().unwrap();
+        assert_eq!(held.error.as_deref(), Some("clip two failed"));
+        assert_eq!(held.file, "clip-three.mp4");
+        assert_eq!(held.file_index, 3);
+        assert_eq!(held.window, 0);
+        assert_eq!(held.window_count, 12);
+    }
 
     #[test]
     fn a_plain_range_asks_for_the_first_hundred_bytes() {
