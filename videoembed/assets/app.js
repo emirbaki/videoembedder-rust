@@ -89,12 +89,22 @@ async function pickFolder() {
 async function startIndex() {
   if (folder === null) return;
   $("start").disabled = true;
+  $("stop").disabled = false;
   note("");
   try {
     await api("/api/index", { path: folder });
     startPolling();
   } catch (err) {
     $("start").disabled = false;
+    $("stop").disabled = true;
+    note(err.message);
+  }
+}
+
+async function stopIndex() {
+  try {
+    await api("/api/stop", {});
+  } catch (err) {
     note(err.message);
   }
 }
@@ -139,6 +149,7 @@ async function pollProgress() {
   clearInterval(timer);
   timer = null;
   $("start").disabled = false;
+  $("stop").disabled = true;
   await refreshVideos();
   await refreshState();
 }
@@ -334,6 +345,7 @@ async function quit() {
 function boot() {
   $("pick").addEventListener("click", pickFolder);
   $("start").addEventListener("click", startIndex);
+  $("stop").addEventListener("click", stopIndex);
   $("search-form").addEventListener("submit", runSearch);
   $("quit").addEventListener("click", quit);
   refreshState().catch((err) => note(err.message));

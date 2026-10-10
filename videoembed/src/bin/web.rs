@@ -12,6 +12,8 @@ use llama_cpp_2::context::LlamaContext;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use videoembed::embed::{Embedder, QUERY_PREFIX};
 use videoembed::index::{self, Group, Progress};
 use videoembed::store::{Record, Store, normalize_label};
@@ -34,6 +36,8 @@ const CSS: &str = include_str!("../../assets/app.css");
 enum Job {
     State(Sender<State>),
     Videos(Sender<Vec<VideoRow>>),
+    /// Stop the running index job. The answer says whether one ran.
+    StopIndex { answer: Sender<bool> },
     Holds {
         path: String,
         answer: Sender<bool>,
@@ -394,21 +398,26 @@ fn engine_loop(
         }
     };
     let mut pending: Option<WebJob> = None;
+    let stopped = Arc::new(AtomicBool::new(false));
     loop {
         if pending.is_some() {
-            step_job(
+            let done = step_job(
                 &embedder,
                 &mut ctx,
                 &mut store,
                 &progress,
+                &stopped,
                 pending.as_mut().unwrap(),
             );
+            if done {
+                pending = None;
+            }
             while let Ok(job) = jobs.try_recv() {
-                handle(job, &embedder, &mut store, &progress, &key, &mut pending);
+                handle(job, &embedder, &mut store, &progress, &key, &stopped, &mut pending);
             }
         } else {
             match jobs.recv() {
-                Ok(job) => handle(job, &embedder, &mut store, &progress, &key, &mut pending),
+                Ok(job) => handle(job, &embedder, &mut store, &progress, &key, &stopped, &mut pending),
                 Err(_) => break,
             }
         }
@@ -421,6 +430,7 @@ fn handle(
     store: &mut Store,
     progress: &Arc<Mutex<Progress>>,
     key: &str,
+    stopped: &Arc<AtomicBool>,
     pending: &mut Option<WebJob>,
 ) {
     match job {
@@ -447,7 +457,12 @@ fn handle(
             let _ = answer.send(search(embedder, store, &query));
         }
         Job::StartIndex { folder, answer } => {
-            let _ = answer.send(start_index(progress, pending, &folder));
+            let _ = answer.send(start_index(progress, pending, stopped, &folder));
+        }
+        Job::StopIndex { answer } => {
+            let running = pending.is_some();
+            stopped.store(true, Ordering::Relaxed);
+            let _ = answer.send(running);
         }
     }
 }
@@ -472,6 +487,7 @@ fn search(embedder: &Embedder, store: &Store, query: &str) -> Result<SearchAnswe
 fn start_index(
     progress: &Arc<Mutex<Progress>>,
     pending: &mut Option<WebJob>,
+    flag: &Arc<AtomicBool>,
     folder: &Path,
 ) -> Result<usize, JobError> {
     if pending.is_some() {
@@ -491,13 +507,18 @@ fn start_index(
         )));
     }
     let count = files.len();
+    flag.store(false, Ordering::Relaxed);
     {
         let mut held = progress.lock().unwrap();
+        // The model load time belongs to the server, not to this job. Hold it,
+        // because the page shows it after the job ends.
+        let load_ms = held.load_ms;
         *held = Progress {
             running: true,
             folder: folder.display().to_string(),
             file_count: count,
             backend: BACKEND.to_string(),
+            load_ms,
             ..Progress::default()
         };
     }
@@ -513,17 +534,27 @@ fn start_index(
 }
 
 /// One media item of work, or the move to the next file.
+/// One media item of work. True means the whole job has finished or stopped.
 fn step_job(
     embedder: &Embedder,
     ctx: &mut LlamaContext<'_>,
     store: &mut Store,
     progress: &Arc<Mutex<Progress>>,
+    flag: &Arc<AtomicBool>,
     job: &mut WebJob,
-) {
+) -> bool {
+    if flag.load(Ordering::Relaxed) {
+        // Drop the partial work of this video. A half-indexed video reads as a
+        // whole one on the next search.
+        job.run = None;
+        job.records.clear();
+        progress.lock().unwrap().running = false;
+        return true;
+    }
     if job.run.is_none() {
         if job.file_at >= job.files.len() {
             progress.lock().unwrap().running = false;
-            return;
+            return true;
         }
         let video = job.files[job.file_at].clone();
         match index::IndexRun::start(&video) {
@@ -541,7 +572,7 @@ fn step_job(
                 job.file_at += 1;
             }
         }
-        return;
+        return false;
     }
 
     let outcome = job.run.as_mut().unwrap().step(embedder, ctx);
@@ -563,6 +594,10 @@ fn step_job(
         }
         job.run = None;
         job.file_at += 1;
+        if job.file_at >= job.files.len() {
+            progress.lock().unwrap().running = false;
+            return true;
+        }
     } else {
         let done = job.indexed + job.records.len();
         let seconds = job.started.elapsed().as_secs_f64();
@@ -572,6 +607,7 @@ fn step_job(
         held.elapsed_ms = (seconds * 1000.0) as u64;
         held.per_second = index::per_second(done, seconds);
     }
+    false
 }
 
 /// Point the progress at a new file.
@@ -752,6 +788,14 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
                 path: picked.map(|p| p.to_string_lossy().to_string()),
             };
             request.respond(json_reply(&answer))?;
+        }
+        (true, "/api/stop") => {
+            let (answer, wait) = channel();
+            let _ = jobs.send(Job::StopIndex { answer });
+            match wait.recv() {
+                Ok(running) => request.respond(json_reply(&Stopping { stopping: running }))?,
+                Err(_) => request.respond(error_reply(500, "the engine stopped"))?,
+            }
         }
         (true, "/api/quit") => {
             let _ = request.respond(json_reply(&Stopping { stopping: true }));
