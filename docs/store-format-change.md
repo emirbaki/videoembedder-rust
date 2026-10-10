@@ -1,7 +1,7 @@
 # The store format change - analysis
 
 Date: 2026-10-11
-Status: analysis, no decision yet
+Status: the decision is the database. The engine choice is open.
 
 ## 1. The items that need the change
 
@@ -25,8 +25,8 @@ The facts below come from `videoembed/src/store.rs`.
 | Fact | Where |
 | --- | --- |
 | One file holds every record. The magic is `VEI1`. | [store.rs:3](videoembed/src/store.rs#L3) |
-| The header is `magic | u32 dim | u32 count`. | [store.rs:191](videoembed/src/store.rs#L191) |
-| A record is `u8 kind | u32 label_len | label | f32 start | f32 end | f32 vec[dim]`. | [store.rs:196](videoembed/src/store.rs#L196) |
+| The header is `magic \| u32 dim \| u32 count`. | [store.rs:191](videoembed/src/store.rs#L191) |
+| A record is `u8 kind \| u32 label_len \| label \| f32 start \| f32 end \| f32 vec[dim]`. | [store.rs:196](videoembed/src/store.rs#L196) |
 | The kinds are window, note, frame, and audio. | [store.rs:18](videoembed/src/store.rs#L18) |
 | The label is the join key. A video path is the identity, in slash form. | [store.rs:34](videoembed/src/store.rs#L34) |
 | The vector is `f32`, so one record carries 3,072 bytes at `dim = 768`. | [store.rs:202](videoembed/src/store.rs#L202) |
@@ -153,31 +153,92 @@ force is fine to about one million vectors
 count passes it, the ANN crate decides the design, and the database behind it is
 the smaller choice.
 
-## 8. The recommendation
+### 7.1 The embedded vector databases
 
-Shape A now. Shape B when one of two signals arrives: a store that holds several
-long videos, or a delete that must not rewrite the file. Shape C only when the
-search needs an index, and then the choice of the index crate matters more than
-the choice of the database.
+A vector database is more than a store. It holds an index, a metadata filter,
+and a write path that knows about vectors. Four of them fit a local tool, and
+three do not.
 
-The reason for A: the four items need fields, not a new engine. Shape A adds the
-fields and keeps every current test. The fp16 vector lands in the same change,
-and it halves the disk and the memory at once.
+| Option | What it is | Index | Filter | Shape | Cost |
+| --- | --- | --- | --- | --- | --- |
+| LanceDB (the Lance format) | An embedded vector database, written in Rust | IVF-PQ, plus brute force under a threshold | A columnar dataset with filters | In-process | A large dependency, Arrow and Lance, a versioned file set |
+| DuckDB with the VSS extension | An embedded SQL engine | HNSW | SQL | One file | A large C++ binary, and an extension |
+| sqlite-vec | A SQLite extension | Brute force, with quantization | SQL | One file plus the extension | An extension build |
+| usearch | An ANN library | HNSW, and other graphs | None | A library | We own the storage and the metadata |
+| hnsw_rs | A Rust ANN index | HNSW | None | A library | The same, in Rust |
+| Faiss | A C++ ANN library | Several | None | A library | A C++ build, and bindings |
+| Qdrant | A vector search server, in Rust | HNSW | Yes | A server process | A process to run and to ship |
 
-## 9. Open questions
+The library rows are indexes, not databases. An index answers "the nearest
+vectors to this one". It holds no path, no plan, and no finished list, so the
+metadata side stays ours in every library row.
 
-1. Which shape: A, B, or C?
-2. Does the store stay one file, or does the file set widen?
-3. Does window mode land in the same change, or after the format is done? Two
+For this project the shortlist is three: LanceDB, an embedded vector database
+with a real index, DuckDB with the VSS extension, and a small ANN library over
+our own file. LanceDB and DuckDB each bring a large dependency. That weight buys
+an index, and the index only matters near the top of the range in section 3.
+
+## 8. The scoped search, with and without SQL
+
+Item 6 lets a user search one video only. The store must answer one question:
+score the records of this one path.
+
+With SQL the answer is one line:
+
+```sql
+SELECT id, vec FROM records WHERE path = ?;
+```
+
+The engine reads an index on `path`, so it touches only those rows. Our code
+holds no filter logic of its own.
+
+A key-value store holds no query language. It holds a map from a key to a
+value. Our code then has two choices, and each one costs work:
+
+1. Read every record, then skip the records whose path differs. The read
+   touches the whole store, so the search slows down as the store grows.
+2. Keep a second map from the path to the record keys. That map is a secondary
+   index. We write it, we update it on every append, and we repair it on every
+   delete.
+
+So "there is no SQL for a scoped search" means this: the filter is code we
+write, and each filter column becomes an index we maintain by hand. SQLite,
+DuckDB, and LanceDB each carry that work already.
+
+## 9. The decision and the recommendation
+
+The decision on 2026-10-11: the store moves to a database. The one-file rule
+goes. The shape is not A.
+
+What follows from that decision:
+
+1. The engine owns the vectors, the ids, the plans, and the finished list.
+2. A scoped search becomes a query, not our own filter code.
+3. The vector leaves the record as an fp16 blob, so the disk and the memory both
+   halve.
+4. An ANN index waits. Below about one million records the engine scores every
+   row, and the index earns its cost only near the top of that range.
+
+The engine choice stays open. SQLite carries the smallest weight and it matches
+Google's design. An embedded vector database (LanceDB) or DuckDB each carry a
+real index, and each brings a large dependency for an index we do not need yet.
+A pure-Rust key-value store carries no C, and it makes the filters our work
+again.
+
+## 10. Open questions
+
+1. Which engine: SQLite, an embedded vector database, or a pure-Rust store?
+2. Does window mode land in the same change, or after the format is done? Two
    steps are safer, because the format change alone is testable on its own.
-4. Does the store need a source fingerprint (size and mtime)? Today a changed
+3. Does the store need a source fingerprint (size and mtime)? Today a changed
    file with the same path stays marked as finished, so the run skips it.
-5. Do the plans repeat inside every record, or do they get one row for each
+4. Do the plans repeat inside every record, or do they get one row for each
    video?
-6. Does the `.done` list fold into the store in shape A too, or does it stay a
-   sidecar until shape B?
+5. Does the import of an old `VEI1` store run once at open, or as its own
+   command?
+6. Does the store keep the name `store/index.vei`, or take a new one?
 
-## 10. What stays the same
+## 11. What stays the same
 
 - The label rule, `normalize_label`, and the slash form of a path.
 - The kind list, and `is_video`.
