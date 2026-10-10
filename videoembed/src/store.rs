@@ -16,6 +16,15 @@ const MAGIC: &[u8; 4] = b"VEI1";
 
 pub const KIND_WINDOW: u8 = 0;
 pub const KIND_NOTE: u8 = 1;
+pub const KIND_FRAME: u8 = 2;
+pub const KIND_AUDIO: u8 = 3;
+
+/// True for a record that belongs to a video file.
+///
+/// A window record is the old shape. A frame or audio record is the new shape.
+pub fn is_video(kind: u8) -> bool {
+    matches!(kind, KIND_WINDOW | KIND_FRAME | KIND_AUDIO)
+}
 
 /// Make one label form for one video path.
 ///
@@ -112,7 +121,7 @@ impl Store {
         let want = normalize_label(path);
         let before = self.records.len();
         self.records
-            .retain(|r| !(r.kind == KIND_WINDOW && normalize_label(&r.label) == want));
+            .retain(|r| !(is_video(r.kind) && normalize_label(&r.label) == want));
         let removed = before - self.records.len();
         if removed > 0 {
             self.write()?;
@@ -139,7 +148,7 @@ impl Store {
         out
     }
 
-    /// True when the store holds a window record with this exact path.
+    /// True when the store holds a video record with this exact path.
     ///
     /// The path separators do not matter, so the console and the web binary
     /// find the same record.
@@ -147,7 +156,7 @@ impl Store {
         let want = normalize_label(path);
         self.records
             .iter()
-            .any(|record| record.kind == KIND_WINDOW && normalize_label(&record.label) == want)
+            .any(|record| is_video(record.kind) && normalize_label(&record.label) == want)
     }
 
     fn write(&self) -> Result<()> {
@@ -261,6 +270,42 @@ mod tests {
         note.kind = KIND_NOTE;
         let store = store_of(vec![note]);
         assert!(!store.holds_video("birthday"));
+    }
+
+    #[test]
+    fn is_video_accepts_the_three_video_kinds() {
+        assert!(is_video(KIND_WINDOW));
+        assert!(is_video(KIND_FRAME));
+        assert!(is_video(KIND_AUDIO));
+        assert!(!is_video(KIND_NOTE));
+    }
+
+    #[test]
+    fn holds_video_matches_a_frame_record() {
+        let mut frame = record("D:/video/a.mp4");
+        frame.kind = KIND_FRAME;
+        let store = store_of(vec![frame]);
+        assert!(store.holds_video("D:/video/a.mp4"));
+        assert!(!store.holds_video("D:/video/b.mp4"));
+    }
+
+    #[test]
+    fn forget_removes_frame_and_audio_records_of_one_video() {
+        let dir = std::env::temp_dir().join(format!("vei_forget_kind_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut frame = record("D:/video/a.mp4");
+        frame.kind = KIND_FRAME;
+        let mut audio = record("D:/video/a.mp4");
+        audio.kind = KIND_AUDIO;
+        let mut store = Store {
+            path: dir.join("index.vei"),
+            dim: 2,
+            records: vec![frame, audio, record("D:/video/b.mp4")],
+        };
+        let removed = store.forget("D:/video/a.mp4").unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.records.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
