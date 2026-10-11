@@ -338,31 +338,79 @@ impl Store {
     /// The rank needs every row, because the median of the store is the
     /// baseline of the result.
     ///
+    /// A scope names one video. The rank then scores the rows of that video
+    /// alone, and the median comes from those rows. The scope matches with
+    /// `normalize_label`, so either path form finds the video.
+    ///
     /// A database fault surfaces as an error. Only an empty store gives an
     /// empty list, because a non-empty store always has a row to score.
-    pub fn rank(&self, query: &[f32]) -> Result<Vec<(usize, f32)>> {
+    pub fn rank(&self, query: &[f32], scope: Option<&str>) -> Result<Vec<(usize, f32)>> {
         if self.records.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = "select rid, distance from vec_records where embedding match vec_f32(?1) and k = ?2";
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .context("prepare the rank query")?;
-        let rows = stmt.query_map(
-            params![db::vec_to_blob(query), self.records.len() as i64],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32)),
-        )
-        .context("run the rank query")?;
+        let forms: Vec<(Option<String>, usize)> = match scope {
+            Some(scope) => self
+                .path_forms(scope)
+                .into_iter()
+                .map(|(path, count)| (Some(path), count))
+                .collect(),
+            None => vec![(None, self.records.len())],
+        };
         let mut scored: Vec<(usize, f32)> = Vec::new();
-        for row in rows {
-            let (rid, distance) = row.context("read a rank row")?;
-            if let Some(at) = self.position_of(rid) {
-                scored.push((at, 1.0 - distance));
+        for (path, count) in forms {
+            let sql = match path {
+                Some(_) => {
+                    "select rid, distance from vec_records \
+                     where embedding match vec_f32(?1) and path = ?2 and k = ?3"
+                }
+                None => {
+                    "select rid, distance from vec_records \
+                     where embedding match vec_f32(?1) and k = ?2"
+                }
+            };
+            let mut stmt = self
+                .conn
+                .prepare(sql)
+                .context("prepare the rank query")?;
+            let mut rows = match &path {
+                Some(path) => stmt.query(params![
+                    db::vec_to_blob(query),
+                    path,
+                    count as i64
+                ]),
+                None => stmt.query(params![db::vec_to_blob(query), count as i64]),
+            }
+            .context("run the rank query")?;
+            while let Some(row) = rows.next().context("read a rank row")? {
+                let rid: i64 = row.get(0)?;
+                let distance: f64 = row.get(1)?;
+                if let Some(at) = self.position_of(rid) {
+                    scored.push((at, 1.0 - distance as f32));
+                }
             }
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(scored)
+    }
+
+    /// The stored path forms a scope names, with the row count of each one.
+    ///
+    /// One video can enter the store under two path forms, because the store
+    /// keeps the label as given. The partition column is exact, so the rank
+    /// asks for each form on its own.
+    fn path_forms(&self, scope: &str) -> Vec<(String, usize)> {
+        let wanted = normalize_label(scope);
+        let mut forms: Vec<(String, usize)> = Vec::new();
+        for record in &self.records {
+            if normalize_label(&record.label) != wanted {
+                continue;
+            }
+            match forms.iter_mut().find(|(path, _)| *path == record.label) {
+                Some((_, count)) => *count += 1,
+                None => forms.push((record.label.clone(), 1)),
+            }
+        }
+        forms
     }
 }
 
@@ -849,7 +897,7 @@ mod tests {
         far.vec = basis(1);
         store.append(vec![near, far]).unwrap();
 
-        let ranked = store.rank(&basis(0)).unwrap();
+        let ranked = store.rank(&basis(0), None).unwrap();
 
         assert_eq!(ranked.len(), 2, "the median needs every score");
         assert_eq!(store.records[ranked[0].0].label, "a.mp4");
@@ -866,9 +914,59 @@ mod tests {
     }
 
     #[test]
+    fn a_scope_ranks_one_video_alone() {
+        let (dir, mut store) = opened("rank_scope");
+        let mut near = new_record("a.mp4", 0.0, 0.25);
+        near.vec = basis(0);
+        let mut far = new_record("b.mp4", 0.0, 0.25);
+        far.vec = basis(1);
+        let mut also = new_record("a.mp4", 0.25, 0.5);
+        also.vec = basis(2);
+        store.append(vec![near, far, also]).unwrap();
+
+        let ranked = store.rank(&basis(0), Some("a.mp4")).unwrap();
+
+        assert_eq!(ranked.len(), 2, "only the rows of the scope take part");
+        for (at, _) in &ranked {
+            assert_eq!(store.records[*at].label, "a.mp4");
+        }
+        assert_eq!(store.records[ranked[0].0].start, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scope_matches_across_path_separators() {
+        let (dir, mut store) = opened("rank_scope_sep");
+        let mut record = new_record("D:\\video\\a.mp4", 0.0, 0.25);
+        record.vec = basis(0);
+        let mut other = new_record("D:/video/b.mp4", 0.0, 0.25);
+        other.vec = basis(1);
+        store.append(vec![record, other]).unwrap();
+
+        let ranked = store.rank(&basis(0), Some("D:/video/a.mp4")).unwrap();
+
+        assert_eq!(ranked.len(), 1, "the scope holds one form of one video");
+        assert_eq!(store.records[ranked[0].0].label, "D:\\video\\a.mp4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scope_with_no_match_is_empty() {
+        let (dir, mut store) = opened("rank_scope_none");
+        let mut record = new_record("a.mp4", 0.0, 0.25);
+        record.vec = basis(0);
+        store.append(vec![record]).unwrap();
+
+        let ranked = store.rank(&basis(1), Some("missing.mp4")).unwrap();
+
+        assert!(ranked.is_empty(), "a scope that names no video gives nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_rank_of_an_empty_store_is_empty() {
         let (dir, store) = opened("rank_empty");
-        assert!(store.rank(&basis(0)).unwrap().is_empty());
+        assert!(store.rank(&basis(0), None).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -881,7 +979,7 @@ mod tests {
         note.vec = basis(0);
         store.append(vec![note]).unwrap();
 
-        let ranked = store.rank(&basis(0)).unwrap();
+        let ranked = store.rank(&basis(0), None).unwrap();
 
         assert_eq!(ranked.len(), 1);
         assert_eq!(store.records[ranked[0].0].kind, KIND_NOTE);
@@ -898,7 +996,7 @@ mod tests {
             .execute_batch("drop table vec_records")
             .unwrap();
 
-        let outcome = store.rank(&basis(0));
+        let outcome = store.rank(&basis(0), None);
 
         assert!(outcome.is_err(), "a dropped table must not read as no matches");
         let _ = std::fs::remove_dir_all(&dir);

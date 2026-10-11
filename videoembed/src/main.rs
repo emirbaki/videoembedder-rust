@@ -241,7 +241,7 @@ fn search(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
         return Ok(());
     }
     let query = embedder.embed_text(&format!("{QUERY_PREFIX}{rest}"))?;
-    let ranked = store.rank(&query)?;
+    let ranked = store.rank(&query, None)?;
     let baseline = index::median(&ranked);
     println!("Top results for: {rest}");
     println!("Baseline (median of the store): {baseline:.3}");
