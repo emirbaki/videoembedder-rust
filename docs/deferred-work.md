@@ -38,5 +38,4 @@ review of the device-mode branch.
 - The task prefixes.
 - The median baseline and the margin.
 - The 0.25 s frame grid.
-- The flat store, until item 9 earns its cost.
 - One binary, with CUDA as an option rather than a requirement.

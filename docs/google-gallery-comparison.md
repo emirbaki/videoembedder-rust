@@ -81,7 +81,7 @@ If the engine rejects audio once, the whole pass restarts with frames only (`Vid
 
 Google keeps the time range in metadata and reads it back after a search (`VideoMomentFinderViewModel.kt:777-790`). The record id already holds the range, so a rewrite is idempotent. A second pass over the same video overwrites the same rows.
 
-This app stores the range in the record itself. That is simpler. But a re-index of one video cannot update in place. The whole file rewrites.
+This app stores the range in the record itself, and the id holds it too. A write upserts by id in one transaction, so a second pass over one video updates the same rows.
 
 ### 2.4 The search and the score
 
