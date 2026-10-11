@@ -416,10 +416,11 @@ fn videos(store: &Store) -> Vec<VideoRow> {
         if !videoembed::store::is_video(record.kind) {
             continue;
         }
-        match rows.iter_mut().find(|row| row.path == record.label) {
+        let name = normalize_label(&record.label);
+        match rows.iter_mut().find(|row| row.path == name) {
             Some(row) => row.items += 1,
             None => rows.push(VideoRow {
-                path: record.label.clone(),
+                path: name,
                 items: 1,
             }),
         }
@@ -1287,6 +1288,39 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "a.mp4");
+        assert_eq!(rows[0].items, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One video makes one row, whatever separator its label carries.
+    #[test]
+    fn a_video_row_gathers_a_video_across_path_separators() {
+        let dir = std::env::temp_dir().join(format!("vei_web_sep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        store
+            .append(vec![
+                NewRecord {
+                    kind: videoembed::store::KIND_FRAME,
+                    label: r"D:\video\a.mp4".into(),
+                    start: 0.0,
+                    end: 0.25,
+                    vec: unit(),
+                },
+                NewRecord {
+                    kind: videoembed::store::KIND_FRAME,
+                    label: "D:/video/a.mp4".into(),
+                    start: 0.25,
+                    end: 0.5,
+                    vec: unit(),
+                },
+            ])
+            .unwrap();
+
+        let rows = videos(&store);
+
+        assert_eq!(rows.len(), 1, "one video makes one row");
+        assert_eq!(rows[0].path, "D:/video/a.mp4");
         assert_eq!(rows[0].items, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }

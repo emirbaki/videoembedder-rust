@@ -321,27 +321,37 @@ fn hit_line(rank: usize, score: f32, margin: f32, cut: f32, record: &Record) -> 
     }
 }
 
+/// Group the video records by their normalized path, in store order.
+///
+/// The path separators do not matter, so one video makes one row whatever
+/// separator its label carries.
+fn video_rows(records: &[Record]) -> Vec<(String, usize)> {
+    let mut videos: Vec<(String, usize)> = Vec::new();
+    for record in records {
+        if !videoembed::store::is_video(record.kind) {
+            continue;
+        }
+        let name = videoembed::store::normalize_label(&record.label);
+        match videos.iter_mut().find(|(held, _)| *held == name) {
+            Some((_, count)) => *count += 1,
+            None => videos.push((name, 1)),
+        }
+    }
+    videos
+}
+
 /// Group the records by source.
 fn list(store: &Store) {
     if store.records.is_empty() {
         println!("The store is empty.");
         return;
     }
-    let mut videos: Vec<(String, usize)> = Vec::new();
-    let mut notes = 0;
-    for record in &store.records {
-        if record.kind == KIND_NOTE {
-            notes += 1;
-            continue;
-        }
-        if !videoembed::store::is_video(record.kind) {
-            continue;
-        }
-        match videos.iter_mut().find(|(name, _)| *name == record.label) {
-            Some((_, count)) => *count += 1,
-            None => videos.push((record.label.clone(), 1)),
-        }
-    }
+    let notes = store
+        .records
+        .iter()
+        .filter(|record| record.kind == KIND_NOTE)
+        .count();
+    let videos = video_rows(&store.records);
     println!("Videos ({}):", videos.len());
     for (name, count) in videos {
         println!("  {name}  ({count} records)");
@@ -452,5 +462,38 @@ mod tests {
         let (query, scope) = parse_search("blue |");
         assert_eq!(query, "blue");
         assert_eq!(scope, None);
+    }
+
+    /// One video makes one row, whatever separator its label carries.
+    #[test]
+    fn the_list_gathers_a_video_across_path_separators() {
+        let rows = video_rows(&[
+            Record {
+                rid: 1,
+                id: r"D:\video\a.mp4/0-250".into(),
+                kind: KIND_FRAME,
+                label: r"D:\video\a.mp4".into(),
+                start: 0.0,
+                end: 0.25,
+            },
+            Record {
+                rid: 2,
+                id: "D:/video/a.mp4/250-500".into(),
+                kind: KIND_FRAME,
+                label: "D:/video/a.mp4".into(),
+                start: 0.25,
+                end: 0.5,
+            },
+            Record {
+                rid: 3,
+                id: "blue/0-0".into(),
+                kind: KIND_NOTE,
+                label: "blue".into(),
+                start: 0.0,
+                end: 0.0,
+            },
+        ]);
+
+        assert_eq!(rows, vec![("D:/video/a.mp4".to_string(), 2)]);
     }
 }

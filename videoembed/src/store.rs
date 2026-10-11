@@ -1005,6 +1005,8 @@ mod tests {
     fn the_rank_of_an_empty_store_is_empty() {
         let (dir, store) = opened("rank_empty");
         assert!(store.rank(&basis(0), None).unwrap().is_empty());
+        // A scope on an empty store hits the guard before it reads a path.
+        assert!(store.rank(&basis(0), Some("a.mp4")).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1021,6 +1023,9 @@ mod tests {
 
         assert_eq!(ranked.len(), 1);
         assert_eq!(store.records[ranked[0].0].kind, KIND_NOTE);
+        // The query vector matches the note vector, so the note takes a score
+        // near one. A note ranks by distance, like a video record.
+        assert!((ranked[0].1 - 1.0).abs() < 1e-5, "got {}", ranked[0].1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

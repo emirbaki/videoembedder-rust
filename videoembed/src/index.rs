@@ -445,12 +445,14 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
         }
     }
 
-    let mut durations: HashMap<&str, f32> = HashMap::new();
+    let mut durations: HashMap<String, f32> = HashMap::new();
     for record in records {
         if !crate::store::is_video(record.kind) {
             continue;
         }
-        let held = durations.entry(record.label.as_str()).or_insert(0.0);
+        let held = durations
+            .entry(crate::store::normalize_label(&record.label))
+            .or_insert(0.0);
         if record.end > *held {
             *held = record.end;
         }
@@ -465,25 +467,23 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
         if !crate::store::is_video(record.kind) {
             continue;
         }
+        let name = crate::store::normalize_label(&record.label);
         let hit = Hit {
             start: record.start,
             end: record.end,
             score: *score,
             margin: *score - baseline,
         };
-        match groups.iter_mut().find(|g| g.video == record.label) {
+        match groups.iter_mut().find(|g| g.video == name) {
             Some(group) => {
                 if group.hits.len() < GROUP_CAP {
                     group.hits.push(hit);
                 }
             }
             None => {
-                let duration = durations
-                    .get(record.label.as_str())
-                    .copied()
-                    .unwrap_or(record.end);
+                let duration = durations.get(&name).copied().unwrap_or(record.end);
                 groups.push(Group {
-                    video: record.label.clone(),
+                    video: name,
                     duration,
                     score: *score,
                     hits: vec![hit],
@@ -500,7 +500,8 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
     // bar takes the frames when the video has them, because they are finer.
     for group in groups.iter_mut() {
         let has_frames = records.iter().any(|record| {
-            record.kind == crate::store::KIND_FRAME && record.label == group.video
+            record.kind == crate::store::KIND_FRAME
+                && crate::store::normalize_label(&record.label) == group.video
         });
         group.cells = records
             .iter()
@@ -511,7 +512,7 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
                 } else {
                     crate::store::is_video(record.kind)
                 };
-                right_kind && record.label == group.video
+                right_kind && crate::store::normalize_label(&record.label) == group.video
             })
             .map(|(index, record)| Cell {
                 start: record.start,
@@ -573,10 +574,13 @@ pub fn thin_indexes(records: &[Record], factor: usize) -> Vec<usize> {
     }
     // The frames of each video, in time order. A store may hold the frames of
     // one video twice, so the order is taken from the start time.
-    let mut order: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut order: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if record.kind == crate::store::KIND_FRAME {
-            order.entry(record.label.as_str()).or_default().push(index);
+            order
+                .entry(crate::store::normalize_label(&record.label))
+                .or_default()
+                .push(index);
         }
     }
     let mut keep = vec![true; records.len()];
@@ -709,6 +713,21 @@ mod tests {
         assert!((groups[0].hits[0].end - 8.0).abs() < 1e-6);
         assert_eq!(groups[1].video, "a.mp4");
         assert_eq!(groups[1].hits.len(), 1);
+    }
+
+    /// One video gathers under one group, whatever separator its label carries.
+    #[test]
+    fn group_hits_gathers_a_video_across_path_separators() {
+        let records = vec![
+            record(r"D:\video\a.mp4", 0.0, 4.0),
+            record("D:/video/a.mp4", 4.0, 8.0),
+        ];
+        let ranked = vec![(0, 0.9), (1, 0.8)];
+
+        let groups = group_hits(&records, &ranked, 0.0);
+
+        assert_eq!(groups.len(), 1, "one video makes one group");
+        assert_eq!(groups[0].video, "D:/video/a.mp4");
     }
 
     /// The bar needs every record, not only the ones above the floor.
@@ -1076,6 +1095,20 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().any(|at| records[*at].label == "a.mp4"));
         assert!(kept.iter().any(|at| records[*at].label == "b.mp4"));
+    }
+
+    /// One video thins as one set, whatever separator its label carries.
+    #[test]
+    fn thinning_gathers_a_video_across_path_separators() {
+        let records = vec![
+            record(r"D:\video\a.mp4", 0.0, 0.25),
+            record("D:/video/a.mp4", 0.25, 0.5),
+            record(r"D:\video\a.mp4", 0.5, 0.75),
+        ];
+
+        let kept = thin_indexes(&records, 2);
+
+        assert_eq!(kept, vec![0, 2], "the two forms make one time order");
     }
 
     /// The thinning gives the indexes of the kept records, in store order.
