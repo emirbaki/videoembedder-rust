@@ -80,6 +80,8 @@ pub struct Store {
     pub records: Vec<Record>,
     /// The video paths that finished an index run.
     done: HashSet<String>,
+    /// The count of records an old `VEI1` file gave at open. Zero after that.
+    pub imported: usize,
 }
 
 impl Store {
@@ -95,8 +97,9 @@ impl Store {
             dim: db::DIM,
             records: Vec::new(),
             done: HashSet::new(),
+            imported: 0,
         };
-        store.import_old_file()?;
+        store.imported = store.import_old_file()?;
         store.load_records()?;
         store.done = store.load_done()?;
         Ok(store)
@@ -106,17 +109,18 @@ impl Store {
     ///
     /// The import runs when the old file is here and the database holds no
     /// record. Every imported video takes the finished mark, so the next run
-    /// does not index it again.
-    fn import_old_file(&mut self) -> Result<()> {
+    /// does not index it again. The count of imported records returns to the
+    /// caller, because this function prints nothing.
+    fn import_old_file(&mut self) -> Result<usize> {
         let old = self.path.with_extension("vei");
         if !old.exists() {
-            return Ok(());
+            return Ok(0);
         }
         let held: i64 = self
             .conn
             .query_row("select count(*) from records", [], |row| row.get(0))?;
         if held > 0 {
-            return Ok(());
+            return Ok(0);
         }
         let bytes = std::fs::read(&old)
             .with_context(|| format!("read the old store {}", old.display()))?;
@@ -143,14 +147,14 @@ impl Store {
                 fresh.push(record);
             }
         }
+        let count = fresh.len();
         self.append(fresh)
             .with_context(|| format!("import the old store {}", old.display()))?;
         for label in labels {
             self.mark_done(&label)
                 .with_context(|| format!("import the old store {}", old.display()))?;
         }
-        println!("Imported {} records from {}", self.records.len(), old.display());
-        Ok(())
+        Ok(count)
     }
 
     /// Read the metadata of every record, in row order.
@@ -1075,6 +1079,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
 
         assert_eq!(store.records.len(), 1);
+        assert_eq!(store.imported, 1, "the count reaches the caller");
         assert_eq!(store.records[0].label, "D:/video/a.mp4");
         assert!(store.is_done("D:/video/a.mp4"), "an old video is finished");
         assert!(
@@ -1096,6 +1101,28 @@ mod tests {
         let again = Store::open(&path).unwrap();
 
         assert_eq!(again.records.len(), 1, "the import must not double the rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An old file beside a full store must not stop the open.
+    ///
+    /// The import runs one time. A later open skips it, so a damaged leftover
+    /// file cannot stop the app on every start.
+    #[test]
+    fn an_old_store_is_ignored_when_the_store_holds_records() {
+        let dir = scratch("import_full");
+        let path = dir.join("index.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&path).unwrap();
+        store.append(vec![new_record("a.mp4", 0.0, 0.25)]).unwrap();
+        let mut record = new_record("b.mp4", 0.0, 0.25);
+        record.vec = vec![1.0, 0.0];
+        std::fs::write(dir.join("index.vei"), vei_bytes(2, &[record])).unwrap();
+
+        let again = Store::open(&path).unwrap();
+
+        assert_eq!(again.records.len(), 1, "the full store stays");
+        assert_eq!(again.imported, 0, "the import must not run");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1111,6 +1111,9 @@ fn main() -> Result<()> {
                 return;
             }
         };
+        if store.imported > 0 {
+            println!("Imported {} records from the old store.", store.imported);
+        }
         let _ = ready_tx.send(Ok(()));
         engine_loop(embedder, models, store, engine_progress, engine_key, jobs_rx);
     });

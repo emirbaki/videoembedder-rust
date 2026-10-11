@@ -19,6 +19,9 @@ fn main() -> Result<()> {
     println!("Loading models from {}", models.display());
     let mut embedder = Embedder::load(&models, asked)?;
     let mut store = Store::open(&store_path)?;
+    if store.imported > 0 {
+        println!("Imported {} records from the old store.", store.imported);
+    }
     println!(
         "Store: {} ({} records)",
         store_path.display(),
