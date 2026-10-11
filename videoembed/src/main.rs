@@ -27,7 +27,7 @@ fn main() -> Result<()> {
         store_path.display(),
         store.records.len()
     );
-    println!("Commands: index <path> | note <text> | search <query> [| <path>] | list | forget <path> | device gpu|cpu | quit");
+    println!("Commands: index <path> | plan <path> <preset> | note <text> | search <query> [| <path>] | list | forget <path> | device gpu|cpu | quit");
     println!("Measure the time grid: measure <query> | <another query>");
     println!("Start with --gpu or --cpu to pick the mode. The default is the card when it is here.");
 
@@ -87,6 +87,7 @@ fn run(embedder: &mut Embedder, models: &Path, store: &mut Store, line: &str) ->
     let (command, rest) = split_command(line);
     match command {
         "index" => index(embedder, store, rest),
+        "plan" => plan(embedder, store, rest),
         "note" => note(embedder, store, rest),
         "search" => search(embedder, store, rest),
         "measure" => measure(embedder, store, rest),
@@ -244,6 +245,50 @@ fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
     store.append(records)?;
     store.set_plan(&label, &plan)?;
     println!("Indexed {count} records into {}", store_path_hint());
+    Ok(())
+}
+
+/// The source file of one stored video, and the check that it is here.
+fn source_of(path: &str) -> Result<PathBuf> {
+    let video = PathBuf::from(path);
+    if !video.is_file() {
+        bail!("{} is not a file", video.display());
+    }
+    Ok(video)
+}
+
+/// The plan a `plan` command asks for, over the stored plan.
+///
+/// The argument is `<path> <preset>` or `<path> <value> <value>`.
+fn plan_command(store: &Store, rest: &str) -> Result<videoembed::plan::Plan> {
+    let (path, words) = rest.split_once(char::is_whitespace).ok_or_else(|| {
+        anyhow::anyhow!("usage: plan <path> <preset> | plan <path> window=4 frames=4")
+    })?;
+    let words = words.trim();
+    if words.is_empty() {
+        bail!("usage: plan <path> <preset> | plan <path> window=4 frames=4");
+    }
+    let label = videoembed::store::normalize_label(path);
+    let base = store
+        .plan_of(&label)?
+        .ok_or_else(|| anyhow::anyhow!("the store holds no video at {path}"))?;
+    if let Some(preset) = videoembed::plan::Preset::parse(words) {
+        return Ok(videoembed::plan::Plan::of(preset));
+    }
+    base.set_words(words)
+}
+
+/// Cut one video again under the plan the user names.
+fn plan(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
+    let (path, _) = rest
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| anyhow::anyhow!("usage: plan <path> <preset>"))?;
+    let wanted = plan_command(store, rest)?;
+    source_of(path)?;
+    println!("Re-indexing {} under the new plan.", path);
+    let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
+    let count = index::reindex(embedder, store, path, &wanted, &mut report)?;
+    println!("Indexed {count} records.");
     Ok(())
 }
 
@@ -562,5 +607,112 @@ mod tests {
 
         let fine = videoembed::plan::Plan::of(videoembed::plan::Preset::Fine);
         assert_eq!(index_line(&fine), "Indexing under the Fine plan (0.25 s frames).");
+    }
+
+    /// A preset word picks that preset.
+    #[test]
+    fn the_plan_command_reads_a_preset() {
+        let (dir, mut store) = store_for_plan_test();
+        store
+            .append(vec![videoembed::store::NewRecord {
+                kind: videoembed::store::KIND_FRAME,
+                label: "D:/video/a.mp4".into(),
+                start: 0.0,
+                end: 0.25,
+                vec: {
+                    let mut vec = vec![0.0f32; videoembed::db::DIM];
+                    vec[0] = 1.0;
+                    vec
+                },
+            }])
+            .unwrap();
+
+        let plan = plan_command(&store, "D:/video/a.mp4 action").unwrap();
+
+        assert_eq!(plan, videoembed::plan::Plan::of(videoembed::plan::Preset::Action));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A value word sets one plan value over the stored plan.
+    #[test]
+    fn the_plan_command_reads_values() {
+        let (dir, mut store) = store_for_plan_test();
+        store
+            .append(vec![videoembed::store::NewRecord {
+                kind: videoembed::store::KIND_FRAME,
+                label: "D:/video/a.mp4".into(),
+                start: 0.0,
+                end: 0.25,
+                vec: {
+                    let mut vec = vec![0.0f32; videoembed::db::DIM];
+                    vec[0] = 1.0;
+                    vec
+                },
+            }])
+            .unwrap();
+
+        let plan = plan_command(&store, "D:/video/a.mp4 window=6 audio=on").unwrap();
+
+        assert_eq!(plan.window, 6.0);
+        assert!(plan.audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path the store does not hold names the fault.
+    #[test]
+    fn the_plan_command_refuses_an_unknown_video() {
+        let (dir, store) = store_for_plan_test();
+        let err = plan_command(&store, "D:/video/zz.mp4 object").unwrap_err();
+        assert!(format!("{err}").contains("zz.mp4"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan change on a video whose file is gone ends the change.
+    #[test]
+    fn a_plan_change_needs_the_source_file() {
+        let (dir, mut store) = store_for_plan_test();
+        store
+            .append(vec![videoembed::store::NewRecord {
+                kind: videoembed::store::KIND_FRAME,
+                label: "D:/video/missing.mp4".into(),
+                start: 0.0,
+                end: 0.25,
+                vec: {
+                    let mut vec = vec![0.0f32; videoembed::db::DIM];
+                    vec[0] = 1.0;
+                    vec
+                },
+            }])
+            .unwrap();
+        store
+            .set_plan(
+                "D:/video/missing.mp4",
+                &videoembed::plan::Plan::of(videoembed::plan::Preset::Object),
+            )
+            .unwrap();
+
+        let err = source_of("D:/video/missing.mp4").unwrap_err();
+
+        assert!(format!("{err}").contains("missing.mp4"), "{err}");
+        // The plan must stay as it was.
+        let held = store.plan_of("D:/video/missing.mp4").unwrap().unwrap();
+        assert_eq!(
+            held,
+            videoembed::plan::Plan::of(videoembed::plan::Preset::Object)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store on a fresh file, for the plan tests.
+    ///
+    /// The counter gives each caller its own file, because the tests run at the
+    /// same time in one process.
+    fn store_for_plan_test() -> (PathBuf, Store) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("vei_plan_cmd_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir.join("index.db")).unwrap();
+        (dir, store)
     }
 }

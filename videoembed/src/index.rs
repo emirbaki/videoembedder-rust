@@ -525,6 +525,31 @@ pub fn index_video(
     Ok(records)
 }
 
+/// Cut one video again under a new plan.
+///
+/// The plan is written last, so a fault in the middle leaves the video with no
+/// records and its old plan. The next index run then rebuilds it.
+pub fn reindex(
+    embedder: &Embedder,
+    store: &mut store::Store,
+    path: &str,
+    plan: &crate::plan::Plan,
+    on_step: &mut dyn FnMut(usize, usize),
+) -> Result<usize> {
+    let video = Path::new(path);
+    if !video.is_file() {
+        bail!("{} is not a file", video.display());
+    }
+    let label = store::normalize_label(path);
+    store.forget(&label)?;
+    let records = index_video(embedder, video, plan, on_step)?;
+    let count = records.len();
+    store.append(records)?;
+    store.set_plan(&label, plan)?;
+    store.mark_done(&label)?;
+    Ok(count)
+}
+
 /// The items of one job for each second.
 ///
 /// A time of zero or less gives 0.0, so a fast job cannot divide by zero.
