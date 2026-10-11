@@ -67,9 +67,16 @@ enum Job {
         device: Device,
         answer: Sender<Result<String, JobError>>,
     },
+    /// Cut one video again under a new plan. The answer holds the record count.
+    SetPlan {
+        path: String,
+        plan: videoembed::plan::Plan,
+        answer: Sender<Result<usize, JobError>>,
+    },
 }
 
 /// The reason a job did not run. The server turns it into a status code.
+#[derive(Debug)]
 enum JobError {
     Busy,
     Message(String),
@@ -89,10 +96,15 @@ struct State {
     key: String,
 }
 
+/// One video, its record count, and its plan.
 #[derive(Serialize)]
 struct VideoRow {
     path: String,
     items: usize,
+    plan: String,
+    window: f64,
+    frames: usize,
+    audio: bool,
 }
 
 #[derive(Serialize)]
@@ -124,6 +136,47 @@ struct QueryBody {
 #[derive(Debug, Deserialize)]
 struct DeviceBody {
     device: String,
+}
+
+/// The plan the page asks for. Either a preset name, or a set of values.
+#[derive(Debug, Deserialize)]
+struct PlanBody {
+    path: String,
+    #[serde(default)]
+    preset: Option<String>,
+    #[serde(default)]
+    window: Option<f64>,
+    #[serde(default)]
+    frames: Option<usize>,
+    #[serde(default)]
+    audio: Option<bool>,
+}
+
+impl PlanBody {
+    /// The plan this body asks for.
+    fn plan(&self) -> Result<videoembed::plan::Plan, JobError> {
+        if let Some(preset) = &self.preset {
+            let preset = videoembed::plan::Preset::parse(preset)
+                .ok_or_else(|| JobError::Message(format!("{preset} is not a preset")))?;
+            return Ok(videoembed::plan::Plan::of(preset));
+        }
+        let mut words = Vec::new();
+        if let Some(window) = self.window {
+            words.push(format!("window={window}"));
+        }
+        if let Some(frames) = self.frames {
+            words.push(format!("frames={frames}"));
+        }
+        if let Some(audio) = self.audio {
+            words.push(format!("audio={}", if audio { "on" } else { "off" }));
+        }
+        if words.is_empty() {
+            return Err(JobError::Message("no plan value arrived".into()));
+        }
+        videoembed::plan::Plan::of(videoembed::plan::Preset::Object)
+            .set_words(&words.join(" "))
+            .map_err(JobError::from)
+    }
 }
 
 /// The mode the model now runs on.
@@ -407,25 +460,57 @@ struct WebJob {
     indexed: usize,
     started: std::time::Instant,
     label: String,
+    /// The plan of the current file. The store takes it when the file ends.
+    plan: Option<videoembed::plan::Plan>,
 }
 
 /// Group the store records by video path. Every video kind counts.
+///
+/// The reply holds the plan of each video. A video with no plan row takes the
+/// default plan.
 fn videos(store: &Store) -> Vec<VideoRow> {
+    let plans: HashMap<String, videoembed::plan::Plan> = store
+        .plan_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let mut rows: Vec<VideoRow> = Vec::new();
     for record in &store.records {
         if !videoembed::store::is_video(record.kind) {
             continue;
         }
         let name = normalize_label(&record.label);
-        match rows.iter_mut().find(|row| row.path == name) {
-            Some(row) => row.items += 1,
-            None => rows.push(VideoRow {
-                path: name,
-                items: 1,
-            }),
+        if let Some(row) = rows.iter_mut().find(|row| row.path == name) {
+            row.items += 1;
+            continue;
         }
+        let plan = plans
+            .get(&name)
+            .copied()
+            .unwrap_or_else(videoembed::plan::Plan::default_plan);
+        rows.push(VideoRow {
+            path: name,
+            items: 1,
+            plan: preset_name(&plan),
+            window: plan.window,
+            frames: plan.frames,
+            audio: plan.audio,
+        });
     }
     rows
+}
+
+/// The preset name of a plan, by its values.
+///
+/// A plan that matches no preset reports the default preset. The page shows the
+/// values beside the name, so the name cannot hide a custom plan.
+fn preset_name(plan: &videoembed::plan::Plan) -> String {
+    videoembed::plan::Preset::ALL
+        .into_iter()
+        .find(|preset| videoembed::plan::Plan::of(*preset) == *plan)
+        .unwrap_or(videoembed::plan::Preset::Object)
+        .as_str()
+        .to_string()
 }
 
 /// Answer jobs forever. A running index does one media item per turn.
@@ -585,6 +670,9 @@ fn handle(
             stopped.store(true, Ordering::Relaxed);
             let _ = answer.send(running);
         }
+        Job::SetPlan { path, plan, answer } => {
+            let _ = answer.send(start_plan(progress, pending, stopped, &path, plan));
+        }
         Job::SetDevice { device, answer } => {
             // The loop owns the model, so the load happens there.
             match refuse_when_busy(pending) {
@@ -681,8 +769,62 @@ fn start_index(
         indexed: 0,
         started: std::time::Instant::now(),
         label: String::new(),
+        plan: None,
     });
     Ok(count)
+}
+
+/// Begin a re-cut of one video under a new plan.
+///
+/// The job holds one file, so the engine loop cuts it one item at a time. A
+/// running index job refuses the change.
+fn start_plan(
+    progress: &Arc<Mutex<Progress>>,
+    pending: &mut Option<WebJob>,
+    flag: &Arc<AtomicBool>,
+    path: &str,
+    plan: videoembed::plan::Plan,
+) -> Result<usize, JobError> {
+    refuse_when_busy(pending)?;
+    let video = PathBuf::from(path);
+    if !video.is_file() {
+        return Err(JobError::Message(format!(
+            "{} is not a file",
+            video.display()
+        )));
+    }
+    let run = index::IndexRun::start_with(&video, &plan).map_err(JobError::from)?;
+    let total = run.total();
+    flag.store(false, Ordering::Relaxed);
+    {
+        let mut held = progress.lock().unwrap();
+        // The model state belongs to the server, not to this job. Hold it,
+        // because the page shows it after the job ends.
+        let device = held.device.clone();
+        let gpu_available = held.gpu_available;
+        let load_ms = held.load_ms;
+        *held = Progress {
+            running: true,
+            folder: String::new(),
+            file_count: 1,
+            device,
+            gpu_available,
+            load_ms,
+            ..Progress::default()
+        };
+    }
+    let label = normalize_label(path);
+    *pending = Some(WebJob {
+        files: vec![video],
+        file_at: 0,
+        run: Some(run),
+        records: Vec::new(),
+        indexed: 0,
+        started: std::time::Instant::now(),
+        label,
+        plan: Some(plan),
+    });
+    Ok(total)
 }
 
 /// True when one finished run left a whole index for its video.
@@ -717,9 +859,18 @@ fn step_job(
             return true;
         }
         let video = job.files[job.file_at].clone();
-        match index::IndexRun::start(&video) {
+        let label = normalize_label(&video.to_string_lossy());
+        // The video takes the plan the store holds for it, or the default.
+        let plan = match store.plan_of(&label) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => videoembed::plan::Plan::default_plan(),
+            Err(err) => {
+                fail(progress, &err);
+                videoembed::plan::Plan::default_plan()
+            }
+        };
+        match index::IndexRun::start_with(&video, &plan) {
             Ok(run) => {
-                let label = normalize_label(&video.to_string_lossy());
                 if store.is_done(&label) {
                     job.file_at += 1;
                     return false;
@@ -729,6 +880,7 @@ fn step_job(
                 }
                 begin_file(progress, label.clone(), job.file_at + 1, run.total());
                 job.label = label;
+                job.plan = Some(plan);
                 job.records.clear();
                 job.run = Some(run);
             }
@@ -758,6 +910,11 @@ fn step_job(
             job.indexed += records.len();
             if let Err(err) = store.append(records) {
                 fail(progress, &err);
+            }
+            if let Some(plan) = &job.plan {
+                if let Err(err) = store.set_plan(&job.label, plan) {
+                    fail(progress, &err);
+                }
             }
             if let Err(err) = store.mark_done(&job.label) {
                 fail(progress, &err);
@@ -1019,6 +1176,42 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
             });
             match wait.recv() {
                 Ok(Ok(files)) => request.respond(json_reply(&Count { files }))?,
+                Ok(Err(JobError::Busy)) => {
+                    request.respond(error_reply(409, "an index job already runs"))?
+                }
+                Ok(Err(JobError::Message(message))) => {
+                    request.respond(error_reply(400, &message))?
+                }
+                Err(_) => request.respond(error_reply(500, "the engine stopped"))?,
+            }
+        }
+        (true, "/api/plan") => {
+            let body: PlanBody = match read_body(&mut request) {
+                Ok(body) => body,
+                Err((code, message)) => {
+                    request.respond(error_reply(code, &message))?;
+                    return Ok(());
+                }
+            };
+            let plan = match body.plan() {
+                Ok(plan) => plan,
+                Err(JobError::Message(message)) => {
+                    request.respond(error_reply(400, &message))?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    request.respond(error_reply(400, "bad plan body"))?;
+                    return Ok(());
+                }
+            };
+            let (answer, wait) = channel();
+            let _ = jobs.send(Job::SetPlan {
+                path: body.path,
+                plan,
+                answer,
+            });
+            match wait.recv() {
+                Ok(Ok(count)) => request.respond(json_reply(&count))?,
                 Ok(Err(JobError::Busy)) => {
                     request.respond(error_reply(409, "an index job already runs"))?
                 }
@@ -1347,6 +1540,7 @@ mod tests {
             indexed: 0,
             started: std::time::Instant::now(),
             label: String::new(),
+            plan: None,
         }
     }
 
@@ -1379,5 +1573,78 @@ mod tests {
             !run_left_a_whole_index(&Err(anyhow!("a broken frame"))),
             "a failed run holds a partial answer"
         );
+    }
+
+    /// The videos reply carries the plan of each video.
+    #[test]
+    fn a_video_row_carries_its_plan() {
+        let dir = std::env::temp_dir().join(format!("vei_web_plan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        store
+            .append(vec![NewRecord {
+                kind: videoembed::store::KIND_WINDOW,
+                label: "a.mp4".into(),
+                start: 0.0,
+                end: 2.0,
+                vec: unit(),
+            }])
+            .unwrap();
+        store
+            .set_plan(
+                "a.mp4",
+                &videoembed::plan::Plan::of(videoembed::plan::Preset::Speech),
+            )
+            .unwrap();
+
+        let rows = videos(&store);
+
+        assert_eq!(rows[0].plan, "speech");
+        assert_eq!(rows[0].window, 6.0);
+        assert_eq!(rows[0].frames, 6);
+        assert!(rows[0].audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan that matches no preset reports the default preset name.
+    ///
+    /// The page sends the name back to the server, so the name must be a real
+    /// preset word. The values in the row show the custom plan.
+    #[test]
+    fn a_custom_plan_reports_the_default_name() {
+        let custom = videoembed::plan::Plan::of(videoembed::plan::Preset::Object)
+            .set_words("window=3 frames=3")
+            .unwrap();
+
+        assert_eq!(preset_name(&custom), "object");
+    }
+
+    /// The plan body reads a preset name.
+    #[test]
+    fn the_plan_body_reads_a_preset() {
+        let body: PlanBody = serde_json::from_str(r#"{"path":"a.mp4","preset":"action"}"#).unwrap();
+        let plan = body.plan().unwrap();
+        assert_eq!(
+            plan,
+            videoembed::plan::Plan::of(videoembed::plan::Preset::Action)
+        );
+    }
+
+    /// The plan body reads a set of values.
+    #[test]
+    fn the_plan_body_reads_values() {
+        let body: PlanBody =
+            serde_json::from_str(r#"{"path":"a.mp4","window":4,"frames":4,"audio":true}"#).unwrap();
+        let plan = body.plan().unwrap();
+        assert_eq!(plan.window, 4.0);
+        assert_eq!(plan.frames, 4);
+        assert!(plan.audio);
+    }
+
+    /// A body with no plan value names the fault.
+    #[test]
+    fn an_empty_plan_body_is_refused() {
+        let body: PlanBody = serde_json::from_str(r#"{"path":"a.mp4"}"#).unwrap();
+        assert!(body.plan().is_err());
     }
 }
