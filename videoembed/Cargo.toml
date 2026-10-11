@@ -17,6 +17,8 @@ tiny_http = "0.12"
 rfd = "0.17"
 open = "5"
 percent-encoding = "2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sqlite-vec = "0.1.9"
 
 [patch.crates-io]
 llama-cpp-sys-2 = { path = "../vendor/llama-cpp-sys-2" }
