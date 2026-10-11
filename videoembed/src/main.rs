@@ -257,37 +257,45 @@ fn source_of(path: &str) -> Result<PathBuf> {
     Ok(video)
 }
 
+/// Split a `plan` argument into the video path and the plan words.
+///
+/// The path may hold spaces. The plan words start at the first word that names
+/// a preset or holds a value, so every word before that one belongs to the
+/// path.
+fn split_plan_args(rest: &str) -> Result<(String, String)> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    for at in 1..words.len() {
+        let word = words[at];
+        if word.contains('=') || videoembed::plan::Preset::parse(word).is_some() {
+            return Ok((words[..at].join(" "), words[at..].join(" ")));
+        }
+    }
+    bail!("usage: plan <path> <preset> | plan <path> window=4 frames=4")
+}
+
 /// The plan a `plan` command asks for, over the stored plan.
 ///
 /// The argument is `<path> <preset>` or `<path> <value> <value>`.
 fn plan_command(store: &Store, rest: &str) -> Result<videoembed::plan::Plan> {
-    let (path, words) = rest.split_once(char::is_whitespace).ok_or_else(|| {
-        anyhow::anyhow!("usage: plan <path> <preset> | plan <path> window=4 frames=4")
-    })?;
-    let words = words.trim();
-    if words.is_empty() {
-        bail!("usage: plan <path> <preset> | plan <path> window=4 frames=4");
-    }
-    let label = videoembed::store::normalize_label(path);
+    let (path, words) = split_plan_args(rest)?;
+    let label = videoembed::store::normalize_label(&path);
     let base = store
         .plan_of(&label)?
         .ok_or_else(|| anyhow::anyhow!("the store holds no video at {path}"))?;
-    if let Some(preset) = videoembed::plan::Preset::parse(words) {
+    if let Some(preset) = videoembed::plan::Preset::parse(&words) {
         return Ok(videoembed::plan::Plan::of(preset));
     }
-    base.set_words(words)
+    base.set_words(&words)
 }
 
 /// Cut one video again under the plan the user names.
 fn plan(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
-    let (path, _) = rest
-        .split_once(char::is_whitespace)
-        .ok_or_else(|| anyhow::anyhow!("usage: plan <path> <preset>"))?;
+    let (path, _) = split_plan_args(rest)?;
     let wanted = plan_command(store, rest)?;
-    source_of(path)?;
+    source_of(&path)?;
     println!("Re-indexing {} under the new plan.", path);
     let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
-    let count = index::reindex(embedder, store, path, &wanted, &mut report)?;
+    let count = index::reindex(embedder, store, &path, &wanted, &mut report)?;
     println!("Indexed {count} records.");
     Ok(())
 }
@@ -656,6 +664,41 @@ mod tests {
         assert_eq!(plan.window, 6.0);
         assert!(plan.audio);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that holds a space still separates from the plan words.
+    #[test]
+    fn the_plan_command_reads_a_path_with_a_space() {
+        let (dir, mut store) = store_for_plan_test();
+        store
+            .append(vec![videoembed::store::NewRecord {
+                kind: videoembed::store::KIND_FRAME,
+                label: "D:/my videos/a.mp4".into(),
+                start: 0.0,
+                end: 0.25,
+                vec: {
+                    let mut vec = vec![0.0f32; videoembed::db::DIM];
+                    vec[0] = 1.0;
+                    vec
+                },
+            }])
+            .unwrap();
+
+        let plan = plan_command(&store, "D:/my videos/a.mp4 action").unwrap();
+
+        assert_eq!(
+            plan,
+            videoembed::plan::Plan::of(videoembed::plan::Preset::Action)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The split hands the whole path to the caller, spaces and all.
+    #[test]
+    fn the_plan_split_names_the_path() {
+        let (path, words) = split_plan_args("D:/my videos/a.mp4 window=4").unwrap();
+        assert_eq!(path, "D:/my videos/a.mp4");
+        assert_eq!(words, "window=4");
     }
 
     /// A path the store does not hold names the fault.

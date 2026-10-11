@@ -527,8 +527,9 @@ pub fn index_video(
 
 /// Cut one video again under a new plan.
 ///
-/// The plan is written last, so a fault in the middle leaves the video with no
-/// records and its old plan. The next index run then rebuilds it.
+/// The plan is written first, and the records go next. A fault after that
+/// point leaves the video with no records and its new plan, so the next index
+/// run rebuilds it under the plan the user chose.
 pub fn reindex(
     embedder: &Embedder,
     store: &mut store::Store,
@@ -541,11 +542,11 @@ pub fn reindex(
         bail!("{} is not a file", video.display());
     }
     let label = store::normalize_label(path);
-    store.forget(&label)?;
+    store.set_plan(&label, plan)?;
+    store.clear_records(&label)?;
     let records = index_video(embedder, video, plan, on_step)?;
     let count = records.len();
     store.append(records)?;
-    store.set_plan(&label, plan)?;
     store.mark_done(&label)?;
     Ok(count)
 }
@@ -1336,7 +1337,8 @@ mod tests {
         run.clear_dir();
     }
 
-    /// A video shorter than one window gives no record, and no fault.
+    /// A video shorter than one window is refused, and the message names the
+    /// window. The same video fits the shorter Object window.
     #[test]
     fn a_video_shorter_than_one_window_gives_no_record() {
         let Some(video) = spike_video_short() else {

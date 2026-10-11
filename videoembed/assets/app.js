@@ -69,10 +69,12 @@ async function refreshVideos() {
   }
 }
 
-// One video's plan, as one short line for the table.
+// One video's plan, as one short line for the table. An empty name means the
+// plan matches no preset. The values then stand alone.
 function planWords(video) {
   if (video.plan === "fine") return "Fine, " + video.window + " s frames";
-  return video.plan + ", " + video.window + " s window, " + video.frames +
+  const head = video.plan === "" ? "" : video.plan + ", ";
+  return head + video.window + " s window, " + video.frames +
     " frames" + (video.audio ? ", audio" : "");
 }
 

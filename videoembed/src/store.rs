@@ -273,6 +273,30 @@ impl Store {
         Ok(removed)
     }
 
+    /// Remove the records of one video, and keep its plan.
+    ///
+    /// A re-cut removes the old records before it cuts again. A fault after
+    /// this point leaves the plan in place, so the next run rebuilds the video
+    /// under it. Use `forget` to drop the whole video.
+    pub fn clear_records(&mut self, path: &str) -> Result<usize> {
+        let want = normalize_label(path);
+        let rids: Vec<i64> = self
+            .records
+            .iter()
+            .filter(|record| is_video(record.kind) && normalize_label(&record.label) == want)
+            .map(|record| record.rid)
+            .collect();
+        let removed = rids.len();
+
+        let tx = self.conn.transaction().context("begin the delete")?;
+        delete_rows(&tx, &rids)?;
+        tx.commit().context("commit the delete")?;
+
+        self.done.remove(&want);
+        self.load_records()?;
+        Ok(removed)
+    }
+
     /// The plan of one video, or None when the video holds no row.
     pub fn plan_of(&self, path: &str) -> Result<Option<Plan>> {
         let want = normalize_label(path);
@@ -1282,6 +1306,31 @@ mod tests {
         let again = Store::open(&dir.join("index.db")).unwrap();
         let held = again.plan_of("a.mp4").unwrap().unwrap();
         assert_eq!(held, plan::Plan::of(plan::Preset::Action));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A records-only clear keeps the plan of the video.
+    ///
+    /// A re-cut removes the old records before it cuts again. A fault after
+    /// that point must leave the plan, so the next run rebuilds the video under
+    /// it. A forget drops the whole video, plan and all.
+    #[test]
+    fn clearing_the_records_keeps_the_plan() {
+        let (dir, mut store) = opened("plan_clear");
+        store.append(vec![new_record("a.mp4", 0.0, 2.0)]).unwrap();
+        store
+            .set_plan("a.mp4", &plan::Plan::of(plan::Preset::Speech))
+            .unwrap();
+
+        let removed = store.clear_records("a.mp4").unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store.plan_of("a.mp4").unwrap().unwrap(),
+            plan::Plan::of(plan::Preset::Speech),
+            "the plan must survive a records-only clear"
+        );
+        assert!(!store.holds_video("a.mp4"), "the records must go");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

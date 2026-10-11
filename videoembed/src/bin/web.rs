@@ -500,17 +500,17 @@ fn videos(store: &Store) -> Vec<VideoRow> {
     rows
 }
 
-/// The preset name of a plan, by its values.
+/// The preset name of a plan, by its values. An empty name means no preset.
 ///
-/// A plan that matches no preset reports the default preset. The page shows the
-/// values beside the name, so the name cannot hide a custom plan.
+/// The page sends the name back to the server. A plan that matches no preset
+/// must name no preset, or the page would replace a custom window and frame
+/// count with that preset.
 fn preset_name(plan: &videoembed::plan::Plan) -> String {
     videoembed::plan::Preset::ALL
         .into_iter()
         .find(|preset| videoembed::plan::Plan::of(*preset) == *plan)
-        .unwrap_or(videoembed::plan::Preset::Object)
-        .as_str()
-        .to_string()
+        .map(|preset| preset.as_str().to_string())
+        .unwrap_or_default()
 }
 
 /// Answer jobs forever. A running index does one media item per turn.
@@ -796,6 +796,7 @@ fn start_plan(
     let run = index::IndexRun::start_with(&video, &plan).map_err(JobError::from)?;
     let total = run.total();
     flag.store(false, Ordering::Relaxed);
+    let label = normalize_label(path);
     {
         let mut held = progress.lock().unwrap();
         // The model state belongs to the server, not to this job. Hold it,
@@ -807,13 +808,16 @@ fn start_plan(
             running: true,
             folder: String::new(),
             file_count: 1,
+            // The page reads the file name and the item count of the job.
+            file: label.clone(),
+            file_index: 1,
+            window_count: total,
             device,
             gpu_available,
             load_ms,
             ..Progress::default()
         };
     }
-    let label = normalize_label(path);
     *pending = Some(WebJob {
         files: vec![video],
         file_at: 0,
@@ -1606,17 +1610,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A plan that matches no preset reports the default preset name.
+    /// A plan that matches no preset names no preset.
     ///
-    /// The page sends the name back to the server, so the name must be a real
-    /// preset word. The values in the row show the custom plan.
+    /// The page sends the name back to the server. A false name would replace
+    /// the custom window and frames of the video with that preset.
     #[test]
-    fn a_custom_plan_reports_the_default_name() {
+    fn a_custom_plan_names_no_preset() {
         let custom = videoembed::plan::Plan::of(videoembed::plan::Preset::Object)
             .set_words("window=3 frames=3")
             .unwrap();
 
-        assert_eq!(preset_name(&custom), "object");
+        assert_eq!(preset_name(&custom), "");
+    }
+
+    /// A plan job points the progress at the video that it cuts.
+    ///
+    /// The page shows the file name and the item count of the running job. A
+    /// zero count gives an empty bar and an item count of "N/0".
+    #[test]
+    fn a_plan_job_fills_the_progress_fields() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut pending = None;
+
+        let total = start_plan(
+            &progress,
+            &mut pending,
+            &flag,
+            &video.to_string_lossy(),
+            videoembed::plan::Plan::of(videoembed::plan::Preset::Speech),
+        )
+        .unwrap();
+
+        let held = progress.lock().unwrap();
+        assert!(held.running, "the plan job runs");
+        assert_eq!(held.window_count, total, "the bar needs the item count");
+        assert_eq!(held.file_count, 1);
+        assert!(
+            held.file.ends_with("testvideo_nolabels.mp4"),
+            "the page names the file, got {:?}",
+            held.file
+        );
+    }
+
+    /// The spike clip, when it is here.
+    fn spike_video() -> Option<PathBuf> {
+        let path = PathBuf::from("../spike/testvideo_nolabels.mp4");
+        path.is_file().then_some(path)
     }
 
     /// The plan body reads a preset name.
