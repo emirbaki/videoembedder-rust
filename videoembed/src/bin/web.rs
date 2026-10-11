@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use videoembed::embed::{Device, Embedder, QUERY_PREFIX};
 use videoembed::index::{self, Group, Progress};
 use videoembed::media;
-use videoembed::store::{Record, Store, normalize_label};
+use videoembed::store::{NewRecord, Store, normalize_label};
 
 type Reply = Response<Box<dyn Read + Send>>;
 
@@ -398,7 +398,7 @@ struct WebJob {
     files: Vec<PathBuf>,
     file_at: usize,
     run: Option<index::IndexRun>,
-    records: Vec<Record>,
+    records: Vec<NewRecord>,
     indexed: usize,
     started: std::time::Instant,
     label: String,
@@ -676,7 +676,7 @@ fn start_index(
 /// A finished video takes the finished mark, and the mark keeps it out of
 /// every later run. A run that failed part way holds a partial answer, so it
 /// takes no mark and the next run indexes the video again.
-fn run_left_a_whole_index(outcome: &Result<Option<Record>>) -> bool {
+fn run_left_a_whole_index(outcome: &Result<Option<NewRecord>>) -> bool {
     matches!(outcome, Ok(None))
 }
 
@@ -1128,6 +1128,13 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A vector of the model size, with one 1.0 at the front.
+    fn unit() -> Vec<f32> {
+        let mut vec = vec![0.0f32; videoembed::db::DIM];
+        vec[0] = 1.0;
+        vec
+    }
+
     /// A failure of one file must survive the start of the next file.
     ///
     /// The page reads the error field for the whole run. A new file that
@@ -1238,26 +1245,26 @@ mod tests {
         let mut store = Store::open(&dir.join("index.vei")).unwrap();
         store
             .append(vec![
-                Record {
+                NewRecord {
                     kind: videoembed::store::KIND_FRAME,
                     label: "a.mp4".into(),
                     start: 0.0,
                     end: 0.25,
-                    vec: vec![1.0, 0.0],
+                    vec: unit(),
                 },
-                Record {
+                NewRecord {
                     kind: videoembed::store::KIND_AUDIO,
                     label: "a.mp4".into(),
                     start: 0.0,
                     end: 1.0,
-                    vec: vec![1.0, 0.0],
+                    vec: unit(),
                 },
-                Record {
+                NewRecord {
                     kind: videoembed::store::KIND_NOTE,
                     label: "a note".into(),
                     start: 0.0,
                     end: 0.0,
-                    vec: vec![1.0, 0.0],
+                    vec: unit(),
                 },
             ])
             .unwrap();
@@ -1308,12 +1315,12 @@ mod tests {
     /// part way must leave no mark. The video then indexes again.
     #[test]
     fn only_a_run_that_reached_its_end_is_whole() {
-        let more_work = Ok(Some(Record {
+        let more_work = Ok(Some(NewRecord {
             kind: videoembed::store::KIND_FRAME,
             label: "a.mp4".to_string(),
             start: 0.0,
             end: 0.25,
-            vec: vec![1.0, 0.0],
+            vec: unit(),
         }));
         assert!(!run_left_a_whole_index(&more_work), "the run is not finished");
         assert!(run_left_a_whole_index(&Ok(None)), "the run reached its end");

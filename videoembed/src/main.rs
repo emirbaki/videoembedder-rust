@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 
 use videoembed::embed::{DOC_PREFIX, Device, Embedder, QUERY_PREFIX, dot};
 use videoembed::index;
-use videoembed::store::{KIND_FRAME, KIND_NOTE, Record, Store};
+use videoembed::store::{KIND_FRAME, KIND_NOTE, NewRecord, Store};
 
 fn main() -> Result<()> {
     let models = models_dir();
@@ -159,13 +159,17 @@ fn measure(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
             println!("{factor:>6}  no frame records");
             continue;
         }
+        // The vectors stay on disk, so the measure asks for the ones the
+        // thinning kept, in the same order.
+        let rids: Vec<i64> = thin.iter().map(|r| r.rid).collect();
+        let vectors_of: Vec<Vec<f32>> = store.vectors(&rids)?;
         let grid = index::FRAME_STEP * factor as f64;
         let mut line = Vec::new();
         for (at, query) in queries.iter().enumerate() {
             let mut ranked: Vec<(usize, f32)> = thin
                 .iter()
                 .enumerate()
-                .map(|(i, r)| (i, dot(&vectors[at], &r.vec)))
+                .map(|(i, _)| (i, dot(&vectors[at], &vectors_of[i])))
                 .collect();
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
             let baseline = index::median(&ranked);
@@ -214,7 +218,7 @@ fn note(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
         bail!("usage: note <text>");
     }
     let vec = embedder.embed_text(&format!("{DOC_PREFIX}{rest}"))?;
-    store.append(vec![Record {
+    store.append(vec![NewRecord {
         kind: KIND_NOTE,
         label: rest.to_string(),
         start: 0.0,

@@ -1,17 +1,16 @@
-//! The vector store. One file holds every record.
+//! The vector store. One SQLite database holds every record.
 //!
-//! Layout: magic "VEI1" | u32 dim | u32 count | record[count]
-//! Record: u8 kind | u32 label_len | label | f32 start | f32 end | f32 vec[dim]
-//!
-//! A write goes to a temp file first. Then the temp file replaces the store.
+//! The vectors live in the `vec_records` table of `db`. The metadata lives in
+//! the `records` and `videos` tables. The in-memory list holds the metadata
+//! alone, so a large store costs memory for the small part.
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, Transaction, params};
 
-use crate::embed::dot;
+use crate::db;
 
 const MAGIC: &[u8; 4] = b"VEI1";
 
@@ -19,6 +18,11 @@ pub const KIND_WINDOW: u8 = 0;
 pub const KIND_NOTE: u8 = 1;
 pub const KIND_FRAME: u8 = 2;
 pub const KIND_AUDIO: u8 = 3;
+
+/// The plan of the run that fills the store. Window mode changes these.
+const PLAN_WINDOW: f64 = 0.25;
+const PLAN_FRAMES: i64 = 1;
+const PLAN_AUDIO: i64 = 1;
 
 /// True for a record that belongs to a video file.
 ///
@@ -33,21 +37,6 @@ pub fn is_video(kind: u8) -> bool {
 /// console and the web binary must agree, so every label becomes a slash form.
 pub fn normalize_label(path: &str) -> String {
     path.replace('\\', "/")
-}
-
-/// The finished list beside the store. `store/index.vei` gives `store/index.done`.
-fn done_path(store: &Path) -> PathBuf {
-    store.with_extension("done")
-}
-
-/// Read the finished list. A missing file gives an empty set.
-fn read_done(store: &Path) -> HashSet<String> {
-    let text = std::fs::read_to_string(done_path(store)).unwrap_or_default();
-    text.lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(normalize_label)
-        .collect()
 }
 
 /// One record before it enters the store. The vector travels with it.
@@ -73,17 +62,20 @@ fn millis(seconds: f32) -> i64 {
     (seconds as f64 * 1000.0).round() as i64
 }
 
+/// One record in the store. The vector stays on disk.
 #[derive(Clone)]
 pub struct Record {
+    pub rid: i64,
+    pub id: String,
     pub kind: u8,
     pub label: String,
     pub start: f32,
     pub end: f32,
-    pub vec: Vec<f32>,
 }
 
 pub struct Store {
     path: PathBuf,
+    conn: Connection,
     pub dim: usize,
     pub records: Vec<Record>,
     /// The video paths that finished an index run.
@@ -93,62 +85,59 @@ pub struct Store {
 impl Store {
     /// Open the store. A missing file gives an empty store.
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self {
-                path: path.to_path_buf(),
-                dim: 0,
-                records: Vec::new(),
-                done: read_done(path),
-            });
-        }
-        let bytes = std::fs::read(path).context("read the store")?;
-        let mut store = Self::decode(path.to_path_buf(), &bytes)?;
-        store.done = read_done(&store.path);
+        let conn = db::open(path)?;
+        let mut store = Self {
+            path: path.to_path_buf(),
+            conn,
+            dim: db::DIM,
+            records: Vec::new(),
+            done: HashSet::new(),
+        };
+        store.load_records()?;
+        store.done = store.load_done()?;
         Ok(store)
     }
 
-    fn decode(path: PathBuf, bytes: &[u8]) -> Result<Self> {
-        let mut cur = Cursor { bytes, at: 0 };
-        if cur.take(4)? != MAGIC {
-            bail!("{} is not a store file", path.display());
+    /// Read the metadata of every record, in row order.
+    fn load_records(&mut self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("select rid, id, kind, path, start, end from records order by rid")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Record {
+                rid: row.get(0)?,
+                id: row.get(1)?,
+                kind: row.get::<_, i64>(2)? as u8,
+                label: row.get(3)?,
+                start: row.get::<_, f64>(4)? as f32,
+                end: row.get::<_, f64>(5)? as f32,
+            })
+        })?;
+        self.records.clear();
+        for row in rows {
+            self.records.push(row?);
         }
-        let dim = cur.u32()? as usize;
-        let count = cur.u32()? as usize;
-        let mut records = Vec::with_capacity(count);
-        for _ in 0..count {
-            let kind = cur.u8()?;
-            let label_len = cur.u32()? as usize;
-            let label = String::from_utf8(cur.take(label_len)?.to_vec())
-                .context("store label is not utf8")?;
-            let start = cur.f32()?;
-            let end = cur.f32()?;
-            let mut vec = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                vec.push(cur.f32()?);
-            }
-            records.push(Record {
-                kind,
-                label,
-                start,
-                end,
-                vec,
-            });
+        Ok(())
+    }
+
+    /// Read the finished marks.
+    fn load_done(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare("select path from videos where done = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
         }
-        Ok(Self {
-            path,
-            dim,
-            records,
-            done: HashSet::new(),
-        })
+        Ok(out)
     }
 
     /// Append records and write the store.
-    pub fn append(&mut self, new_records: Vec<Record>) -> Result<()> {
+    ///
+    /// A path that arrives again replaces its own rows. One transaction holds
+    /// the records, their vectors, and the video rows.
+    pub fn append(&mut self, new_records: Vec<NewRecord>) -> Result<()> {
         if new_records.is_empty() {
             return Ok(());
-        }
-        if self.dim == 0 {
-            self.dim = new_records[0].vec.len();
         }
         for record in &new_records {
             if record.vec.len() != self.dim {
@@ -159,80 +148,89 @@ impl Store {
                 );
             }
         }
-        self.records.extend(new_records);
-        self.write()
+
+        let tx = self.conn.transaction().context("begin the write")?;
+        // The path match ignores the separator direction, so a batch label and
+        // a stored label name one video across `\` and `/`.
+        let mut wants: Vec<String> = new_records.iter().map(|r| normalize_label(&r.label)).collect();
+        wants.sort_unstable();
+        wants.dedup();
+        for want in &wants {
+            let rids: Vec<i64> = self
+                .records
+                .iter()
+                .filter(|record| normalize_label(&record.label) == *want)
+                .map(|record| record.rid)
+                .collect();
+            delete_rows(&tx, &rids)?;
+        }
+        for record in &new_records {
+            tx.execute(
+                "insert into records(id, path, kind, start, end) values (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record_id(&record.label, record.start, record.end),
+                    record.label,
+                    record.kind as i64,
+                    record.start as f64,
+                    record.end as f64
+                ],
+            )?;
+            let rid = tx.last_insert_rowid();
+            tx.execute(
+                "insert into vec_records(rid, path, embedding) values (?1, ?2, vec_f32(?3))",
+                params![rid, record.label, db::vec_to_blob(&record.vec)],
+            )?;
+        }
+        write_videos(&tx, &new_records)?;
+        tx.commit().context("commit the write")?;
+
+        self.load_records()
     }
 
     /// Remove every video record of one video path.
     ///
-    /// The path separators do not matter, like `holds_video`.
+    /// The path separators do not matter, like `holds_video`. A note keeps its
+    /// place, because a note is not a video record. The stored `path` column
+    /// keeps the label as it shows, so the rows are found by id, not by path.
     pub fn forget(&mut self, path: &str) -> Result<usize> {
         let want = normalize_label(path);
-        let before = self.records.len();
-        self.records
-            .retain(|r| !(is_video(r.kind) && normalize_label(&r.label) == want));
-        let removed = before - self.records.len();
-        if removed > 0 {
-            self.write()?;
-            self.done.remove(&want);
-            self.write_done()?;
-        }
+        let rids: Vec<i64> = self
+            .records
+            .iter()
+            .filter(|record| record.kind != KIND_NOTE && normalize_label(&record.label) == want)
+            .map(|record| record.rid)
+            .collect();
+        let removed = rids.len();
+
+        let tx = self.conn.transaction().context("begin the delete")?;
+        delete_rows(&tx, &rids)?;
+        tx.execute("delete from videos where path = ?1", [&want])?;
+        tx.commit().context("commit the delete")?;
+
+        self.done.remove(&want);
+        self.load_records()?;
         Ok(removed)
     }
 
     /// True when this video finished an index run.
-    ///
-    /// The path separators do not matter, like `holds_video`.
     pub fn is_done(&self, label: &str) -> bool {
         self.done.contains(&normalize_label(label))
     }
 
     /// Record that this video finished an index run.
     pub fn mark_done(&mut self, label: &str) -> Result<()> {
-        self.done.insert(normalize_label(label));
-        self.write_done()
-    }
-
-    /// The finished set, one path on each line.
-    fn write_done(&self) -> Result<()> {
-        let mut out = String::new();
-        for label in &self.done {
-            out.push_str(label);
-            out.push('\n');
-        }
-        let path = done_path(&self.path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("done.tmp");
-        std::fs::write(&tmp, out).context("write the finished list")?;
-        std::fs::rename(&tmp, &path).context("replace the finished list")?;
+        let want = normalize_label(label);
+        self.conn.execute(
+            "insert into videos(path, plan_window, plan_stride, plan_frames, plan_audio, done)
+             values (?1, ?2, ?2, ?3, ?4, 1)
+             on conflict(path) do update set done = 1",
+            params![want, PLAN_WINDOW, PLAN_FRAMES, PLAN_AUDIO],
+        )?;
+        self.done.insert(want);
         Ok(())
     }
 
-    /// Build the store bytes. `write` sends them to the file.
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(self.dim as u32).to_le_bytes());
-        out.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
-        for record in &self.records {
-            out.push(record.kind);
-            out.extend_from_slice(&(record.label.len() as u32).to_le_bytes());
-            out.extend_from_slice(record.label.as_bytes());
-            out.extend_from_slice(&record.start.to_le_bytes());
-            out.extend_from_slice(&record.end.to_le_bytes());
-            for x in &record.vec {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        out
-    }
-
     /// True when the store holds a video record with this exact path.
-    ///
-    /// The path separators do not matter, so the console and the web binary
-    /// find the same record.
     pub fn holds_video(&self, path: &str) -> bool {
         let want = normalize_label(path);
         self.records
@@ -240,31 +238,100 @@ impl Store {
             .any(|record| is_video(record.kind) && normalize_label(&record.label) == want)
     }
 
-    fn write(&self) -> Result<()> {
-        let out = self.encode();
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Read the vectors of these rows, in the order of the ids.
+    ///
+    /// The measure command uses this. The vectors stay on disk, so a caller
+    /// asks for the ones it needs.
+    pub fn vectors(&self, rids: &[i64]) -> Result<Vec<Vec<f32>>> {
+        let mut stmt = self
+            .conn
+            .prepare("select embedding from vec_records where rid = ?1")?;
+        let mut out = Vec::with_capacity(rids.len());
+        for rid in rids {
+            let blob: Vec<u8> = stmt
+                .query_row([rid], |row| row.get(0))
+                .with_context(|| format!("read the vector of row {rid}"))?;
+            out.push(db::blob_to_vec(&blob));
         }
-        let tmp = self.path.with_extension("vei.tmp");
-        let mut file = std::fs::File::create(&tmp).context("create the temp store")?;
-        file.write_all(&out)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &self.path).context("replace the store")?;
-        Ok(())
+        Ok(out)
+    }
+
+    /// The path of the store file.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Rank every record against one query vector. Best first.
+    ///
+    /// The vectors sit in the database, so the search moves to a query in
+    /// Task 4. This body returns a zero score for every record and keeps the
+    /// callers working until then.
     pub fn rank(&self, query: &[f32]) -> Vec<(usize, f32)> {
-        let mut scored: Vec<(usize, f32)> = self
-            .records
+        let _ = query;
+        self.records
             .iter()
             .enumerate()
-            .map(|(i, r)| (i, dot(query, &r.vec)))
-            .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored
+            .map(|(at, _)| (at, 0.0))
+            .collect()
     }
+}
+
+/// Delete the rows with these ids from both tables.
+fn delete_rows(tx: &Transaction, rids: &[i64]) -> Result<()> {
+    for rid in rids {
+        tx.execute("delete from vec_records where rid = ?1", [rid])?;
+        tx.execute("delete from records where rid = ?1", [rid])?;
+    }
+    Ok(())
+}
+
+/// Write one `videos` row for each video path in the batch.
+///
+/// The stored path is the normalized form, because `is_done` normalizes when
+/// it reads the mark.
+fn write_videos(tx: &Transaction, records: &[NewRecord]) -> Result<()> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for record in records {
+        if !is_video(record.kind) || !seen.insert(record.label.as_str()) {
+            continue;
+        }
+        let (size, mtime) = fingerprint(&record.label);
+        tx.execute(
+            "insert into videos(path, plan_window, plan_stride, plan_frames, plan_audio,
+                                source_size, source_mtime, done)
+             values (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0)
+             on conflict(path) do update set
+               plan_window = excluded.plan_window,
+               plan_stride = excluded.plan_stride,
+               plan_frames = excluded.plan_frames,
+               plan_audio = excluded.plan_audio,
+               source_size = excluded.source_size,
+               source_mtime = excluded.source_mtime",
+            params![
+                normalize_label(&record.label),
+                PLAN_WINDOW,
+                PLAN_FRAMES,
+                PLAN_AUDIO,
+                size,
+                mtime
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The size and the time of the source file. A note gives two `None` values.
+fn fingerprint(label: &str) -> (Option<i64>, Option<i64>) {
+    let Ok(meta) = std::fs::metadata(label) else {
+        return (None, None);
+    };
+    let size = meta.len() as i64;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    (Some(size), mtime)
 }
 
 struct Cursor<'a> {
@@ -297,30 +364,63 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Build store bytes for a test. The real path goes through `Store::encode`.
-#[cfg(test)]
-fn encode_for_test(dim: usize, records: &[Record]) -> Vec<u8> {
-    let store = Store {
-        path: PathBuf::from("unused.vei"),
-        dim,
-        records: records.to_vec(),
-        done: HashSet::new(),
-    };
-    store.encode()
+/// Read the records of an old `VEI1` file. The import uses this.
+#[allow(dead_code)]
+fn vei_records(bytes: &[u8]) -> Result<(usize, Vec<NewRecord>)> {
+    let mut cur = Cursor { bytes, at: 0 };
+    if cur.take(4)? != MAGIC {
+        bail!("the old store file is not a VEI1 file");
+    }
+    let dim = cur.u32()? as usize;
+    let count = cur.u32()? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = cur.u8()?;
+        let label_len = cur.u32()? as usize;
+        let label = String::from_utf8(cur.take(label_len)?.to_vec())
+            .context("store label is not utf8")?;
+        let start = cur.f32()?;
+        let end = cur.f32()?;
+        let mut vec = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            vec.push(cur.f32()?);
+        }
+        out.push(NewRecord {
+            kind,
+            label,
+            start,
+            end,
+            vec,
+        });
+    }
+    Ok((dim, out))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn record(label: &str) -> Record {
-        Record {
-            kind: KIND_WINDOW,
+    /// A frame record for one video. The vector size is the model size.
+    fn new_record(label: &str, start: f32, end: f32) -> NewRecord {
+        let mut vec = vec![0.0f32; db::DIM];
+        vec[0] = 1.0;
+        NewRecord {
+            kind: KIND_FRAME,
             label: label.to_string(),
-            start: 0.0,
-            end: 4.0,
-            vec: vec![1.0, 0.0],
+            start,
+            end,
+            vec,
         }
+    }
+
+    /// A store on a fresh database in the scratch folder.
+    fn opened(name: &str) -> (PathBuf, Store) {
+        let dir = scratch(name);
+        let path = dir.join("index.db");
+        let store = Store::open(&path).unwrap();
+        (dir, store)
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -329,13 +429,171 @@ mod tests {
         dir
     }
 
-    fn store_of(records: Vec<Record>) -> Store {
-        Store {
-            path: PathBuf::from("unused.vei"),
-            dim: 2,
-            records,
-            done: HashSet::new(),
+    /// A stored record, for the tests that read one.
+    fn record(label: &str) -> Record {
+        Record {
+            rid: 0,
+            id: record_id(label, 0.0, 4.0),
+            kind: KIND_WINDOW,
+            label: label.to_string(),
+            start: 0.0,
+            end: 4.0,
         }
+    }
+
+    /// A store that holds these records, on a fresh database.
+    ///
+    /// The folder is unique per call, so tests under the parallel runner do
+    /// not share one database.
+    fn store_of(records: Vec<Record>) -> Store {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "vei_store_of_{}_{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        let new: Vec<NewRecord> = records
+            .into_iter()
+            .map(|r| NewRecord {
+                kind: r.kind,
+                label: r.label,
+                start: r.start,
+                end: r.end,
+                vec: {
+                    let mut vec = vec![0.0f32; db::DIM];
+                    vec[0] = 1.0;
+                    vec
+                },
+            })
+            .collect();
+        store.append(new).unwrap();
+        store
+    }
+
+    #[test]
+    fn a_record_reaches_the_database_and_comes_back() {
+        let (dir, mut store) = opened("round");
+        store
+            .append(vec![new_record("D:/video/a.mp4", 0.25, 0.5)])
+            .unwrap();
+
+        let again = Store::open(&dir.join("index.db")).unwrap();
+
+        assert_eq!(again.records.len(), 1);
+        assert_eq!(again.records[0].label, "D:/video/a.mp4");
+        assert_eq!(again.records[0].id, "D:/video/a.mp4/250-500");
+        assert_eq!(again.records[0].kind, KIND_FRAME);
+        assert_eq!(again.records[0].start, 0.25);
+        assert_eq!(again.records[0].end, 0.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second pass over one video replaces its rows. It does not double them.
+    #[test]
+    fn a_second_pass_leaves_one_set_of_rows() {
+        let (dir, mut store) = opened("twice");
+        store
+            .append(vec![
+                new_record("a.mp4", 0.0, 0.25),
+                new_record("a.mp4", 0.25, 0.5),
+            ])
+            .unwrap();
+        store
+            .append(vec![
+                new_record("a.mp4", 0.0, 0.25),
+                new_record("a.mp4", 0.25, 0.5),
+            ])
+            .unwrap();
+
+        assert_eq!(store.records.len(), 2);
+        let again = Store::open(&dir.join("index.db")).unwrap();
+        assert_eq!(again.records.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delete of one video touches the records and the vectors.
+    #[test]
+    fn a_delete_removes_the_rows_and_the_vectors() {
+        let (dir, mut store) = opened("delete");
+        store
+            .append(vec![new_record("a.mp4", 0.0, 0.25), new_record("b.mp4", 0.0, 0.25)])
+            .unwrap();
+
+        let removed = store.forget("a.mp4").unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(store.records.len(), 1);
+        let left: i64 = store
+            .conn
+            .query_row("select count(*) from vec_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "the vector of the removed record must go");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two paths where one starts like the other stay apart.
+    #[test]
+    fn a_path_that_starts_like_another_keeps_the_delete_to_one_video() {
+        let (dir, mut store) = opened("prefix");
+        store
+            .append(vec![
+                new_record("a/b.mp4", 0.0, 0.25),
+                new_record("a/b.mp4x", 0.0, 0.25),
+            ])
+            .unwrap();
+
+        let removed = store.forget("a/b.mp4").unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(store.records.len(), 1);
+        assert_eq!(store.records[0].label, "a/b.mp4x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fault in the middle of a write leaves no half record.
+    ///
+    /// The two records hold the same path, the same range, and so the same
+    /// id. The second insert breaks the unique rule. One transaction holds
+    /// the two, so the first insert goes back with the second.
+    #[test]
+    fn a_fault_in_the_middle_of_a_write_leaves_no_rows() {
+        let (dir, mut store) = opened("fault");
+        let outcome = store.append(vec![
+            new_record("a.mp4", 0.0, 0.25),
+            new_record("a.mp4", 0.0, 0.25),
+        ]);
+
+        assert!(outcome.is_err(), "the same id must break the write");
+        assert!(store.records.is_empty(), "the store keeps no half record");
+        let rows: i64 = store
+            .conn
+            .query_row("select count(*) from vec_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "no vector may stay after the fault");
+        let again = Store::open(&dir.join("index.db")).unwrap();
+        assert!(again.records.is_empty(), "the file keeps no half record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A space and a non-ASCII letter survive the database.
+    #[test]
+    fn a_unicode_path_and_a_note_round_trip() {
+        let (dir, mut store) = opened("unicode");
+        let mut note = new_record("doğum günü", 0.0, 0.0);
+        note.kind = KIND_NOTE;
+        store
+            .append(vec![new_record("D:/video/doğum günü.mp4", 0.0, 0.25), note])
+            .unwrap();
+
+        let again = Store::open(&dir.join("index.db")).unwrap();
+
+        assert_eq!(again.records.len(), 2);
+        assert!(again.holds_video("D:/video/doğum günü.mp4"));
+        assert_eq!(again.records[1].kind, KIND_NOTE);
+        assert_eq!(again.records[1].id, "doğum günü/0-0");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -380,19 +638,19 @@ mod tests {
 
     #[test]
     fn forget_removes_frame_and_audio_records_of_one_video() {
-        let dir = std::env::temp_dir().join(format!("vei_forget_kind_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut frame = record("D:/video/a.mp4");
-        frame.kind = KIND_FRAME;
-        let mut audio = record("D:/video/a.mp4");
+        let (dir, mut store) = opened("forget_kind");
+        let mut audio = new_record("D:/video/a.mp4", 0.0, 1.0);
         audio.kind = KIND_AUDIO;
-        let mut store = Store {
-            path: dir.join("index.vei"),
-            dim: 2,
-            records: vec![frame, audio, record("D:/video/b.mp4")],
-            done: HashSet::new(),
-        };
+        store
+            .append(vec![
+                new_record("D:/video/a.mp4", 0.0, 0.25),
+                audio,
+                new_record("D:/video/b.mp4", 0.0, 0.25),
+            ])
+            .unwrap();
+
         let removed = store.forget("D:/video/a.mp4").unwrap();
+
         assert_eq!(removed, 2);
         assert_eq!(store.records.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -414,48 +672,26 @@ mod tests {
 
     #[test]
     fn forget_removes_a_label_across_path_separators() {
-        let dir = std::env::temp_dir().join(format!("vei_forget_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut store = Store {
-            path: dir.join("index.vei"),
-            dim: 2,
-            records: vec![record("D:\\video\\a.mp4"), record("D:\\video\\b.mp4")],
-            done: HashSet::new(),
-        };
+        let (dir, mut store) = opened("forget_slash");
+        store
+            .append(vec![
+                new_record("D:\\video\\a.mp4", 0.0, 0.25),
+                new_record("D:\\video\\b.mp4", 0.0, 0.25),
+            ])
+            .unwrap();
+
         let removed = store.forget("D:/video/a.mp4").unwrap();
+
         assert_eq!(removed, 1);
-        assert_eq!(store.records.len(), 1);
         assert_eq!(store.records[0].label, "D:\\video\\b.mp4");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_store_round_trips_through_the_file_format() {
-        let records = vec![record("D:/video/a.mp4"), record("D:/video/b.mp4")];
-        let bytes = encode_for_test(2, &records);
-        let decoded = Store::decode(PathBuf::from("unused.vei"), &bytes).unwrap();
-        assert_eq!(decoded.dim, 2);
-        assert_eq!(decoded.records.len(), 2);
-        assert_eq!(decoded.records[1].label, "D:/video/b.mp4");
-        assert_eq!(decoded.records[0].start, 0.0);
-        assert_eq!(decoded.records[0].end, 4.0);
-        assert_eq!(decoded.records[0].vec, vec![1.0, 0.0]);
-    }
-
-    #[test]
-    fn a_damaged_file_is_rejected_with_a_message() {
-        let err = match Store::decode(PathBuf::from("broken.vei"), b"nope") {
-            Ok(_) => panic!("a damaged file was accepted"),
-            Err(err) => err,
-        };
-        assert!(format!("{err:#}").contains("broken.vei"));
     }
 
     /// A finished video is known after the store reopens.
     #[test]
     fn a_finished_video_survives_a_reopen() {
         let dir = scratch("done");
-        let path = dir.join("index.vei");
+        let path = dir.join("index.db");
         let mut store = Store::open(&path).unwrap();
         store.mark_done("a.mp4").unwrap();
 
@@ -471,9 +707,9 @@ mod tests {
     #[test]
     fn forget_clears_the_finished_mark() {
         let dir = scratch("done_forget");
-        let path = dir.join("index.vei");
+        let path = dir.join("index.db");
         let mut store = Store::open(&path).unwrap();
-        store.append(vec![record("a.mp4")]).unwrap();
+        store.append(vec![new_record("a.mp4", 0.0, 4.0)]).unwrap();
         store.mark_done("a.mp4").unwrap();
 
         store.forget("a.mp4").unwrap();
@@ -488,7 +724,7 @@ mod tests {
     #[test]
     fn a_windows_path_form_still_matches_the_mark() {
         let dir = scratch("done_slash");
-        let path = dir.join("index.vei");
+        let path = dir.join("index.db");
         let mut store = Store::open(&path).unwrap();
         store.mark_done(r"sub\a.mp4").unwrap();
         assert!(store.is_done("sub/a.mp4"));

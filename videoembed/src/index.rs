@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::embed::Embedder;
 use crate::media;
-use crate::store::{self, Record};
+use crate::store::{self, NewRecord, Record};
 
 /// An item below this score never enters a result group.
 pub const FLOOR: f32 = 0.4;
@@ -251,7 +251,7 @@ impl IndexRun {
         &mut self,
         embedder: &Embedder,
         ctx: &mut LlamaContext<'_>,
-    ) -> Result<Option<Record>> {
+    ) -> Result<Option<NewRecord>> {
         if self.phase == Phase::Done {
             return Ok(None);
         }
@@ -279,7 +279,7 @@ impl IndexRun {
         };
         self.advance();
         self.done += 1;
-        Ok(Some(Record {
+        Ok(Some(NewRecord {
             kind,
             label: self.label.clone(),
             start: start as f32,
@@ -394,7 +394,7 @@ pub fn index_video(
     embedder: &Embedder,
     video: &Path,
     on_step: &mut dyn FnMut(usize, usize),
-) -> Result<Vec<Record>> {
+) -> Result<Vec<NewRecord>> {
     let mut run = IndexRun::start(video)?;
     let total = run.total();
     let mut ctx = embedder.new_context()?;
@@ -593,11 +593,12 @@ mod tests {
 
     fn record_of(kind: u8, label: &str, start: f32, end: f32) -> Record {
         Record {
+            rid: 0,
+            id: store::record_id(label, start, end),
             kind,
             label: label.to_string(),
             start,
             end,
-            vec: vec![1.0, 0.0],
         }
     }
 
