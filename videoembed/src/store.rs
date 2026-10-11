@@ -84,6 +84,9 @@ pub struct Store {
 
 impl Store {
     /// Open the store. A missing file gives an empty store.
+    ///
+    /// An old `VEI1` file beside the database imports one time. The old file
+    /// stays, so a fault costs nothing.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = db::open(path)?;
         let mut store = Self {
@@ -93,9 +96,50 @@ impl Store {
             records: Vec::new(),
             done: HashSet::new(),
         };
+        store.import_old_file()?;
         store.load_records()?;
         store.done = store.load_done()?;
         Ok(store)
+    }
+
+    /// Import the records of an old `VEI1` file beside the store.
+    ///
+    /// The import runs when the old file is here and the database holds no
+    /// record. Every imported video takes the finished mark, so the next run
+    /// does not index it again.
+    fn import_old_file(&mut self) -> Result<()> {
+        let old = self.path.with_extension("vei");
+        if !old.exists() {
+            return Ok(());
+        }
+        let held: i64 = self
+            .conn
+            .query_row("select count(*) from records", [], |row| row.get(0))?;
+        if held > 0 {
+            return Ok(());
+        }
+        let bytes = std::fs::read(&old)
+            .with_context(|| format!("read the old store {}", old.display()))?;
+        let (dim, records) =
+            vei_records(&bytes).with_context(|| format!("read the old store {}", old.display()))?;
+        if dim != self.dim {
+            bail!(
+                "the old store {} holds vectors of size {dim}, but the model gives size {}",
+                old.display(),
+                self.dim
+            );
+        }
+        let labels: Vec<String> = records
+            .iter()
+            .filter(|r| is_video(r.kind))
+            .map(|r| r.label.clone())
+            .collect();
+        self.append(records)?;
+        for label in labels {
+            self.mark_done(&label)?;
+        }
+        println!("Imported {} records from {}", self.records.len(), old.display());
+        Ok(())
     }
 
     /// Read the metadata of every record, in row order.
@@ -400,7 +444,6 @@ impl<'a> Cursor<'a> {
 }
 
 /// Read the records of an old `VEI1` file. The import uses this.
-#[allow(dead_code)]
 fn vei_records(bytes: &[u8]) -> Result<(usize, Vec<NewRecord>)> {
     let mut cur = Cursor { bytes, at: 0 };
     if cur.take(4)? != MAGIC {
@@ -847,6 +890,79 @@ mod tests {
         let outcome = store.rank(&basis(0));
 
         assert!(outcome.is_err(), "a dropped table must not read as no matches");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build an old `VEI1` file from these records.
+    fn vei_bytes(dim: usize, records: &[NewRecord]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&(dim as u32).to_le_bytes());
+        out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        for record in records {
+            out.push(record.kind);
+            out.extend_from_slice(&(record.label.len() as u32).to_le_bytes());
+            out.extend_from_slice(record.label.as_bytes());
+            out.extend_from_slice(&record.start.to_le_bytes());
+            out.extend_from_slice(&record.end.to_le_bytes());
+            for x in &record.vec {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_old_store_imports_into_the_database() {
+        let dir = scratch("import");
+        let path = dir.join("index.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = vec![new_record("D:/video/a.mp4", 0.0, 0.25)];
+        std::fs::write(dir.join("index.vei"), vei_bytes(db::DIM, &old)).unwrap();
+
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(store.records.len(), 1);
+        assert_eq!(store.records[0].label, "D:/video/a.mp4");
+        assert!(store.is_done("D:/video/a.mp4"), "an old video is finished");
+        assert!(
+            dir.join("index.vei").exists(),
+            "the old file must stay after the import"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_import_runs_one_time() {
+        let dir = scratch("import_once");
+        let path = dir.join("index.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = vec![new_record("a.mp4", 0.0, 0.25)];
+        std::fs::write(dir.join("index.vei"), vei_bytes(db::DIM, &old)).unwrap();
+        let _ = Store::open(&path).unwrap();
+
+        let again = Store::open(&path).unwrap();
+
+        assert_eq!(again.records.len(), 1, "the import must not double the rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An old store from another model must not import.
+    #[test]
+    fn an_old_store_of_another_size_is_refused() {
+        let dir = scratch("import_size");
+        let path = dir.join("index.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut record = new_record("a.mp4", 0.0, 0.25);
+        record.vec = vec![1.0, 0.0];
+        std::fs::write(dir.join("index.vei"), vei_bytes(2, &[record])).unwrap();
+
+        let err = match Store::open(&path) {
+            Ok(_) => panic!("an old store of size 2 was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err:#}").contains("index.vei"), "got {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1063,7 +1063,7 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
 
 fn main() -> Result<()> {
     let models = models_dir();
-    let store_path = PathBuf::from("store/index.vei");
+    let store_path = PathBuf::from("store/index.db");
     let progress = Arc::new(Mutex::new(Progress::default()));
     let thumbs = Arc::new(Mutex::new(HashMap::new()));
     let (jobs_tx, jobs_rx) = channel::<Job>();
@@ -1242,7 +1242,7 @@ mod tests {
     fn a_video_row_counts_frames_and_audio_together() {
         let dir = std::env::temp_dir().join(format!("vei_web_rows_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut store = Store::open(&dir.join("index.vei")).unwrap();
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
         store
             .append(vec![
                 NewRecord {

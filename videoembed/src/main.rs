@@ -13,7 +13,7 @@ use videoembed::store::{KIND_FRAME, KIND_NOTE, NewRecord, Store};
 
 fn main() -> Result<()> {
     let models = models_dir();
-    let store_path = PathBuf::from("store/index.vei");
+    let store_path = PathBuf::from("store/index.db");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (asked, args) = split_device(args);
     println!("Loading models from {}", models.display());
@@ -315,7 +315,7 @@ fn bar(score: f32) -> String {
 }
 
 fn store_path_hint() -> &'static str {
-    "store/index.vei"
+    "store/index.db"
 }
 
 #[cfg(test)]
