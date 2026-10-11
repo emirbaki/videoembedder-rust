@@ -50,6 +50,29 @@ fn read_done(store: &Path) -> HashSet<String> {
         .collect()
 }
 
+/// One record before it enters the store. The vector travels with it.
+pub struct NewRecord {
+    pub kind: u8,
+    pub label: String,
+    pub start: f32,
+    pub end: f32,
+    pub vec: Vec<f32>,
+}
+
+/// The id of one record, in Google's shape.
+///
+/// The label holds the source, and the two times hold the place in it. A
+/// second pass over one video writes the same ids, so the write replaces the
+/// rows of the first pass.
+pub fn record_id(label: &str, start: f32, end: f32) -> String {
+    format!("{}/{}-{}", label, millis(start), millis(end))
+}
+
+/// One time in milliseconds, rounded to the nearest one.
+fn millis(seconds: f32) -> i64 {
+    (seconds as f64 * 1000.0).round() as i64
+}
+
 #[derive(Clone)]
 pub struct Record {
     pub kind: u8,
@@ -470,5 +493,18 @@ mod tests {
         store.mark_done(r"sub\a.mp4").unwrap();
         assert!(store.is_done("sub/a.mp4"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_id_holds_the_path_and_the_range() {
+        assert_eq!(record_id("D:/video/a.mp4", 0.25, 0.5), "D:/video/a.mp4/250-500");
+        assert_eq!(record_id("a note", 0.0, 0.0), "a note/0-0");
+    }
+
+    #[test]
+    fn the_same_record_gives_the_same_id_twice() {
+        let first = record_id("a.mp4", 1.0, 1.25);
+        let second = record_id("a.mp4", 1.0, 1.25);
+        assert_eq!(first, second, "a second pass must write the same id");
     }
 }
