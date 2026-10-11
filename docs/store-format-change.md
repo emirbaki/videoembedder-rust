@@ -1,8 +1,7 @@
 # The store format change - analysis
 
 Date: 2026-10-11
-Status: the decision is SQLite, with the sqlite-vec extension. The schema
-design is open.
+Status: the store is SQLite with the sqlite-vec extension. The format change is done.
 
 ## 1. The items that need the change
 
@@ -274,6 +273,9 @@ What follows from the two decisions:
    extension carries no `fp16` type, so the disk saving comes from a rebuild in
    `f32` first, and from quantization later.
 
+The change landed on 2026-10-11. The code is in `videoembed/src/db.rs` and
+`videoembed/src/store.rs`. Window mode is the next item.
+
 ## 10. Open questions
 
 1. Does window mode land in the same change, or after the format is done? Two
@@ -283,6 +285,7 @@ What follows from the two decisions:
 3. Does the import of an old `VEI1` store run once at open, or as its own
    command?
 4. Does the store keep the name `store/index.vei`, or take a new one?
+   Settled: the store takes `store/index.db`.
 
 ## 11. What stays the same
 
@@ -290,4 +293,4 @@ What follows from the two decisions:
 - The kind list, and `is_video`.
 - The temp-file-then-rename write, so a crash cannot leave a half store.
 - The one vector size for the whole file.
-- The store path, `store/index.vei`.
+- The store path, `store/index.db`.

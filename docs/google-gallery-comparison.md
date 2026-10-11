@@ -72,12 +72,12 @@ If the engine rejects audio once, the whole pass restarts with frames only (`Vid
 
 | Item | Google | This app |
 |---|---|---|
-| Store | SQLite through MediaPipe `SqliteVectorStore` | One flat file, `store/index.vei` |
-| Table | `rag_vector_store` | None |
-| Record id | `"<projectId>/<startTimeMs>-<endTimeMs>"` | None, records are positional |
+| Store | SQLite through MediaPipe `SqliteVectorStore` | One SQLite database, `store/index.db` |
+| Table | `rag_vector_store` | `videos`, `records`, `vec_records` |
+| Record id | `"<projectId>/<startTimeMs>-<endTimeMs>"` | `"path/startMs-endMs"` |
 | Time map | `start_time_ms` and `end_time_ms` metadata | `start` and `end` fields |
-| Write path | Idempotent upsert by id | Full rewrite of the file |
-| Delete | By id, or by id prefix | By label, and the file rewrites |
+| Write path | Idempotent upsert by id | An upsert by id, in one transaction |
+| Delete | By id, or by id prefix | By id, one video at a time |
 
 Google keeps the time range in metadata and reads it back after a search (`VideoMomentFinderViewModel.kt:777-790`). The record id already holds the range, so a rewrite is idempotent. A second pass over the same video overwrites the same rows.
 
@@ -185,7 +185,8 @@ Two honest notes from this area:
 2. **An honest score scale.** Google shows a raw cosine. A cosine value alone has no scale, so 0.65 and 0.70 look alike. This app shows the gap over the store median, and the bar turns that gap into colour.
 3. **Finer time resolution.** 0.25 s against 2 s. For a query about a single instant, this app is more precise.
 4. **Audio encoded once.** This app encodes each audio second one time. Google re-reads the audio of every window. With an overlap of zero the waste is small, but the multiplication grows with overlap.
-5. **No database dependency.** One flat file, one binary. Google needs SQLite, MediaPipe, WorkManager, and Proto DataStore.
+5. **A small database dependency.** One crate, `rusqlite`, with the bundled
+   SQLite. Google needs SQLite, MediaPipe, WorkManager, and Proto DataStore.
 6. **A GPU path with all layers offloaded.** `N_GPU_LAYERS = 999` gives the measured 40 times speedup.
 
 ## 4. Where Google is ahead
@@ -194,12 +195,11 @@ Two honest notes from this area:
 2. **A thumbnail in each result**, so the user sees the moment.
 3. **A cancellable, resumable, reconciling index job.**
 4. **A scoped search** by project, instead of a rank over the whole store.
-5. **Idempotent upsert and prefix delete**, so one video updates on its own.
-6. **Merged intervals**, so near hits become one moment.
-7. **User control of the plan**, through presets and sliders.
-8. **A measured speed report**, instead of a guess.
-9. **Media repair**: the MP4 rewrite and the black-frame probe.
-10. **A fallback path** when the chosen accelerator fails.
+5. **Merged intervals**, so near hits become one moment.
+6. **User control of the plan**, through presets and sliders.
+7. **A measured speed report**, instead of a guess.
+8. **Media repair**: the MP4 rewrite and the black-frame probe.
+9. **A fallback path** when the chosen accelerator fails.
 
 ## 5. Candidate features, ranked
 
@@ -258,5 +258,4 @@ The card is about 31 times faster on this clip. The card costs about a second mo
 - The task prefixes. Google does not have them. Do not trade them away for parity.
 - The median baseline and the margin. It is the reason a grey bar can say "no match".
 - The 0.25 s frame grid, at least for short clips.
-- The flat store, until feature 9 earns its cost.
 - The single binary, with CUDA as an option rather than a requirement.

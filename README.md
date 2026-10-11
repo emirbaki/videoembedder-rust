@@ -108,9 +108,10 @@ a script.
 The stride is 1 s, so the windows overlap. A hit at 20.0-22.0 s can start at
 19 s or 21 s in the true scene.
 
-The store sits at `videoembed/store/index.vei`. Both the console and the future
-web binary use that one file. The format is `VEI1`, and a crash cannot corrupt
-it, because a write goes through a temp file and a rename.
+The store sits at `videoembed/store/index.db`. Both the console and the web
+binary use that one file. The format is SQLite with the sqlite-vec extension.
+One write is one transaction, so a crash cannot corrupt it. The app imports an
+old `VEI1` store one time at open, when the database holds no record.
 
 Set `VEI_MODELS` to point at another model folder.
 
