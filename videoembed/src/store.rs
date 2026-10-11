@@ -205,16 +205,22 @@ impl Store {
         }
 
         let tx = self.conn.transaction().context("begin the write")?;
-        // The path match ignores the separator direction, so a batch label and
-        // a stored label name one video across `\` and `/`.
-        let mut wants: Vec<String> = new_records.iter().map(|r| normalize_label(&r.label)).collect();
+        // A path that arrives again replaces its own rows. The match ignores
+        // the separator direction, and it stays inside the record class, so a
+        // note and a video of the same text never name each other.
+        let mut wants: Vec<(String, bool)> = new_records
+            .iter()
+            .map(|record| (normalize_label(&record.label), is_video(record.kind)))
+            .collect();
         wants.sort_unstable();
         wants.dedup();
-        for want in &wants {
+        for (want, video) in &wants {
             let rids: Vec<i64> = self
                 .records
                 .iter()
-                .filter(|record| normalize_label(&record.label) == *want)
+                .filter(|record| {
+                    is_video(record.kind) == *video && normalize_label(&record.label) == *want
+                })
                 .map(|record| record.rid)
                 .collect();
             delete_rows(&tx, &rids)?;
@@ -252,7 +258,7 @@ impl Store {
         let rids: Vec<i64> = self
             .records
             .iter()
-            .filter(|record| record.kind != KIND_NOTE && normalize_label(&record.label) == want)
+            .filter(|record| is_video(record.kind) && normalize_label(&record.label) == want)
             .map(|record| record.rid)
             .collect();
         let removed = rids.len();
@@ -428,9 +434,14 @@ fn delete_rows(tx: &Transaction, rids: &[i64]) -> Result<()> {
 /// The stored path is the normalized form, because `is_done` normalizes when
 /// it reads the mark.
 fn write_videos(tx: &Transaction, records: &[NewRecord]) -> Result<()> {
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for record in records {
-        if !is_video(record.kind) || !seen.insert(record.label.as_str()) {
+        if !is_video(record.kind) {
+            continue;
+        }
+        // One row for each video, whatever separator the label carries.
+        let want = normalize_label(&record.label);
+        if !seen.insert(want.clone()) {
             continue;
         }
         let (size, mtime) = fingerprint(&record.label);
@@ -446,7 +457,7 @@ fn write_videos(tx: &Transaction, records: &[NewRecord]) -> Result<()> {
                source_size = excluded.source_size,
                source_mtime = excluded.source_mtime",
             params![
-                normalize_label(&record.label),
+                want,
                 PLAN_WINDOW,
                 PLAN_FRAMES,
                 PLAN_AUDIO,
@@ -647,6 +658,33 @@ mod tests {
         assert_eq!(store.records.len(), 2);
         let again = Store::open(&dir.join("index.db")).unwrap();
         assert_eq!(again.records.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note that carries the text of a video keeps the video rows.
+    ///
+    /// A note is not a video record, so its label alone must not name a video.
+    #[test]
+    fn a_note_keeps_a_video_of_the_same_text() {
+        let (dir, mut store) = opened("append_note");
+        store.append(vec![new_record("blue", 0.0, 0.25)]).unwrap();
+
+        let mut note = new_record("blue", 0.0, 0.0);
+        note.kind = KIND_NOTE;
+        store.append(vec![note]).unwrap();
+
+        let frames = store
+            .records
+            .iter()
+            .filter(|record| record.kind == KIND_FRAME)
+            .count();
+        assert_eq!(frames, 1, "the frame row must stay");
+        let notes = store
+            .records
+            .iter()
+            .filter(|record| record.kind == KIND_NOTE)
+            .count();
+        assert_eq!(notes, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
