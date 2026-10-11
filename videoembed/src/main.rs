@@ -169,6 +169,7 @@ fn measure(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
         // thinning kept, in the same order.
         let rids: Vec<i64> = kept.iter().map(|at| store.records[*at].rid).collect();
         let vectors_of: Vec<Vec<f32>> = store.vectors(&rids)?;
+        let thin: Vec<Record> = kept.iter().map(|at| store.records[*at].clone()).collect();
         let grid = index::FRAME_STEP * factor as f64;
         let mut line = Vec::new();
         for (at, query) in queries.iter().enumerate() {
@@ -177,7 +178,6 @@ fn measure(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
                 .collect();
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
             let baseline = index::median(&ranked);
-            let thin: Vec<Record> = kept.iter().map(|at| store.records[*at].clone()).collect();
             let groups = index::group_hits(&thin, &ranked, baseline);
             // The best frame tells the grid cost. The moment tells what a
             // person sees, and it spans every touching hit above the floor.
@@ -254,22 +254,30 @@ fn parse_search(rest: &str) -> (String, Option<String>) {
     }
 }
 
+/// The line the console shows when the rank gives no row.
+///
+/// A scope that names no video takes its own line. No scope keeps the line
+/// that names the start step.
+fn no_result_line(scope: Option<&str>) -> String {
+    match scope {
+        Some(scope) => format!("No records for {scope}."),
+        None => "The store is empty. Run index or note first.".to_string(),
+    }
+}
+
 fn search(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
     let (text, scope) = parse_search(rest);
     if text.is_empty() {
         bail!("usage: search <query> [| <path>]");
     }
     if store.records.is_empty() {
-        println!("The store is empty. Run index or note first.");
+        println!("{}", no_result_line(None));
         return Ok(());
     }
     let query = embedder.embed_text(&format!("{QUERY_PREFIX}{text}"))?;
     let ranked = store.rank(&query, scope.as_deref())?;
     if ranked.is_empty() {
-        match &scope {
-            Some(scope) => println!("No records for {scope}."),
-            None => println!("The store is empty. Run index or note first."),
-        }
+        println!("{}", no_result_line(scope.as_deref()));
         return Ok(());
     }
     let baseline = index::median(&ranked);
@@ -465,6 +473,19 @@ mod tests {
         let (query, scope) = parse_search("blue |");
         assert_eq!(query, "blue");
         assert_eq!(scope, None);
+    }
+
+    /// The line names the scope, or the start step when there is no scope.
+    #[test]
+    fn an_empty_result_names_the_scope_or_the_start() {
+        assert_eq!(
+            no_result_line(Some("spike/a.mp4")),
+            "No records for spike/a.mp4."
+        );
+        assert_eq!(
+            no_result_line(None),
+            "The store is empty. Run index or note first."
+        );
     }
 
     /// One video makes one row, whatever separator its label carries.

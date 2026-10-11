@@ -596,8 +596,8 @@ mod tests {
     /// A store that holds these records, on a fresh database.
     ///
     /// The folder is unique per call, so tests under the parallel runner do
-    /// not share one database.
-    fn store_of(records: Vec<Record>) -> Store {
+    /// not share one database. The caller removes the folder.
+    fn store_of(records: Vec<Record>) -> (PathBuf, Store) {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -621,7 +621,7 @@ mod tests {
             })
             .collect();
         store.append(new).unwrap();
-        store
+        (dir, store)
     }
 
     #[test]
@@ -777,25 +777,28 @@ mod tests {
 
     #[test]
     fn holds_video_matches_one_exact_path() {
-        let store = store_of(vec![record("D:/video/a.mp4"), record("D:/video/b.mp4")]);
+        let (dir, store) = store_of(vec![record("D:/video/a.mp4"), record("D:/video/b.mp4")]);
         assert!(store.holds_video("D:/video/a.mp4"));
         assert!(!store.holds_video("D:/video/zz.mp4"));
         assert!(!store.holds_video(""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn holds_video_keeps_a_path_with_a_space_and_a_unicode_letter() {
-        let store = store_of(vec![record("D:/video/doğum günü.mp4")]);
+        let (dir, store) = store_of(vec![record("D:/video/doğum günü.mp4")]);
         assert!(store.holds_video("D:/video/doğum günü.mp4"));
         assert!(!store.holds_video("D:/video/dogum gunu.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn holds_video_ignores_a_note_with_the_same_text() {
         let mut note = record("birthday");
         note.kind = KIND_NOTE;
-        let store = store_of(vec![note]);
+        let (dir, store) = store_of(vec![note]);
         assert!(!store.holds_video("birthday"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -810,9 +813,10 @@ mod tests {
     fn holds_video_matches_a_frame_record() {
         let mut frame = record("D:/video/a.mp4");
         frame.kind = KIND_FRAME;
-        let store = store_of(vec![frame]);
+        let (dir, store) = store_of(vec![frame]);
         assert!(store.holds_video("D:/video/a.mp4"));
         assert!(!store.holds_video("D:/video/b.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -844,9 +848,10 @@ mod tests {
 
     #[test]
     fn holds_video_matches_across_path_separators() {
-        let store = store_of(vec![record("D:\\video\\a.mp4")]);
+        let (dir, store) = store_of(vec![record("D:\\video\\a.mp4")]);
         assert!(store.holds_video("D:/video/a.mp4"));
         assert!(store.holds_video("D:\\video\\a.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -914,6 +919,18 @@ mod tests {
     fn a_record_id_holds_the_path_and_the_range() {
         assert_eq!(record_id("D:/video/a.mp4", 0.25, 0.5), "D:/video/a.mp4/250-500");
         assert_eq!(record_id("a note", 0.0, 0.0), "a note/0-0");
+        // A time that a 32-bit float cannot hold exactly still reads as a
+        // clean whole number of milliseconds.
+        assert_eq!(record_id("a.mp4", 1.1, 2.02), "a.mp4/1100-2020");
+    }
+
+    /// A time between two milliseconds rounds to the nearer one.
+    #[test]
+    fn a_time_between_two_milliseconds_rounds_to_the_nearer() {
+        assert_eq!(millis(0.0014), 1);
+        assert_eq!(millis(0.0016), 2);
+        assert_eq!(millis(1.9994), 1999);
+        assert_eq!(millis(1.9996), 2000);
     }
 
     #[test]
