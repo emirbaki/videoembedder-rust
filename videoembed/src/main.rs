@@ -199,7 +199,30 @@ fn measure(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Cut one video into frames and audio clips, embed each one, and append.
+/// The line the console shows before an index run.
+fn index_line(plan: &videoembed::plan::Plan) -> String {
+    if plan.mode == videoembed::plan::Mode::Fine {
+        return "Indexing under the Fine plan (0.25 s frames).".to_string();
+    }
+    let audio = if plan.audio { "with audio" } else { "no audio" };
+    format!(
+        "Indexing under the {:?} plan ({} s windows, {} frames, {}).",
+        preset_of(plan),
+        plan.window,
+        plan.frames,
+        audio
+    )
+}
+
+/// The preset of a plan, by its values.
+fn preset_of(plan: &videoembed::plan::Plan) -> videoembed::plan::Preset {
+    videoembed::plan::Preset::ALL
+        .into_iter()
+        .find(|preset| videoembed::plan::Plan::of(*preset) == *plan)
+        .unwrap_or(videoembed::plan::Preset::Object)
+}
+
+/// Cut one video under its plan, embed each item, and append.
 fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
     if rest.is_empty() {
         bail!("usage: index <video path>");
@@ -208,11 +231,18 @@ fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
     if !video.is_file() {
         bail!("{} is not a file", video.display());
     }
+    let label = videoembed::store::normalize_label(&video.to_string_lossy());
+    let plan = store
+        .plan_of(&label)?
+        .unwrap_or_else(videoembed::plan::Plan::default_plan);
     println!("Video: {}", video.display());
+    println!("{}", index_line(&plan));
     let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
-    let records = index::index_video(embedder, &video, &mut report)?;
+    let records = index::index_video(embedder, &video, &plan, &mut report)?;
     let count = records.len();
+    store.forget(&label)?;
     store.append(records)?;
+    store.set_plan(&label, &plan)?;
     println!("Indexed {count} records into {}", store_path_hint());
     Ok(())
 }
@@ -519,5 +549,18 @@ mod tests {
         ]);
 
         assert_eq!(rows, vec![("D:/video/a.mp4".to_string(), 2)]);
+    }
+
+    /// The index command names the plan it will use.
+    #[test]
+    fn the_index_line_names_the_plan() {
+        let plan = videoembed::plan::Plan::of(videoembed::plan::Preset::Object);
+        assert_eq!(
+            index_line(&plan),
+            "Indexing under the Object plan (2 s windows, 2 frames, no audio)."
+        );
+
+        let fine = videoembed::plan::Plan::of(videoembed::plan::Preset::Fine);
+        assert_eq!(index_line(&fine), "Indexing under the Fine plan (0.25 s frames).");
     }
 }

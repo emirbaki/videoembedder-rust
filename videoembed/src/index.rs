@@ -504,16 +504,17 @@ impl Drop for IndexRun {
     }
 }
 
-/// Index one video. Embed every frame and every audio clip.
+/// Index one video under one plan. Embed every item of the plan.
 ///
 /// The callback runs after each record with the number made so far, counting
 /// from 1, and the record count of the whole video.
 pub fn index_video(
     embedder: &Embedder,
     video: &Path,
+    plan: &crate::plan::Plan,
     on_step: &mut dyn FnMut(usize, usize),
 ) -> Result<Vec<NewRecord>> {
-    let mut run = IndexRun::start(video)?;
+    let mut run = IndexRun::start_with(video, plan)?;
     let total = run.total();
     let mut ctx = embedder.new_context()?;
     let mut records = Vec::with_capacity(total);
