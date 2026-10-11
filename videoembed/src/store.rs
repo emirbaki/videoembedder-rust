@@ -134,9 +134,20 @@ impl Store {
             .filter(|r| is_video(r.kind))
             .map(|r| r.label.clone())
             .collect();
-        self.append(records)?;
+        // The base `index` command appended, so one old store can hold one
+        // record twice. The id joins the two copies, and the first one wins.
+        let mut seen = HashSet::new();
+        let mut fresh = Vec::with_capacity(records.len());
+        for record in records {
+            if seen.insert(record_id(&record.label, record.start, record.end)) {
+                fresh.push(record);
+            }
+        }
+        self.append(fresh)
+            .with_context(|| format!("import the old store {}", old.display()))?;
         for label in labels {
-            self.mark_done(&label)?;
+            self.mark_done(&label)
+                .with_context(|| format!("import the old store {}", old.display()))?;
         }
         println!("Imported {} records from {}", self.records.len(), old.display());
         Ok(())
@@ -963,6 +974,27 @@ mod tests {
         };
 
         assert!(format!("{err:#}").contains("index.vei"), "got {err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An old store can hold one record twice, because the base `index`
+    /// command appended and a second run over one video wrote the same ids.
+    /// The import must land one set of rows.
+    #[test]
+    fn a_repeated_record_in_an_old_store_imports_once() {
+        let dir = scratch("import_repeat");
+        let path = dir.join("index.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = new_record("D:/video/a.mp4", 0.0, 0.25);
+        let second = new_record("D:/video/a.mp4", 0.0, 0.25);
+        std::fs::write(dir.join("index.vei"), vei_bytes(db::DIM, &[first, second])).unwrap();
+
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(store.records.len(), 1, "the import must not hold a copy");
+        let rids: Vec<i64> = store.records.iter().map(|r| r.rid).collect();
+        assert_eq!(store.vectors(&rids).unwrap().len(), 1);
+        assert!(store.is_done("D:/video/a.mp4"), "an old video is finished");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
