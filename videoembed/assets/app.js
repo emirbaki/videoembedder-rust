@@ -33,7 +33,7 @@ async function refreshVideos() {
   if (answer.videos.length === 0) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 3;
+    cell.colSpan = 4;
     cell.textContent = "No video is indexed yet.";
     row.appendChild(cell);
     body.appendChild(row);
@@ -42,11 +42,20 @@ async function refreshVideos() {
   for (const video of answer.videos) {
     const row = document.createElement("tr");
 
-    const name = document.createElement("td");
+    const cell = document.createElement("td");
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "video-name";
     name.textContent = video.path;
+    name.title = "Show the plan of this video";
+    name.addEventListener("click", () => showPlan(video));
+    cell.appendChild(name);
 
     const count = document.createElement("td");
     count.textContent = video.items + " items";
+
+    const plan = document.createElement("td");
+    plan.textContent = planWords(video);
 
     const act = document.createElement("td");
     const drop = document.createElement("button");
@@ -55,9 +64,16 @@ async function refreshVideos() {
     drop.addEventListener("click", () => forget(video.path));
     act.appendChild(drop);
 
-    row.append(name, count, act);
+    row.append(cell, count, plan, act);
     body.appendChild(row);
   }
+}
+
+// One video's plan, as one short line for the table.
+function planWords(video) {
+  if (video.plan === "fine") return "Fine, " + video.window + " s frames";
+  return video.plan + ", " + video.window + " s window, " + video.frames +
+    " frames" + (video.audio ? ", audio" : "");
 }
 
 async function forget(path) {
@@ -68,6 +84,103 @@ async function forget(path) {
   } catch (err) {
     note(err.message);
   }
+}
+
+// The video the plan panel changes.
+let planPath = "";
+// The preset the controls show. A moved slider clears it.
+let planName = "";
+
+// Show the plan of one video in the panel.
+function showPlan(video) {
+  planPath = video.path;
+  planName = video.plan;
+  $("plan-panel").hidden = false;
+  $("plan-title").textContent = "Plan for " + video.path;
+  $("plan-window").value = String(Math.max(1, Math.round(video.window)));
+  $("plan-frames").value = String(video.frames);
+  $("plan-audio").checked = video.audio;
+  updatePlanLabels();
+  markPreset(planName);
+}
+
+// Mark the preset button that the controls name. An empty name marks none.
+function markPreset(name) {
+  for (const button of document.querySelectorAll("[data-preset]")) {
+    button.classList.toggle("on", button.dataset.preset === name);
+  }
+}
+
+// The window slider sets the frame slider top to the window in whole seconds.
+function updatePlanLabels() {
+  const window = Number($("plan-window").value);
+  $("plan-window-value").textContent = window + " s";
+  const frames = $("plan-frames");
+  frames.max = String(window);
+  if (Number(frames.value) > window) frames.value = String(window);
+  $("plan-frames-value").textContent = frames.value;
+}
+
+// A moved slider means the controls no longer name a preset.
+function planChanged() {
+  planName = "";
+  markPreset("");
+  updatePlanLabels();
+}
+
+// Cut the video again. A plan that still names a preset goes as that preset,
+// so the round trip cannot change the plan a second time.
+async function applyPlan() {
+  if (planName !== "") {
+    await applyPreset(planName);
+    return;
+  }
+  note("");
+  try {
+    await api("/api/plan", {
+      path: planPath,
+      window: Number($("plan-window").value),
+      frames: Number($("plan-frames").value),
+      audio: $("plan-audio").checked,
+    });
+    startPolling();
+  } catch (err) {
+    note(err.message);
+  }
+}
+
+async function applyPreset(name) {
+  note("");
+  try {
+    await api("/api/plan", { path: planPath, preset: name });
+    planName = name;
+    markPreset(name);
+    startPolling();
+  } catch (err) {
+    note(err.message);
+  }
+}
+
+// A preset button sets the controls. The sliders run in whole seconds, so Fine
+// cannot show, and the button applies it at once.
+function usePreset(name) {
+  const base = {
+    fine: [0.25, 1, true],
+    object: [2, 2, false],
+    action: [4, 4, false],
+    speech: [6, 6, true],
+  };
+  if (name === "fine") {
+    applyPreset("fine");
+    return;
+  }
+  const [window, frames, audio] = base[name];
+  planName = name;
+  $("plan-window").value = String(window);
+  $("plan-frames").value = String(frames);
+  $("plan-audio").checked = audio;
+  markPreset(name);
+  updatePlanLabels();
 }
 
 let folder = null;
@@ -395,6 +508,13 @@ function boot() {
   $("device").addEventListener("change", switchDevice);
   $("search-form").addEventListener("submit", runSearch);
   $("quit").addEventListener("click", quit);
+  $("plan-window").addEventListener("input", planChanged);
+  $("plan-frames").addEventListener("input", planChanged);
+  $("plan-audio").addEventListener("change", planChanged);
+  $("plan-apply").addEventListener("click", applyPlan);
+  for (const button of document.querySelectorAll("[data-preset]")) {
+    button.addEventListener("click", () => usePreset(button.dataset.preset));
+  }
   api("/api/progress").then(showProgress).catch(() => {});
   refreshState().catch((err) => note(err.message));
   refreshVideos().catch((err) => note(err.message));

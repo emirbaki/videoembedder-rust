@@ -60,6 +60,27 @@
 <section>
   <h2>Indexed</h2>
   <table id="videos"><tbody></tbody></table>
+  <div id="plan-panel" class="panel" hidden>
+    <strong id="plan-title"></strong>
+    <div class="presets">
+      <button type="button" data-preset="fine">Fine</button>
+      <button type="button" data-preset="object">Object</button>
+      <button type="button" data-preset="action">Action</button>
+      <button type="button" data-preset="speech">Speech</button>
+    </div>
+    <label>Window
+      <input id="plan-window" type="range" min="1" max="10" step="1" value="2">
+      <span id="plan-window-value">2 s</span>
+    </label>
+    <label>Frames
+      <input id="plan-frames" type="range" min="1" max="2" step="1" value="2">
+      <span id="plan-frames-value">2</span>
+    </label>
+    <label><input id="plan-audio" type="checkbox"> Audio</label>
+    <button type="button" id="plan-apply">Apply</button>
+    <p class="legend">Apply cuts the video again. The job replaces every
+    record of the video.</p>
+  </div>
 </section>
 </main>
 <script src="/app.js"></script>
