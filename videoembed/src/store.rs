@@ -965,4 +965,22 @@ mod tests {
         assert!(format!("{err:#}").contains("index.vei"), "got {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn the_vectors_come_back_in_the_order_of_the_ids() {
+        let (dir, mut store) = opened("vectors");
+        let mut first = new_record("a.mp4", 0.0, 0.25);
+        first.vec = basis(0);
+        let mut second = new_record("a.mp4", 0.25, 0.5);
+        second.vec = basis(1);
+        store.append(vec![first, second]).unwrap();
+        let rids: Vec<i64> = store.records.iter().map(|r| r.rid).collect();
+
+        let vectors = store.vectors(&[rids[1], rids[0]]).unwrap();
+
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], basis(1), "the order of the ids must hold");
+        assert_eq!(vectors[1], basis(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

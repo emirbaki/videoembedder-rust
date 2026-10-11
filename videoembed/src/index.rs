@@ -547,13 +547,13 @@ pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
     moments
 }
 
-/// Keep one frame of every group of `factor` frames of each video.
+/// The indexes of the records that stay after the thinning.
 ///
-/// The thinning measures the cost of a coarser time grid. Every other record
-/// stays, so the audio keeps its one second grid.
-pub fn thin_frames(records: &[Record], factor: usize) -> Vec<Record> {
+/// The thinning measures the cost of a coarser time grid. Every `factor`th
+/// frame of one video stays, and the audio keeps its one second grid.
+pub fn thin_indexes(records: &[Record], factor: usize) -> Vec<usize> {
     if factor < 2 {
-        return records.to_vec();
+        return (0..records.len()).collect();
     }
     // The frames of each video, in time order. A store may hold the frames of
     // one video twice, so the order is taken from the start time.
@@ -572,12 +572,7 @@ pub fn thin_frames(records: &[Record], factor: usize) -> Vec<Record> {
             }
         }
     }
-    records
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| keep[*index])
-        .map(|(_, record)| record.clone())
-        .collect()
+    (0..records.len()).filter(|at| keep[*at]).collect()
 }
 
 #[cfg(test)]
@@ -1021,23 +1016,19 @@ mod tests {
         records.push(record_of(crate::store::KIND_AUDIO, "a.mp4", 0.0, 1.0));
         records.push(record_of(crate::store::KIND_AUDIO, "a.mp4", 1.0, 2.0));
 
-        let thin = thin_frames(&records, 4);
+        let kept = thin_indexes(&records, 4);
 
-        assert_eq!(thin.len(), 4, "two frames and two audio records");
-        let frames: Vec<f32> = thin
-            .iter()
-            .filter(|r| r.kind == crate::store::KIND_FRAME)
-            .map(|r| r.start)
-            .collect();
-        assert_eq!(frames, vec![0.0, 1.0]);
+        assert_eq!(kept.len(), 4, "two frames and two audio records");
+        let starts: Vec<f32> = kept.iter().map(|at| records[*at].start).collect();
+        assert_eq!(starts, vec![0.0, 1.0, 0.0, 1.0]);
     }
 
     /// A factor of one keeps every record.
     #[test]
     fn a_factor_of_one_keeps_everything() {
         let records = vec![record("a.mp4", 0.0, 0.25), record("a.mp4", 0.25, 0.5)];
-        assert_eq!(thin_frames(&records, 1).len(), 2);
-        assert_eq!(thin_frames(&records, 0).len(), 2);
+        assert_eq!(thin_indexes(&records, 1).len(), 2);
+        assert_eq!(thin_indexes(&records, 0).len(), 2);
     }
 
     /// Each video thins on its own, so a short video keeps its first frame.
@@ -1049,9 +1040,24 @@ mod tests {
             record("a.mp4", 0.25, 0.5),
             record("b.mp4", 0.25, 0.5),
         ];
-        let thin = thin_frames(&records, 2);
-        assert_eq!(thin.len(), 2);
-        assert!(thin.iter().any(|r| r.label == "a.mp4"));
-        assert!(thin.iter().any(|r| r.label == "b.mp4"));
+        let kept = thin_indexes(&records, 2);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|at| records[*at].label == "a.mp4"));
+        assert!(kept.iter().any(|at| records[*at].label == "b.mp4"));
+    }
+
+    /// The thinning gives the indexes of the kept records, in store order.
+    #[test]
+    fn the_thinning_gives_the_indexes_of_the_kept_records() {
+        let records = vec![
+            record("a.mp4", 0.0, 0.25),
+            record("a.mp4", 0.25, 0.5),
+            record("a.mp4", 0.5, 0.75),
+            record("a.mp4", 0.75, 1.0),
+        ];
+
+        let kept = thin_indexes(&records, 2);
+
+        assert_eq!(kept, vec![0, 2]);
     }
 }

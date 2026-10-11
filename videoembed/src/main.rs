@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 
 use videoembed::embed::{DOC_PREFIX, Device, Embedder, QUERY_PREFIX, dot};
 use videoembed::index;
-use videoembed::store::{KIND_FRAME, KIND_NOTE, NewRecord, Store};
+use videoembed::store::{KIND_FRAME, KIND_NOTE, NewRecord, Record, Store};
 
 fn main() -> Result<()> {
     let models = models_dir();
@@ -153,26 +153,28 @@ fn measure(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
         "factor", "grid", "frames"
     );
     for factor in [1usize, 2, 4, 8] {
-        let thin = index::thin_frames(&store.records, factor);
-        let frames = thin.iter().filter(|r| r.kind == KIND_FRAME).count();
+        let kept = index::thin_indexes(&store.records, factor);
+        let frames = kept
+            .iter()
+            .filter(|at| store.records[**at].kind == KIND_FRAME)
+            .count();
         if frames == 0 {
             println!("{factor:>6}  no frame records");
             continue;
         }
         // The vectors stay on disk, so the measure asks for the ones the
         // thinning kept, in the same order.
-        let rids: Vec<i64> = thin.iter().map(|r| r.rid).collect();
+        let rids: Vec<i64> = kept.iter().map(|at| store.records[*at].rid).collect();
         let vectors_of: Vec<Vec<f32>> = store.vectors(&rids)?;
         let grid = index::FRAME_STEP * factor as f64;
         let mut line = Vec::new();
         for (at, query) in queries.iter().enumerate() {
-            let mut ranked: Vec<(usize, f32)> = thin
-                .iter()
-                .enumerate()
-                .map(|(i, _)| (i, dot(&vectors[at], &vectors_of[i])))
+            let mut ranked: Vec<(usize, f32)> = (0..kept.len())
+                .map(|i| (i, dot(&vectors[at], &vectors_of[i])))
                 .collect();
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
             let baseline = index::median(&ranked);
+            let thin: Vec<Record> = kept.iter().map(|at| store.records[*at].clone()).collect();
             let groups = index::group_hits(&thin, &ranked, baseline);
             // The best frame tells the grid cost. The moment tells what a
             // person sees, and it spans every touching hit above the floor.
