@@ -291,6 +291,6 @@ The change landed on 2026-10-11. The code is in `videoembed/src/db.rs` and
 
 - The label rule, `normalize_label`, and the slash form of a path.
 - The kind list, and `is_video`.
-- The temp-file-then-rename write, so a crash cannot leave a half store.
+- The atomic write, so a crash cannot leave a half store.
 - The one vector size for the whole file.
 - The store path, `store/index.db`.
