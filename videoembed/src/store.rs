@@ -262,8 +262,18 @@ impl Store {
     }
 
     /// The position of one row id in the record list.
+    ///
+    /// A row id without a record means the metadata and the vector table have
+    /// drifted apart. One transaction keeps them in step, so this is a signal
+    /// of drift, not a normal case. The rank keeps going and names the row.
     fn position_of(&self, rid: i64) -> Option<usize> {
-        self.records.iter().position(|record| record.rid == rid)
+        match self.records.iter().position(|record| record.rid == rid) {
+            Some(at) => Some(at),
+            None => {
+                eprintln!("the vector table holds row {rid} with no record");
+                None
+            }
+        }
     }
 
     /// Rank every record against one query vector. Best first.
@@ -272,30 +282,32 @@ impl Store {
     /// table holds cosine distance, so the score is one minus the distance.
     /// The rank needs every row, because the median of the store is the
     /// baseline of the result.
-    pub fn rank(&self, query: &[f32]) -> Vec<(usize, f32)> {
+    ///
+    /// A database fault surfaces as an error. Only an empty store gives an
+    /// empty list, because a non-empty store always has a row to score.
+    pub fn rank(&self, query: &[f32]) -> Result<Vec<(usize, f32)>> {
         if self.records.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let sql = "select rid, distance from vec_records where embedding match vec_f32(?1) and k = ?2";
-        let mut stmt = match self.conn.prepare(sql) {
-            Ok(stmt) => stmt,
-            Err(_) => return Vec::new(),
-        };
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("prepare the rank query")?;
         let rows = stmt.query_map(
             params![db::vec_to_blob(query), self.records.len() as i64],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32)),
-        );
-        let Ok(rows) = rows else {
-            return Vec::new();
-        };
+        )
+        .context("run the rank query")?;
         let mut scored: Vec<(usize, f32)> = Vec::new();
-        for row in rows.flatten() {
-            if let Some(at) = self.position_of(row.0) {
-                scored.push((at, 1.0 - row.1));
+        for row in rows {
+            let (rid, distance) = row.context("read a rank row")?;
+            if let Some(at) = self.position_of(rid) {
+                scored.push((at, 1.0 - distance));
             }
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored
+        Ok(scored)
     }
 }
 
@@ -783,7 +795,7 @@ mod tests {
         far.vec = basis(1);
         store.append(vec![near, far]).unwrap();
 
-        let ranked = store.rank(&basis(0));
+        let ranked = store.rank(&basis(0)).unwrap();
 
         assert_eq!(ranked.len(), 2, "the median needs every score");
         assert_eq!(store.records[ranked[0].0].label, "a.mp4");
@@ -802,7 +814,7 @@ mod tests {
     #[test]
     fn the_rank_of_an_empty_store_is_empty() {
         let (dir, store) = opened("rank_empty");
-        assert!(store.rank(&basis(0)).is_empty());
+        assert!(store.rank(&basis(0)).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -815,10 +827,26 @@ mod tests {
         note.vec = basis(0);
         store.append(vec![note]).unwrap();
 
-        let ranked = store.rank(&basis(0));
+        let ranked = store.rank(&basis(0)).unwrap();
 
         assert_eq!(ranked.len(), 1);
         assert_eq!(store.records[ranked[0].0].kind, KIND_NOTE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database fault must surface. It must not read as an empty store.
+    #[test]
+    fn a_fault_in_the_rank_query_is_an_error() {
+        let (dir, mut store) = opened("rank_fault");
+        store.append(vec![new_record("a.mp4", 0.0, 0.25)]).unwrap();
+        store
+            .conn
+            .execute_batch("drop table vec_records")
+            .unwrap();
+
+        let outcome = store.rank(&basis(0));
+
+        assert!(outcome.is_err(), "a dropped table must not read as no matches");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -601,7 +601,7 @@ fn search(embedder: &Embedder, store: &Store, query: &str) -> Result<SearchAnswe
     }
     let text = format!("{QUERY_PREFIX}{query}");
     let vec = embedder.embed_text(&text).map_err(JobError::from)?;
-    let ranked = store.rank(&vec);
+    let ranked = store.rank(&vec).map_err(JobError::from)?;
     let baseline = index::median(&ranked);
     Ok(SearchAnswer {
         groups: index::group_hits(&store.records, &ranked, baseline),
