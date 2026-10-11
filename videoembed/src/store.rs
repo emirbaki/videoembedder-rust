@@ -8,9 +8,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::db;
+use crate::plan::{self, Plan};
 
 const MAGIC: &[u8; 4] = b"VEI1";
 
@@ -18,11 +19,6 @@ pub const KIND_WINDOW: u8 = 0;
 pub const KIND_NOTE: u8 = 1;
 pub const KIND_FRAME: u8 = 2;
 pub const KIND_AUDIO: u8 = 3;
-
-/// The plan of the run that fills the store. Window mode changes these.
-const PLAN_WINDOW: f64 = 0.25;
-const PLAN_FRAMES: i64 = 1;
-const PLAN_AUDIO: i64 = 1;
 
 /// True for a record that belongs to a video file.
 ///
@@ -277,6 +273,89 @@ impl Store {
         Ok(removed)
     }
 
+    /// The plan of one video, or None when the video holds no row.
+    pub fn plan_of(&self, path: &str) -> Result<Option<Plan>> {
+        let want = normalize_label(path);
+        let row = self
+            .conn
+            .query_row(
+                "select plan_mode, plan_window, plan_stride, plan_frames, plan_audio
+                 from videos where path = ?1",
+                [&want],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("read the plan")?;
+        let Some((mode, window, stride, frames, audio)) = row else {
+            return Ok(None);
+        };
+        let mode = plan::Mode::parse(&mode).unwrap_or(plan::Mode::Fine);
+        Ok(Some(Plan {
+            mode,
+            window,
+            stride,
+            frames: frames as usize,
+            audio: audio != 0,
+        }))
+    }
+
+    /// Write the plan of one video.
+    ///
+    /// The call makes the video row when it is absent, so a plan write never
+    /// goes missing without a word.
+    pub fn set_plan(&mut self, path: &str, plan: &Plan) -> Result<()> {
+        let want = normalize_label(path);
+        self.conn
+            .execute(
+                "insert into videos(path, plan_mode, plan_window, plan_stride, plan_frames,
+                                    plan_audio)
+                 values (?1, ?2, ?3, ?4, ?5, ?6)
+                 on conflict(path) do update set
+                   plan_mode = excluded.plan_mode,
+                   plan_window = excluded.plan_window,
+                   plan_stride = excluded.plan_stride,
+                   plan_frames = excluded.plan_frames,
+                   plan_audio = excluded.plan_audio",
+                params![
+                    want,
+                    plan.mode.as_str(),
+                    plan.window,
+                    plan.stride,
+                    plan.frames as i64,
+                    plan.audio as i64
+                ],
+            )
+            .context("write the plan")?;
+        Ok(())
+    }
+
+    /// Every video and its plan, in path order.
+    pub fn plan_rows(&self) -> Result<Vec<(String, Plan)>> {
+        let mut out = Vec::new();
+        let mut paths: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("select path from videos order by path")?;
+            let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows.by_ref() {
+                paths.push(row?);
+            }
+        }
+        for path in paths {
+            if let Some(plan) = self.plan_of(&path)? {
+                out.push((path, plan));
+            }
+        }
+        Ok(out)
+    }
+
     /// True when this video finished an index run.
     pub fn is_done(&self, label: &str) -> bool {
         self.done.contains(&normalize_label(label))
@@ -286,10 +365,9 @@ impl Store {
     pub fn mark_done(&mut self, label: &str) -> Result<()> {
         let want = normalize_label(label);
         self.conn.execute(
-            "insert into videos(path, plan_window, plan_stride, plan_frames, plan_audio, done)
-             values (?1, ?2, ?2, ?3, ?4, 1)
+            "insert into videos(path, done) values (?1, 1)
              on conflict(path) do update set done = 1",
-            params![want, PLAN_WINDOW, PLAN_FRAMES, PLAN_AUDIO],
+            params![want],
         )?;
         self.done.insert(want);
         Ok(())
@@ -450,24 +528,12 @@ fn write_videos(tx: &Transaction, records: &[NewRecord]) -> Result<()> {
         }
         let (size, mtime) = fingerprint(&record.label);
         tx.execute(
-            "insert into videos(path, plan_window, plan_stride, plan_frames, plan_audio,
-                                source_size, source_mtime, done)
-             values (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0)
+            "insert into videos(path, source_size, source_mtime, done)
+             values (?1, ?2, ?3, 0)
              on conflict(path) do update set
-               plan_window = excluded.plan_window,
-               plan_stride = excluded.plan_stride,
-               plan_frames = excluded.plan_frames,
-               plan_audio = excluded.plan_audio,
                source_size = excluded.source_size,
                source_mtime = excluded.source_mtime",
-            params![
-                want,
-                PLAN_WINDOW,
-                PLAN_FRAMES,
-                PLAN_AUDIO,
-                size,
-                mtime
-            ],
+            params![want, size, mtime],
         )?;
     }
     Ok(())
@@ -1198,6 +1264,92 @@ mod tests {
         assert_eq!(vectors.len(), 2);
         assert_eq!(vectors[0], basis(1), "the order of the ids must hold");
         assert_eq!(vectors[1], basis(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan written to a video reads back whole.
+    #[test]
+    fn a_plan_round_trips_through_the_store() {
+        let (dir, mut store) = opened("plan_round");
+        store
+            .append(vec![new_record("a.mp4", 0.0, 0.25)])
+            .unwrap();
+
+        store
+            .set_plan("a.mp4", &plan::Plan::of(plan::Preset::Action))
+            .unwrap();
+
+        let again = Store::open(&dir.join("index.db")).unwrap();
+        let held = again.plan_of("a.mp4").unwrap().unwrap();
+        assert_eq!(held, plan::Plan::of(plan::Preset::Action));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A video with no plan row gives nothing, so the caller uses the default.
+    #[test]
+    fn a_video_with_no_plan_gives_nothing() {
+        let (dir, store) = opened("plan_none");
+        assert_eq!(store.plan_of("a.mp4").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An older store reads as Fine, because its records are fine records.
+    #[test]
+    fn an_older_store_reads_as_fine() {
+        let dir = scratch("plan_old");
+        let path = dir.join("index.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::open(&path).unwrap();
+        // A row as an older version wrote it: no plan_mode column.
+        conn.execute_batch(
+            "drop table videos;
+             create table videos (
+               path TEXT PRIMARY KEY,
+               plan_window REAL NOT NULL DEFAULT 0.25,
+               plan_stride REAL NOT NULL DEFAULT 0.25,
+               plan_frames INTEGER NOT NULL DEFAULT 1,
+               plan_audio INTEGER NOT NULL DEFAULT 1,
+               source_size INTEGER,
+               source_mtime INTEGER,
+               done INTEGER NOT NULL DEFAULT 0
+             );
+             insert into videos(path, done) values ('a.mp4', 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+
+        let held = store.plan_of("a.mp4").unwrap().unwrap();
+        assert_eq!(held.mode, plan::Mode::Fine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One plan read gives every video and its plan.
+    #[test]
+    fn the_plan_rows_give_every_video() {
+        let (dir, mut store) = opened("plan_rows");
+        store
+            .append(vec![new_record("a.mp4", 0.0, 0.25)])
+            .unwrap();
+        store
+            .append(vec![new_record("b.mp4", 0.0, 0.25)])
+            .unwrap();
+        store
+            .set_plan("b.mp4", &plan::Plan::of(plan::Preset::Speech))
+            .unwrap();
+
+        let rows = store.plan_rows().unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "a.mp4");
+        assert_eq!(
+            rows[1],
+            (
+                "b.mp4".to_string(),
+                plan::Plan::of(plan::Preset::Speech)
+            )
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

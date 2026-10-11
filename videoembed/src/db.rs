@@ -18,6 +18,7 @@ pub const DIM: usize = 768;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS videos (
   path         TEXT PRIMARY KEY,
+  plan_mode    TEXT NOT NULL DEFAULT 'fine',
   plan_window  REAL NOT NULL DEFAULT 0.25,
   plan_stride  REAL NOT NULL DEFAULT 0.25,
   plan_frames  INTEGER NOT NULL DEFAULT 1,
@@ -71,8 +72,30 @@ pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("open the store")?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(SCHEMA).context("make the tables")?;
+    add_missing_columns(&conn)?;
     conn.execute_batch(&vec_schema()).context("make the vector table")?;
     Ok(conn)
+}
+
+/// Add a column that a later version introduced.
+///
+/// The table is old when the column is absent. The default backfills every
+/// existing row, so the store stays true for its records.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    let mut names: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("pragma table_info(videos)")?;
+        let mut rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows.by_ref() {
+            names.push(row?);
+        }
+    }
+    if names.iter().any(|name| name == "plan_mode") {
+        return Ok(());
+    }
+    conn.execute_batch("alter table videos add column plan_mode TEXT NOT NULL DEFAULT 'fine'")
+        .context("add the plan_mode column")?;
+    Ok(())
 }
 
 /// Write one vector as a blob. One value takes four bytes, little-endian.
