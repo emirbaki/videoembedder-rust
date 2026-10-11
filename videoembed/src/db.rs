@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Once;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use sqlite_vec::sqlite3_vec_init;
 
@@ -75,7 +75,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Write one vector as a blob. One value takes four bytes.
+/// Write one vector as a blob. One value takes four bytes, little-endian.
 pub fn vec_to_blob(vec: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vec.len() * 4);
     for x in vec {
@@ -84,12 +84,21 @@ pub fn vec_to_blob(vec: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Read a stored vector blob. One value takes four bytes.
-pub fn blob_to_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
+/// Read a stored vector blob. One value takes four bytes, little-endian.
+///
+/// A write gives the blob a whole number of values. A length that is not a
+/// multiple of four names a damaged row, so the read refuses the blob.
+pub fn blob_to_vec(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % 4 != 0 {
+        bail!(
+            "a vector blob of {} bytes does not hold 32-bit values",
+            bytes.len()
+        );
+    }
+    Ok(bytes
         .chunks_exact(4)
         .map(|part| f32::from_le_bytes([part[0], part[1], part[2], part[3]]))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -136,8 +145,22 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(blob_to_vec(&blob), vec_at(0));
+        assert_eq!(blob_to_vec(&blob).unwrap(), vec_at(0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blob that holds part of a value names a damaged row.
+    #[test]
+    fn a_blob_of_a_partial_value_is_refused() {
+        let err = blob_to_vec(&[1u8, 2, 3, 4, 5, 6]).unwrap_err();
+
+        assert!(format!("{err}").contains('6'), "{err}");
+    }
+
+    /// An empty blob is no vector, and the read says so without a fault.
+    #[test]
+    fn an_empty_blob_is_no_vector() {
+        assert_eq!(blob_to_vec(&[]).unwrap(), Vec::<f32>::new());
     }
 
     #[test]

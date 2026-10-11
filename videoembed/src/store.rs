@@ -306,7 +306,7 @@ impl Store {
             let blob: Vec<u8> = stmt
                 .query_row([rid], |row| row.get(0))
                 .with_context(|| format!("read the vector of row {rid}"))?;
-            out.push(db::blob_to_vec(&blob));
+            out.push(db::blob_to_vec(&blob)?);
         }
         Ok(out)
     }
