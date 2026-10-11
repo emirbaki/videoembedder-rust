@@ -24,7 +24,7 @@ fn main() -> Result<()> {
         store_path.display(),
         store.records.len()
     );
-    println!("Commands: index <path> | note <text> | search <query> | list | forget <path> | device gpu|cpu | quit");
+    println!("Commands: index <path> | note <text> | search <query> [| <path>] | list | forget <path> | device gpu|cpu | quit");
     println!("Measure the time grid: measure <query> | <another query>");
     println!("Start with --gpu or --cpu to pick the mode. The default is the card when it is here.");
 
@@ -232,19 +232,52 @@ fn note(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
 }
 
 /// Rank every record against the query.
+/// Split the search argument into the query and an optional scope.
+///
+/// The last `|` holds the scope, so a query can keep one of its own. The
+/// separator is the same one `measure` uses.
+fn parse_search(rest: &str) -> (String, Option<String>) {
+    match rest.rsplit_once('|') {
+        Some((query, scope)) => {
+            let scope = scope.trim();
+            let query = query.trim().to_string();
+            if scope.is_empty() {
+                (query, None)
+            } else {
+                (query, Some(scope.to_string()))
+            }
+        }
+        None => (rest.trim().to_string(), None),
+    }
+}
+
 fn search(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
-    if rest.is_empty() {
-        bail!("usage: search <query>");
+    let (text, scope) = parse_search(rest);
+    if text.is_empty() {
+        bail!("usage: search <query> [| <path>]");
     }
     if store.records.is_empty() {
         println!("The store is empty. Run index or note first.");
         return Ok(());
     }
-    let query = embedder.embed_text(&format!("{QUERY_PREFIX}{rest}"))?;
-    let ranked = store.rank(&query, None)?;
+    let query = embedder.embed_text(&format!("{QUERY_PREFIX}{text}"))?;
+    let ranked = store.rank(&query, scope.as_deref())?;
+    if ranked.is_empty() {
+        match &scope {
+            Some(scope) => println!("No records for {scope}."),
+            None => println!("The store is empty. Run index or note first."),
+        }
+        return Ok(());
+    }
     let baseline = index::median(&ranked);
-    println!("Top results for: {rest}");
-    println!("Baseline (median of the store): {baseline:.3}");
+    match &scope {
+        Some(scope) => println!("Top results for: {text} in {scope}"),
+        None => println!("Top results for: {text}"),
+    }
+    match &scope {
+        Some(_) => println!("Baseline (median of the video): {baseline:.3}"),
+        None => println!("Baseline (median of the store): {baseline:.3}"),
+    }
     for (rank, (i, score)) in ranked.iter().take(10).enumerate() {
         let record = &store.records[*i];
         let margin = score - baseline;
@@ -346,5 +379,33 @@ mod tests {
         let (asked, rest) = split_device(vec!["--verbose".into(), "list".into()]);
         assert_eq!(asked, None);
         assert_eq!(rest, vec!["--verbose", "list"]);
+    }
+
+    /// The search takes a scope after the separator.
+    #[test]
+    fn the_search_takes_a_scope_after_the_separator() {
+        let (query, scope) = parse_search("blue | spike/a.mp4");
+        assert_eq!(query, "blue");
+        assert_eq!(scope.as_deref(), Some("spike/a.mp4"));
+
+        let (query, scope) = parse_search("  blue  ");
+        assert_eq!(query, "blue");
+        assert_eq!(scope, None);
+    }
+
+    /// The last separator wins, so a query can hold the `|` itself.
+    #[test]
+    fn the_last_separator_holds_the_scope() {
+        let (query, scope) = parse_search("a | b.mp4 | spike/c.mp4");
+        assert_eq!(query, "a | b.mp4");
+        assert_eq!(scope.as_deref(), Some("spike/c.mp4"));
+    }
+
+    /// An empty scope is no scope.
+    #[test]
+    fn an_empty_scope_is_no_scope() {
+        let (query, scope) = parse_search("blue |");
+        assert_eq!(query, "blue");
+        assert_eq!(scope, None);
     }
 }

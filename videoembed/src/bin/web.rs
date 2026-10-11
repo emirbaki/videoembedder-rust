@@ -59,6 +59,7 @@ enum Job {
     },
     Search {
         query: String,
+        path: Option<String>,
         answer: Sender<Result<SearchAnswer, JobError>>,
     },
     /// Load the model again on another device. The answer names the new mode.
@@ -113,6 +114,8 @@ struct PathBody {
 #[derive(Debug, Deserialize)]
 struct QueryBody {
     query: String,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 /// The mode a switch asks for, as "gpu" or "cpu".
@@ -568,8 +571,8 @@ fn handle(
             let outcome = store.forget(&path).map_err(JobError::from);
             let _ = answer.send(outcome);
         }
-        Job::Search { query, answer } => {
-            let _ = answer.send(search(embedder, store, &query));
+        Job::Search { query, path, answer } => {
+            let _ = answer.send(search(embedder, store, &query, path.as_deref()));
         }
         Job::StartIndex { folder, answer } => {
             let _ = answer.send(start_index(progress, pending, stopped, &folder));
@@ -592,7 +595,12 @@ fn handle(
     None
 }
 
-fn search(embedder: &Embedder, store: &Store, query: &str) -> Result<SearchAnswer, JobError> {
+fn search(
+    embedder: &Embedder,
+    store: &Store,
+    query: &str,
+    scope: Option<&str>,
+) -> Result<SearchAnswer, JobError> {
     if store.records.is_empty() {
         return Ok(SearchAnswer {
             groups: Vec::new(),
@@ -601,7 +609,7 @@ fn search(embedder: &Embedder, store: &Store, query: &str) -> Result<SearchAnswe
     }
     let text = format!("{QUERY_PREFIX}{query}");
     let vec = embedder.embed_text(&text).map_err(JobError::from)?;
-    let ranked = store.rank(&vec, None).map_err(JobError::from)?;
+    let ranked = store.rank(&vec, scope).map_err(JobError::from)?;
     let baseline = index::median(&ranked);
     Ok(SearchAnswer {
         groups: index::group_hits(&store.records, &ranked, baseline),
@@ -1025,6 +1033,7 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
             let (answer, wait) = channel();
             let _ = jobs.send(Job::Search {
                 query: body.query,
+                path: body.path,
                 answer,
             });
             match wait.recv() {

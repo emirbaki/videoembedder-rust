@@ -100,7 +100,7 @@ a script.
 |---|---|
 | `index <path>` | Cut the video into 2 s windows on a 1 s stride. Embed each window. |
 | `note <text>` | Add one free text record. |
-| `search <query>` | Rank every record. Show the top 10. |
+| `search <query> [\| <path>]` | Rank every record, or one video. Show the top 10. |
 | `list` | Group the records by video. |
 | `forget <path>` | Drop one video from the index. |
 | `quit` | Stop. |
