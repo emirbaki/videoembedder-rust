@@ -95,12 +95,15 @@ impl Plan {
                 frames: 1,
                 audio: true,
             },
+            // The probe measured this shape at 10 hits of 10 with the window
+            // audio, against 6 of 10 without it. Google's Object preset holds
+            // no audio, so this value departs from that table.
             Preset::Object => Plan {
                 mode: Mode::Window,
                 window: 2.0,
                 stride: 1.0,
                 frames: 2,
-                audio: false,
+                audio: true,
             },
             Preset::Action => Plan {
                 mode: Mode::Window,
@@ -221,7 +224,7 @@ mod tests {
         assert_eq!(object.window, 2.0);
         assert_eq!(object.stride, 1.0);
         assert_eq!(object.frames, 2);
-        assert!(!object.audio);
+        assert!(object.audio);
 
         let speech = Plan::of(Preset::Speech);
         assert_eq!(speech.window, 6.0);

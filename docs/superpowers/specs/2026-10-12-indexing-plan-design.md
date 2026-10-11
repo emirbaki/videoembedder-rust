@@ -59,11 +59,18 @@ The four presets:
 | Preset | mode | window | stride | frames | audio |
 | --- | --- | --- | --- | --- | --- |
 | Fine | fine | 0.25 | 0.25 | 1 | yes |
-| Object | window | 2 | 1 | 2 | no |
+| Object | window | 2 | 1 | 2 | yes |
 | Action | window | 4 | 2 | 4 | no |
 | Speech | window | 6 | 3 | 6 | yes |
 
 The default plan is Object.
+
+Amendment of 2026-10-12. The Object preset holds the window audio. The probe
+window is one 2 s window on a 1 s stride with 2 frames, and that shape is the
+Object plan. The probe ran that shape with the audio and without it. The audio
+form hit 10 of 10 queries, and the plain form hit 6 of 10. Google's table gives
+Object no audio, so this value departs from that table. The cost is one more
+encode for each window. The record count stays as it was.
 
 In fine mode the `window`, `stride`, and `frames` values have no effect. Fine
 mode keeps the 0.25 s frame grid and the 1 s audio grid, as the code does today.

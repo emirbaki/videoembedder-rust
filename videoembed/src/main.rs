@@ -610,7 +610,7 @@ mod tests {
         let plan = videoembed::plan::Plan::of(videoembed::plan::Preset::Object);
         assert_eq!(
             index_line(&plan),
-            "Indexing under the Object plan (2 s windows, 2 frames, no audio)."
+            "Indexing under the Object plan (2 s windows, 2 frames, with audio)."
         );
 
         let fine = videoembed::plan::Plan::of(videoembed::plan::Preset::Fine);

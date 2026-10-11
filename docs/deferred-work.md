@@ -15,8 +15,15 @@ and the plan panel all landed on 2026-10-12.
 
 The probe of 2026-10-12 measured window mode on `spike/testvideo_nolabels.mp4`
 against ten queries. Window mode with audio hit 10 of 10. Window mode with no
-audio hit 6 of 10. The fine grid hit 5 of 10. The default plan stays Object,
-because the user chose the three Google presets and the design names Object.
+audio hit 6 of 10. The fine grid hit 5 of 10. The probe window is the Object
+plan, so the audio form answers for the Object shape.
+
+The default plan changed on 2026-10-12. It is Object with the window audio,
+because of the probe result. Google's table gives Object no audio, and the
+design recorded that table. The default now departs from it.
+
+A video that is already indexed keeps its stored plan. A new default does not
+re-cut it. Change the plan of that video to take the new default.
 
 ## 2. Small fixes from the device-mode review
 

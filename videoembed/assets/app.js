@@ -168,7 +168,7 @@ async function applyPreset(name) {
 function usePreset(name) {
   const base = {
     fine: [0.25, 1, true],
-    object: [2, 2, false],
+    object: [2, 2, true],
     action: [4, 4, false],
     speech: [6, 6, true],
   };
