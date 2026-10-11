@@ -262,6 +262,28 @@ impl Embedder {
         self.embed_joint(ctx, &[bitmap])
     }
 
+    /// Embed several media files as one window, in the given order.
+    ///
+    /// The caller passes the frames first and the audio clip last. One batch
+    /// holds every part, and one decode follows. A probe uses this call to test
+    /// window mode.
+    pub fn embed_window_in(
+        &self,
+        ctx: &mut LlamaContext<'_>,
+        media: &[&Path],
+    ) -> Result<Vec<f32>> {
+        if media.is_empty() {
+            bail!("a window holds no media");
+        }
+        ctx.clear_kv_cache();
+        let mut bitmaps = Vec::with_capacity(media.len());
+        for path in media {
+            let path = path.to_str().context("media path is not utf8")?;
+            bitmaps.push(MtmdBitmap::from_file(&self.mtmd, path, false)?);
+        }
+        self.embed_joint(ctx, &bitmaps)
+    }
+
     /// One batch holds every token and every media row. One decode follows.
     fn embed_joint(&self, ctx: &mut LlamaContext<'_>, bitmaps: &[MtmdBitmap]) -> Result<Vec<f32>> {
         let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();

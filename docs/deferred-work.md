@@ -13,6 +13,10 @@ review of the device-mode branch.
 | 10 | MP4 normalisation, and a black-frame probe | Needs more ffmpeg work. |
 | 11 | Sliders for the window and the frame count | Follows item 8. |
 
+The probe of 2026-10-12 measured window mode on `spike/testvideo_nolabels.mp4`
+against ten queries. Window mode with audio hit 10 of 10. Window mode with no
+audio hit 6 of 10. The fine grid hit 5 of 10.
+
 ## 2. Small fixes from the device-mode review
 
 | # | Item |
