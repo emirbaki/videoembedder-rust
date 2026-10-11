@@ -1,6 +1,6 @@
 # Deferred work
 
-The state on 2026-10-11. The list holds the work that we chose not to do yet.
+The state on 2026-10-12. The list holds the work that we chose not to do yet.
 The rank comes from `docs/google-gallery-comparison.md` section 5, and from the
 review of the device-mode branch.
 
@@ -8,14 +8,15 @@ review of the device-mode branch.
 
 | # | Item | Why it waits |
 | --- | --- | --- |
-| 1 | Window mode: one 2 s window holds 2 frames and its audio | Changes the store format. It cuts the work about tenfold. One clip cannot settle the accuracy question, so the decision stays open. |
-| 8 | A per-video plan, with presets | The store holds the plan. The indexer does not use it yet. |
 | 10 | MP4 normalisation, and a black-frame probe | Needs more ffmpeg work. |
-| 11 | Sliders for the window and the frame count | Follows item 8. |
+
+Items 1, 8, and 11 are done. Window mode, the per-video plan with its presets,
+and the plan panel all landed on 2026-10-12.
 
 The probe of 2026-10-12 measured window mode on `spike/testvideo_nolabels.mp4`
 against ten queries. Window mode with audio hit 10 of 10. Window mode with no
-audio hit 6 of 10. The fine grid hit 5 of 10.
+audio hit 6 of 10. The fine grid hit 5 of 10. The default plan stays Object,
+because the user chose the three Google presets and the design names Object.
 
 ## 2. Small fixes from the device-mode review
 

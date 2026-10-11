@@ -98,15 +98,22 @@ a script.
 
 | Command | Action |
 |---|---|
-| `index <path>` | Cut the video into 2 s windows on a 1 s stride. Embed each window. |
+| `index <path>` | Cut the video under its plan. Embed each item. |
+| `plan <path> <preset>` | Cut the video again under a new plan. |
 | `note <text>` | Add one free text record. |
 | `search <query> [\| <path>]` | Rank every record, or one video. Show the top 10, and mark a weak row. |
 | `list` | Group the records by video. |
 | `forget <path>` | Drop one video from the index. |
 | `quit` | Stop. |
 
-The stride is 1 s, so the windows overlap. A hit at 20.0-22.0 s can start at
-19 s or 21 s in the true scene.
+The default plan is Object: a 2 s window on a 1 s stride, with 2 frames and no
+audio. The presets are Object, Action, Speech, and Fine. The Fine preset keeps
+the 0.25 s frame grid. A video that the store does not know takes the default.
+An older video keeps the Fine plan that it was cut under.
+
+The `plan` command also reads values, as `plan <path> window=4 frames=4
+audio=on`. The window takes 1 to 10 seconds, and the frame count stops at the
+window in seconds.
 
 The store sits at `videoembed/store/index.db`. Both the console and the web
 binary use that one file. The format is SQLite with the sqlite-vec extension.
@@ -129,8 +136,10 @@ The app opens `http://127.0.0.1:8787/` in your browser.
 2. Press Index. The bar shows the file and the window.
 3. Type a query. The hits appear under Search.
 4. Press a hit. The player jumps to that moment.
-5. Press Forget on a row to drop one video from the index.
-6. Press Quit to stop the server.
+5. Press the name of a video to show its plan. Pick a preset, or move the two
+   sliders, then press Apply to cut the video again.
+6. Press Forget on a row to drop one video from the index.
+7. Press Quit to stop the server.
 
 The server binds to `127.0.0.1` only, so another machine cannot reach it.
 
@@ -144,10 +153,11 @@ takes a random key in the query instead. The page reads that key from
 |---|---|---|
 | `/api/state` | GET | The version, the record count, the video count, and the video key. |
 | `/api/progress` | GET | The progress object of the running job. |
-| `/api/videos` | GET | Every indexed video with its window count. |
+| `/api/videos` | GET | Every indexed video, with its item count and its plan. |
 | `/api/search` | POST | Rank the store, or one video, and group the hits. The reply names the weak cut. |
 | `/api/pick-folder` | POST | Open the folder dialog. |
 | `/api/index` | POST | Index every video under a folder. |
+| `/api/plan` | POST | Set the plan of one video. The reply names the item count. |
 | `/api/forget` | POST | Drop one video from the index. |
 | `/api/video` | GET | The video bytes, with byte ranges. |
 | `/api/quit` | POST | Stop the server. |
