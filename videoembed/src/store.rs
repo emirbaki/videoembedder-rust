@@ -261,18 +261,41 @@ impl Store {
         &self.path
     }
 
+    /// The position of one row id in the record list.
+    fn position_of(&self, rid: i64) -> Option<usize> {
+        self.records.iter().position(|record| record.rid == rid)
+    }
+
     /// Rank every record against one query vector. Best first.
     ///
-    /// The vectors sit in the database, so the search moves to a query in
-    /// Task 4. This body returns a zero score for every record and keeps the
-    /// callers working until then.
+    /// The query asks the vector table for every row and its distance. The
+    /// table holds cosine distance, so the score is one minus the distance.
+    /// The rank needs every row, because the median of the store is the
+    /// baseline of the result.
     pub fn rank(&self, query: &[f32]) -> Vec<(usize, f32)> {
-        let _ = query;
-        self.records
-            .iter()
-            .enumerate()
-            .map(|(at, _)| (at, 0.0))
-            .collect()
+        if self.records.is_empty() {
+            return Vec::new();
+        }
+        let sql = "select rid, distance from vec_records where embedding match vec_f32(?1) and k = ?2";
+        let mut stmt = match self.conn.prepare(sql) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(
+            params![db::vec_to_blob(query), self.records.len() as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32)),
+        );
+        let Ok(rows) = rows else {
+            return Vec::new();
+        };
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        for row in rows.flatten() {
+            if let Some(at) = self.position_of(row.0) {
+                scored.push((at, 1.0 - row.1));
+            }
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored
     }
 }
 
@@ -742,5 +765,60 @@ mod tests {
         let first = record_id("a.mp4", 1.0, 1.25);
         let second = record_id("a.mp4", 1.0, 1.25);
         assert_eq!(first, second, "a second pass must write the same id");
+    }
+
+    /// A vector with one 1.0 at `at`, on the model size.
+    fn basis(at: usize) -> Vec<f32> {
+        let mut vec = vec![0.0f32; db::DIM];
+        vec[at] = 1.0;
+        vec
+    }
+
+    #[test]
+    fn the_rank_returns_every_record_best_first() {
+        let (dir, mut store) = opened("rank");
+        let mut near = new_record("a.mp4", 0.0, 0.25);
+        near.vec = basis(0);
+        let mut far = new_record("b.mp4", 0.0, 0.25);
+        far.vec = basis(1);
+        store.append(vec![near, far]).unwrap();
+
+        let ranked = store.rank(&basis(0));
+
+        assert_eq!(ranked.len(), 2, "the median needs every score");
+        assert_eq!(store.records[ranked[0].0].label, "a.mp4");
+        assert!(
+            ranked[0].1 > ranked[1].1,
+            "the near record must score higher"
+        );
+        assert!(
+            (ranked[0].1 - 1.0).abs() < 1e-4,
+            "a unit vector against itself scores 1.0, got {}",
+            ranked[0].1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_rank_of_an_empty_store_is_empty() {
+        let (dir, store) = opened("rank_empty");
+        assert!(store.rank(&basis(0)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note takes part in the rank, like a frame record.
+    #[test]
+    fn the_rank_holds_a_note() {
+        let (dir, mut store) = opened("rank_note");
+        let mut note = new_record("birthday", 0.0, 0.0);
+        note.kind = KIND_NOTE;
+        note.vec = basis(0);
+        store.append(vec![note]).unwrap();
+
+        let ranked = store.rank(&basis(0));
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(store.records[ranked[0].0].kind, KIND_NOTE);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
