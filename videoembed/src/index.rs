@@ -53,6 +53,22 @@ pub fn median(ranked: &[(usize, f32)]) -> f32 {
     }
 }
 
+/// The gap between the best score of one result and the weak cut.
+pub const WEAK_GAP: f32 = 0.20;
+
+/// The cut that marks a weak result.
+///
+/// The best score of the result anchors the cut, as Google's photo feature
+/// does. The floor of 0.4 keeps the cut above a hopeless row.
+pub fn weak_cut(top: f32) -> f32 {
+    (top - WEAK_GAP).max(FLOOR)
+}
+
+/// Is one score below the cut of its result?
+pub fn is_weak(score: f32, cut: f32) -> bool {
+    score < cut
+}
+
 const VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mkv", "mov", "avi", "webm"];
 
 /// The progress of the running index job. The server reads a copy.
@@ -802,6 +818,22 @@ mod tests {
     #[test]
     fn the_median_of_an_empty_list_is_zero() {
         assert_eq!(median(&[]), 0.0);
+    }
+
+    #[test]
+    fn the_cut_follows_the_best_score() {
+        assert!((weak_cut(0.9) - 0.70).abs() < 1e-6);
+        assert!(
+            (weak_cut(0.5) - FLOOR).abs() < 1e-6,
+            "a weak best score leaves the floor in place"
+        );
+    }
+
+    #[test]
+    fn a_score_below_the_cut_is_weak() {
+        assert!(is_weak(0.60, 0.70));
+        assert!(!is_weak(0.70, 0.70), "the cut itself stands");
+        assert!(!is_weak(0.80, 0.70));
     }
 
     #[test]

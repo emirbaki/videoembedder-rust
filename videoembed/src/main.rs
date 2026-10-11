@@ -278,32 +278,47 @@ fn search(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
         Some(_) => println!("Baseline (median of the video): {baseline:.3}"),
         None => println!("Baseline (median of the store): {baseline:.3}"),
     }
+    let cut = index::weak_cut(ranked[0].1);
+    println!("Weak below: {cut:.3}");
     for (rank, (i, score)) in ranked.iter().take(10).enumerate() {
         let record = &store.records[*i];
-        let margin = score - baseline;
-        let bar = bar(*score);
-        match record.kind {
-            KIND_NOTE => println!(
-                "{:2}. {:.3} ({:+.3}) {} note: {}",
-                rank + 1,
-                score,
-                margin,
-                bar,
-                record.label
-            ),
-            _ => println!(
-                "{:2}. {:.3} ({:+.3}) {} {}  [{:.2}-{:.2} s]",
-                rank + 1,
-                score,
-                margin,
-                bar,
-                record.label,
-                record.start,
-                record.end
-            ),
-        }
+        println!("{}", hit_line(rank, *score, score - baseline, cut, record));
     }
     Ok(())
+}
+
+/// One line of the result list.
+///
+/// A row below the cut takes the `weak` mark. The cut comes from the best
+/// score of the result, so a strong match marks its weak rows.
+fn hit_line(rank: usize, score: f32, margin: f32, cut: f32, record: &Record) -> String {
+    let mark = if index::is_weak(score, cut) {
+        " weak"
+    } else {
+        ""
+    };
+    match record.kind {
+        KIND_NOTE => format!(
+            "{:2}. {:.3} ({:+.3}) {} note: {}{}",
+            rank + 1,
+            score,
+            margin,
+            bar(score),
+            record.label,
+            mark
+        ),
+        _ => format!(
+            "{:2}. {:.3} ({:+.3}) {} {}  [{:.2}-{:.2} s]{}",
+            rank + 1,
+            score,
+            margin,
+            bar(score),
+            record.label,
+            record.start,
+            record.end,
+            mark
+        ),
+    }
 }
 
 /// Group the records by source.
@@ -379,6 +394,36 @@ mod tests {
         let (asked, rest) = split_device(vec!["--verbose".into(), "list".into()]);
         assert_eq!(asked, None);
         assert_eq!(rest, vec!["--verbose", "list"]);
+    }
+
+    /// A row below the cut takes the weak mark.
+    #[test]
+    fn a_row_below_the_cut_is_marked_weak() {
+        let frame = Record {
+            rid: 1,
+            id: "a.mp4/0-250".into(),
+            kind: KIND_FRAME,
+            label: "a.mp4".into(),
+            start: 0.0,
+            end: 0.25,
+        };
+        let weak = hit_line(0, 0.55, -0.05, 0.70, &frame);
+        assert!(weak.ends_with(" weak"), "{weak}");
+        let strong = hit_line(0, 0.80, 0.20, 0.70, &frame);
+        assert!(!strong.contains("weak"), "{strong}");
+        assert!(strong.contains("[0.00-0.25 s]"), "{strong}");
+
+        let note = Record {
+            rid: 2,
+            id: "blue/0-0".into(),
+            kind: KIND_NOTE,
+            label: "blue".into(),
+            start: 0.0,
+            end: 0.0,
+        };
+        let line = hit_line(1, 0.50, -0.10, 0.70, &note);
+        assert!(line.contains("note: blue"), "{line}");
+        assert!(line.ends_with(" weak"), "{line}");
     }
 
     /// The search takes a scope after the separator.

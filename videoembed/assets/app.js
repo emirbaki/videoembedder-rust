@@ -200,14 +200,14 @@ async function runSearch(event) {
   note("");
   try {
     const answer = await api("/api/search", { query });
-    renderGroups(answer.groups, answer.baseline);
+    renderGroups(answer.groups, answer.baseline, answer.cut);
   } catch (err) {
     note(err.message);
-    renderGroups([], null);
+    renderGroups([], null, null);
   }
 }
 
-function renderGroups(groups, baseline) {
+function renderGroups(groups, baseline, cut) {
   const list = $("groups");
   list.textContent = "";
   const timeline = $("timeline");
@@ -220,6 +220,7 @@ function renderGroups(groups, baseline) {
   note("");
   for (const group of groups) {
     const item = document.createElement("li");
+    if (Number.isFinite(cut) && group.score < cut) item.className = "weak";
 
     const title = document.createElement("strong");
     title.textContent = group.video;

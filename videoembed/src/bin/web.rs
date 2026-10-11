@@ -104,6 +104,8 @@ struct Rows {
 struct SearchAnswer {
     groups: Vec<Group>,
     baseline: f32,
+    /// The score below which a group reads as weak.
+    cut: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -605,15 +607,18 @@ fn search(
         return Ok(SearchAnswer {
             groups: Vec::new(),
             baseline: 0.0,
+            cut: 0.0,
         });
     }
     let text = format!("{QUERY_PREFIX}{query}");
     let vec = embedder.embed_text(&text).map_err(JobError::from)?;
     let ranked = store.rank(&vec, scope).map_err(JobError::from)?;
     let baseline = index::median(&ranked);
+    let cut = index::weak_cut(ranked.first().map(|(_, score)| *score).unwrap_or(0.0));
     Ok(SearchAnswer {
         groups: index::group_hits(&store.records, &ranked, baseline),
         baseline,
+        cut,
     })
 }
 

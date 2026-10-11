@@ -9,7 +9,6 @@ review of the device-mode branch.
 | # | Item | Why it waits |
 | --- | --- | --- |
 | 1 | Window mode: one 2 s window holds 2 frames and its audio | Changes the store format. It cuts the work about tenfold. One clip cannot settle the accuracy question, so the decision stays open. |
-| 7 | A relative score cut, like the Google greyout | Changes the number of results. Small cost. |
 | 8 | A per-video plan, with presets | The store holds the plan. The indexer does not use it yet. |
 | 10 | MP4 normalisation, and a black-frame probe | Needs more ffmpeg work. |
 | 11 | Sliders for the window and the frame count | Follows item 8. |

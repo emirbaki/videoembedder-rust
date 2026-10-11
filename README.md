@@ -100,7 +100,7 @@ a script.
 |---|---|
 | `index <path>` | Cut the video into 2 s windows on a 1 s stride. Embed each window. |
 | `note <text>` | Add one free text record. |
-| `search <query> [\| <path>]` | Rank every record, or one video. Show the top 10. |
+| `search <query> [\| <path>]` | Rank every record, or one video. Show the top 10, and mark a weak row. |
 | `list` | Group the records by video. |
 | `forget <path>` | Drop one video from the index. |
 | `quit` | Stop. |
@@ -145,7 +145,7 @@ takes a random key in the query instead. The page reads that key from
 | `/api/state` | GET | The version, the record count, the video count, and the video key. |
 | `/api/progress` | GET | The progress object of the running job. |
 | `/api/videos` | GET | Every indexed video with its window count. |
-| `/api/search` | POST | Rank the store and group the hits by video. |
+| `/api/search` | POST | Rank the store, or one video, and group the hits. The reply names the weak cut. |
 | `/api/pick-folder` | POST | Open the folder dialog. |
 | `/api/index` | POST | Index every video under a folder. |
 | `/api/forget` | POST | Drop one video from the index. |
