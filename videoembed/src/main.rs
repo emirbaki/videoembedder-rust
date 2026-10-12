@@ -372,6 +372,9 @@ fn no_result_line(scope: Option<&str>) -> String {
     }
 }
 
+/// The number of rows a search shows.
+const ROW_CAP: usize = 10;
+
 fn search(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
     let (text, scope) = parse_search(rest);
     if text.is_empty() {
@@ -398,45 +401,50 @@ fn search(embedder: &Embedder, store: &Store, rest: &str) -> Result<()> {
     }
     let cut = index::weak_cut(ranked[0].1);
     println!("Weak below: {cut:.3}");
-    for (rank, (i, score)) in ranked.iter().take(10).enumerate() {
-        let record = &store.records[*i];
-        println!("{}", hit_line(rank, *score, score - baseline, cut, record));
+    for (rank, row) in rows_of(&store.records, &ranked, baseline).iter().enumerate() {
+        println!("{}", hit_line(rank, row, cut));
     }
     Ok(())
 }
 
+/// The rows a search shows: the ten best, folded into moments.
+fn rows_of(records: &[Record], ranked: &[(usize, f32)], baseline: f32) -> Vec<index::Row> {
+    index::search_rows(records, ranked, baseline, ROW_CAP, index::MERGE_GAP)
+}
+
 /// One line of the result list.
 ///
-/// A row below the cut takes the `weak` mark. The cut comes from the best
-/// score of the result, so a strong match marks its weak rows.
-fn hit_line(rank: usize, score: f32, margin: f32, cut: f32, record: &Record) -> String {
-    let mark = if index::is_weak(score, cut) {
+/// The row holds the whole moment, so the line shows the range of the moment. A
+/// row below the cut takes the `weak` mark. The cut comes from the best score of
+/// the result, so a strong match marks its weak rows.
+fn hit_line(rank: usize, row: &index::Row, cut: f32) -> String {
+    let mark = if index::is_weak(row.score, cut) {
         " weak"
     } else {
         ""
     };
-    match record.kind {
-        KIND_NOTE => format!(
+    if row.note {
+        return format!(
             "{:2}. {:.3} ({:+.3}) {} note: {}{}",
             rank + 1,
-            score,
-            margin,
-            bar(score),
-            record.label,
+            row.score,
+            row.margin,
+            bar(row.score),
+            row.label,
             mark
-        ),
-        _ => format!(
-            "{:2}. {:.3} ({:+.3}) {} {}  [{:.2}-{:.2} s]{}",
-            rank + 1,
-            score,
-            margin,
-            bar(score),
-            record.label,
-            record.start,
-            record.end,
-            mark
-        ),
+        );
     }
+    format!(
+        "{:2}. {:.3} ({:+.3}) {} {}  [{:.2}-{:.2} s]{}",
+        rank + 1,
+        row.score,
+        row.margin,
+        bar(row.score),
+        row.label,
+        row.start,
+        row.end,
+        mark
+    )
 }
 
 /// Group the video records by their normalized path, in store order.
@@ -524,34 +532,70 @@ mod tests {
         assert_eq!(rest, vec!["--verbose", "list"]);
     }
 
+    /// One row of a search, as the test writes it.
+    fn row(label: &str, start: f32, end: f32, score: f32, note: bool) -> index::Row {
+        index::Row {
+            note,
+            label: label.to_string(),
+            start,
+            end,
+            score,
+            margin: score - 0.5,
+        }
+    }
+
     /// A row below the cut takes the weak mark.
     #[test]
     fn a_row_below_the_cut_is_marked_weak() {
-        let frame = Record {
-            rid: 1,
-            id: "a.mp4/0-250".into(),
-            kind: KIND_FRAME,
-            label: "a.mp4".into(),
-            start: 0.0,
-            end: 0.25,
-        };
-        let weak = hit_line(0, 0.55, -0.05, 0.70, &frame);
+        let weak = hit_line(0, &row("a.mp4", 0.0, 0.25, 0.55, false), 0.70);
         assert!(weak.ends_with(" weak"), "{weak}");
-        let strong = hit_line(0, 0.80, 0.20, 0.70, &frame);
+        let strong = hit_line(0, &row("a.mp4", 0.0, 0.25, 0.80, false), 0.70);
         assert!(!strong.contains("weak"), "{strong}");
         assert!(strong.contains("[0.00-0.25 s]"), "{strong}");
 
-        let note = Record {
-            rid: 2,
-            id: "blue/0-0".into(),
-            kind: KIND_NOTE,
-            label: "blue".into(),
-            start: 0.0,
-            end: 0.0,
-        };
-        let line = hit_line(1, 0.50, -0.10, 0.70, &note);
-        assert!(line.contains("note: blue"), "{line}");
-        assert!(line.ends_with(" weak"), "{line}");
+        let note = hit_line(1, &row("blue", 0.0, 0.0, 0.50, true), 0.70);
+        assert!(note.contains("note: blue"), "{note}");
+        assert!(note.ends_with(" weak"), "{note}");
+    }
+
+    /// One line shows the range of the whole moment.
+    #[test]
+    fn the_line_shows_the_range_of_the_whole_moment() {
+        let line = hit_line(0, &row("a.mp4", 0.0, 4.0, 0.9, false), 0.7);
+
+        assert!(line.contains("[0.00-4.00 s]"), "got {line}");
+    }
+
+    /// A search of the window grid shows one row for a near pair.
+    ///
+    /// The cap holds ten rows before the fold, so the near pair joins one row
+    /// of the ten.
+    #[test]
+    fn a_search_shows_one_row_for_a_near_pair() {
+        let records = vec![
+            videoembed::store::Record {
+                rid: 0,
+                id: "a.mp4/0-2000".to_string(),
+                kind: videoembed::store::KIND_FRAME,
+                label: "a.mp4".to_string(),
+                start: 0.0,
+                end: 2.0,
+            },
+            videoembed::store::Record {
+                rid: 1,
+                id: "a.mp4/2000-4000".to_string(),
+                kind: videoembed::store::KIND_FRAME,
+                label: "a.mp4".to_string(),
+                start: 2.0,
+                end: 4.0,
+            },
+        ];
+        let ranked = vec![(0, 0.9), (1, 0.85)];
+
+        let rows = rows_of(&records, &ranked, 0.0);
+
+        assert_eq!(rows.len(), 1, "the pair joins the cap of ten");
+        assert_eq!(rows[0].end, 4.0, "the moment runs to the last end");
     }
 
     /// The search takes a scope after the separator.
