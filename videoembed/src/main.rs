@@ -215,6 +215,14 @@ fn index_line(plan: &videoembed::plan::Plan) -> String {
     )
 }
 
+/// The line about the source of a cut. An empty line means no copy.
+fn note_line(copy_from: Option<&str>) -> String {
+    match copy_from {
+        Some(path) => format!("Reading the progressive copy of {path}."),
+        None => String::new(),
+    }
+}
+
 /// The preset of a plan, by its values.
 fn preset_of(plan: &videoembed::plan::Plan) -> videoembed::plan::Preset {
     videoembed::plan::Preset::ALL
@@ -238,8 +246,12 @@ fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
         .unwrap_or_else(videoembed::plan::Plan::default_plan);
     println!("Video: {}", video.display());
     println!("{}", index_line(&plan));
-    let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
     let media = store.media_dir();
+    let note = note_line(index::copy_note(&video, &media)?.as_deref());
+    if !note.is_empty() {
+        println!("{note}");
+    }
+    let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
     let records = index::index_video(embedder, &video, &plan, &media, &mut report)?;
     let count = records.len();
     store.forget(&label)?;
@@ -295,6 +307,11 @@ fn plan(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
     let wanted = plan_command(store, rest)?;
     source_of(&path)?;
     println!("Re-indexing {} under the new plan.", path);
+    let media = store.media_dir();
+    let note = note_line(index::copy_note(Path::new(&path), &media)?.as_deref());
+    if !note.is_empty() {
+        println!("{note}");
+    }
     let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
     let count = index::reindex(embedder, store, &path, &wanted, &mut report)?;
     println!("Indexed {count} records.");
@@ -616,6 +633,16 @@ mod tests {
 
         let fine = videoembed::plan::Plan::of(videoembed::plan::Preset::Fine);
         assert_eq!(index_line(&fine), "Indexing under the Fine plan (0.25 s frames).");
+    }
+
+    /// The index line names the rewrite of a fragmented video.
+    #[test]
+    fn the_note_line_names_a_rewrite() {
+        assert_eq!(
+            note_line(Some("D:/video/a.mp4")),
+            "Reading the progressive copy of D:/video/a.mp4."
+        );
+        assert_eq!(note_line(None), "");
     }
 
     /// A preset word picks that preset.

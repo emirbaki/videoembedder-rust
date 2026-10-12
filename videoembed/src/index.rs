@@ -215,6 +215,17 @@ pub fn work_dir(at: usize) -> PathBuf {
     std::env::temp_dir().join(format!("vei_{}_{n}_{at}", std::process::id()))
 }
 
+/// The message about the source of one cut. None means the video is its own
+/// source.
+///
+/// A fragmented MP4 is cut through a progressive copy, and the user waits
+/// while the copy is made. This call makes the copy when it is missing or
+/// stale.
+pub fn copy_note(video: &Path, media: &Path) -> Result<Option<String>> {
+    let source = media::source_file(video, media)?;
+    Ok((source != video).then(|| video.to_string_lossy().to_string()))
+}
+
 /// The phase of an index run.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Phase {
@@ -1469,6 +1480,34 @@ mod tests {
         assert_eq!(run.frames_cut.len(), 120);
         assert!(run.clips_cut.is_empty());
         assert_eq!(run.files.len(), FRAME_BATCH);
+    }
+
+    /// A plain video is its own source, so it takes no copy note.
+    #[test]
+    fn a_plain_video_takes_no_copy_note() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("note_media");
+        assert!(copy_note(&video, &media).unwrap().is_none());
+    }
+
+    /// A fragmented video takes a copy note, and the copy lands in the media
+    /// folder.
+    #[test]
+    fn a_fragmented_video_takes_a_copy_note() {
+        let Some(video) = cut_spike(
+            &["-t", "2", "-movflags", "frag_keyframe+empty_moov"],
+            "frag_note",
+        ) else {
+            return;
+        };
+        let media = scratch("frag_note_media");
+        let note = copy_note(&video, &media).unwrap();
+        assert_eq!(note.as_deref(), Some(video.to_string_lossy().as_ref()));
+        assert!(media.is_dir(), "the copy folder comes with the note");
+        let made: Vec<_> = std::fs::read_dir(&media).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(made.len(), 1, "one copy comes");
     }
 
     /// The spike clip, when it is here.
