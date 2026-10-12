@@ -42,6 +42,11 @@ window batch, the timestamp text, and the audio token budget.
 Plan C landed on 2026-10-13. It answered the merged moment, the pause and the
 resume, and the reconcile pass.
 
+The `small-fixes` branch merged into `main` on 2026-10-13. It answered five
+small fixes from the device-mode review, the fallback when the card fails, and
+one more fix from the branch review. The full suite passes on the merged tree:
+156 library tests, 21 console tests, 38 web tests, and 4 model tests.
+
 ## 1. Features that wait
 
 The rank weighs the gain against the cost.
