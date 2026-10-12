@@ -97,7 +97,7 @@ impl From<anyhow::Error> for JobError {
 /// exception, and it answers 409.
 fn switch_reply(err: JobError) -> (u16, String) {
     match err {
-        JobError::Busy => (409, "an index job already runs".to_string()),
+        JobError::Busy => (409, "the engine runs another job".to_string()),
         JobError::Message(message) => (500, message),
     }
 }
@@ -2032,7 +2032,10 @@ mod tests {
     fn a_failed_load_answers_500_and_a_busy_switch_answers_409() {
         let (code, message) = switch_reply(JobError::Busy);
         assert_eq!(code, 409);
-        assert!(!message.is_empty(), "the page shows a line");
+        // The engine refuses a switch for two reasons: a job runs, or another
+        // switch loads. The line must fit both, and it must not name a job
+        // that does not exist.
+        assert_eq!(message, "the engine runs another job");
 
         let (code, message) = switch_reply(JobError::Message("the card is out of memory".to_string()));
         assert_eq!(code, 500, "a load fault belongs to the server");
