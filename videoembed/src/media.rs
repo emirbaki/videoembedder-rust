@@ -222,6 +222,32 @@ pub fn extract_audio(video: &Path, from: f64, to: f64, dir: &Path) -> Result<Vec
     Ok(kept)
 }
 
+/// Cut every frame of a video at `rate` frames a second.
+///
+/// One ffmpeg call covers the whole video, so a plan with many windows pays
+/// for the seek once. The caller slices the list by time, because frame number
+/// `n` counts from one and sits at `(n - 1) / rate`.
+pub fn cut_frames(video: &Path, rate: f64, dir: &Path) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(dir)?;
+    let pattern = dir.join("f%05d.jpg").to_string_lossy().to_string();
+    let args = vec![
+        "-y".into(),
+        "-i".into(),
+        video.to_string_lossy().to_string(),
+        "-vf".into(),
+        format!("fps={rate}"),
+        "-q:v".into(),
+        "2".into(),
+        pattern,
+    ];
+    run_ffmpeg(args, "extracting frames")?;
+    let files = read_media(dir, &["jpg", "jpeg", "png"])?;
+    if files.is_empty() {
+        bail!("no frame came from {}", video.display());
+    }
+    Ok(files)
+}
+
 /// True when a wav file holds audio samples.
 ///
 /// The data chunk size tells the truth. The stream duration of a video does
@@ -352,6 +378,29 @@ mod tests {
         let clips = extract_audio(&video, 0.0, 3.0, &dir).unwrap();
         assert_eq!(clips.len(), 3, "got {}", clips.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One pass over the whole video gives one frame for each step of the rate.
+    #[test]
+    fn a_whole_video_cut_gives_a_frame_a_step() {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        }
+        let dir = scratch("whole_frames");
+        let files = cut_frames(&video, 1.0, &dir).unwrap();
+        // The clip holds 30.064 s of format, so one frame a second gives 30.
+        assert_eq!(files.len(), 30, "got {}", files.len());
+        assert!(files.iter().all(|file| file.exists()));
+        // The names climb, because ffmpeg numbers them in time order.
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(files, sorted);
+
+        let dir = scratch("whole_frames_fast");
+        let fast = cut_frames(&video, 4.0, &dir).unwrap();
+        assert_eq!(fast.len(), 120, "got {}", fast.len());
     }
 
     #[test]
