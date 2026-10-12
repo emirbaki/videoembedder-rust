@@ -111,6 +111,7 @@ fn context_params() -> LlamaContextParams {
         .with_n_ctx(NonZeroU32::new(N_CTX))
         .with_n_batch(N_BATCH)
         .with_n_ubatch(N_UBATCH)
+        .with_n_seq_max(N_WINDOW_BATCH as u32)
 }
 
 /// The windows in one model call.
@@ -123,6 +124,17 @@ pub const N_WINDOW_BATCH: usize = 4;
 /// four of those windows fit the batch of 2048. The budget of 1024 comes from
 /// Google.
 pub const BUDGET_TOKENS: usize = 1024;
+
+/// One window of a model call: its text and its media files.
+///
+/// The text carries one marker for each media file, in the same order.
+#[derive(Clone, Debug, Default)]
+pub struct WindowIn {
+    /// The marker text of the window.
+    pub text: String,
+    /// The media files in the order the model reads them: the frames first.
+    pub media: Vec<PathBuf>,
+}
 
 pub struct Embedder {
     backend: LlamaBackend,
@@ -286,20 +298,78 @@ impl Embedder {
         self.embed_image_in(&mut ctx, frame)
     }
 
+    /// Embed several windows in one model call. One vector for each window.
+    ///
+    /// Every window takes its own sequence, so the pooled vector of a window
+    /// holds the tokens of that window alone. The text and the media of a
+    /// window share its sequence for the same reason. The answer follows the
+    /// order of the call.
+    pub fn embed_windows_in(
+        &self,
+        ctx: &mut LlamaContext<'_>,
+        windows: &[WindowIn],
+    ) -> Result<Vec<Vec<f32>>> {
+        if windows.is_empty() {
+            bail!("a batch holds no window");
+        }
+        if windows.len() > N_WINDOW_BATCH {
+            bail!(
+                "the batch holds {} windows, above the limit of {N_WINDOW_BATCH}",
+                windows.len()
+            );
+        }
+        ctx.clear_kv_cache();
+
+        let n_embd_inp = unsafe { sys::llama_model_n_embd_inp(self.model.as_ptr()) };
+        if n_embd_inp <= 0 {
+            bail!("the model reports no input embedding size");
+        }
+        let n_embd_inp = n_embd_inp as usize;
+
+        let batch = unsafe { sys::llama_batch_ext_init(ctx.as_ptr()) };
+        if batch.is_null() {
+            bail!("llama_batch_ext_init returned null");
+        }
+        let mrope = multi_axis_rope(self.model.as_ptr());
+        let mut pos = vec![0 as sys::llama_pos; windows.len()];
+        let mut filled = Ok(());
+        for (at, window) in windows.iter().enumerate() {
+            let held = self.fill_window(window, at as sys::llama_seq_id, batch, n_embd_inp, mrope, &mut pos[at]);
+            if let Err(err) = held {
+                filled = Err(err);
+                break;
+            }
+        }
+        let raw = match filled {
+            Ok(()) => unsafe {
+                sys::llama_process(ctx.as_ptr(), sys::LLAMA_PROCESS_TYPE_DECODE, batch);
+                (0..windows.len())
+                    .map(|seq| pooled_seq(ctx, seq as sys::llama_seq_id))
+                    .collect::<Result<Vec<Vec<f32>>>>()
+            },
+            Err(err) => Err(err),
+        };
+        unsafe { sys::llama_batch_ext_free(batch) };
+
+        let mut out = Vec::with_capacity(windows.len());
+        for one in raw? {
+            out.push(unit(&one)?);
+        }
+        Ok(out)
+    }
+
     /// Embed one image in a caller-owned context.
     pub fn embed_image_in(&self, ctx: &mut LlamaContext<'_>, frame: &Path) -> Result<Vec<f32>> {
-        ctx.clear_kv_cache();
-        let path = frame.to_str().context("frame path is not utf8")?;
-        let bitmap = MtmdBitmap::from_file(&self.mtmd, path, false)?;
-        self.embed_joint(ctx, &[bitmap])
+        let window = WindowIn {
+            text: mtmd_default_marker().to_string(),
+            media: vec![frame.to_path_buf()],
+        };
+        Ok(self.embed_windows_in(ctx, &[window])?.remove(0))
     }
 
     /// Embed one audio clip in a caller-owned context.
     pub fn embed_audio_in(&self, ctx: &mut LlamaContext<'_>, clip: &Path) -> Result<Vec<f32>> {
-        ctx.clear_kv_cache();
-        let path = clip.to_str().context("audio path is not utf8")?;
-        let bitmap = MtmdBitmap::from_file(&self.mtmd, path, false)?;
-        self.embed_joint(ctx, &[bitmap])
+        self.embed_image_in(ctx, clip)
     }
 
     /// Embed several media files as one window, in the given order.
@@ -315,54 +385,37 @@ impl Embedder {
         if media.is_empty() {
             bail!("a window holds no media");
         }
-        ctx.clear_kv_cache();
-        let mut bitmaps = Vec::with_capacity(media.len());
-        for path in media {
+        let window = WindowIn {
+            text: mtmd_default_marker().repeat(media.len()),
+            media: media.iter().map(|path| path.to_path_buf()).collect(),
+        };
+        Ok(self.embed_windows_in(ctx, &[window])?.remove(0))
+    }
+
+    /// Add every token and every media row of one window to the batch.
+    ///
+    /// The window takes its own sequence, so its pooled vector holds its own
+    /// entries alone. The text of the window goes to the tokenizer on its own,
+    /// because one shared text gives the first window a start token and the
+    /// last window a trailing text piece, and those two windows then differ
+    /// from the same window read on its own.
+    fn fill_window(
+        &self,
+        window: &WindowIn,
+        seq: sys::llama_seq_id,
+        batch: *mut sys::llama_batch_ext,
+        n_embd_inp: usize,
+        mrope: bool,
+        pos: &mut sys::llama_pos,
+    ) -> Result<()> {
+        let mut bitmaps = Vec::with_capacity(window.media.len());
+        for path in &window.media {
             let path = path.to_str().context("media path is not utf8")?;
             bitmaps.push(MtmdBitmap::from_file(&self.mtmd, path, false)?);
         }
-        self.embed_joint(ctx, &bitmaps)
-    }
-
-    /// One batch holds every token and every media row. One decode follows.
-    fn embed_joint(&self, ctx: &mut LlamaContext<'_>, bitmaps: &[MtmdBitmap]) -> Result<Vec<f32>> {
         let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
-        let input = MtmdInputText {
-            text: mtmd_default_marker().repeat(refs.len()),
-            add_special: true,
-            parse_special: true,
-        };
-        let chunks = self.mtmd.tokenize(input, &refs)?;
-
-        let n_embd_inp = unsafe { sys::llama_model_n_embd_inp(self.model.as_ptr()) };
-        if n_embd_inp <= 0 {
-            bail!("the model reports no input embedding size");
-        }
-        let n_embd_inp = n_embd_inp as usize;
-
-        let batch = unsafe { sys::llama_batch_ext_init(ctx.as_ptr()) };
-        if batch.is_null() {
-            bail!("llama_batch_ext_init returned null");
-        }
-        let filled = self.fill_batch(ctx, &chunks, batch, n_embd_inp);
-        let raw = match filled {
-            Ok(()) => unsafe { pooled(ctx) },
-            Err(err) => Err(err),
-        };
-        unsafe { sys::llama_batch_ext_free(batch) };
-        unit(&raw?)
-    }
-
-    /// Add every chunk to the batch. Text adds tokens. Media adds embedding rows.
-    fn fill_batch(
-        &self,
-        ctx: &LlamaContext<'_>,
-        chunks: &MtmdInputChunks,
-        batch: *mut sys::llama_batch_ext,
-        n_embd_inp: usize,
-    ) -> Result<()> {
+        let chunks = self.tokenize(&window.text, &refs)?;
         let n_chunks = unsafe { sys::mtmd_input_chunks_size(chunks.as_ptr()) };
-        let mut pos: sys::llama_pos = 0;
 
         for i in 0..n_chunks {
             let chunk = unsafe { sys::mtmd_input_chunks_get(chunks.as_ptr(), i) };
@@ -379,7 +432,9 @@ impl Embedder {
                 }
                 for t in 0..count {
                     let id = unsafe { *tokens.add(t) };
-                    self.push(batch, TokenOrRows::Token(id), n_embd_inp, &mut pos)?;
+                    // A text token carries one position, at any rope type.
+                    self.push(batch, seq, TokenOrRows::Token(id), n_embd_inp, &[*pos])?;
+                    *pos += 1;
                 }
             } else {
                 let rc = unsafe { sys::mtmd_encode_chunk(self.mtmd.as_ptr(), chunk) };
@@ -391,52 +446,91 @@ impl Embedder {
                 if data.is_null() {
                     bail!("chunk {i} produced no embedding rows");
                 }
+                let base = *pos;
                 for t in 0..n_tokens {
                     let row = unsafe { data.add(t * n_embd_inp) };
-                    self.push(batch, TokenOrRows::Rows(row), n_embd_inp, &mut pos)?;
+                    let at = media_pos(chunk, kind, base, t, mrope);
+                    let width = if mrope { 4 } else { 1 };
+                    self.push(batch, seq, TokenOrRows::Rows(row), n_embd_inp, &at[..width])?;
                 }
-                // Media chunks can carry more positions than tokens. Text does not.
+                // A media chunk covers positions of its own, and the count can
+                // pass its token count. The next chunk starts after that count.
                 let n_pos = unsafe { sys::mtmd_input_chunk_get_n_pos(chunk) };
-                if n_pos > n_tokens as sys::llama_pos {
-                    pos = pos + (n_pos - n_tokens as sys::llama_pos);
-                }
+                *pos = base + n_pos.max(n_tokens as sys::llama_pos);
             }
-        }
-
-        let rc = unsafe { sys::llama_process(ctx.as_ptr(), sys::LLAMA_PROCESS_TYPE_DECODE, batch) };
-        if rc != 0 {
-            bail!("llama_process failed with code {rc}");
         }
         Ok(())
     }
 
+    /// Add one item to the batch, on the sequence of the window that owns it.
+    ///
+    /// The positions hold one value for each rotary section of the model. An
+    /// embedding entry reads every value of the slice.
     fn push(
         &self,
         batch: *mut sys::llama_batch_ext,
+        seq: sys::llama_seq_id,
         item: TokenOrRows,
         n_embd_inp: usize,
-        pos: &mut sys::llama_pos,
+        pos: &[sys::llama_pos],
     ) -> Result<()> {
         unsafe {
             let idx = match item {
-                TokenOrRows::Token(id) => sys::llama_batch_ext_add_token(batch, 0, id),
+                TokenOrRows::Token(id) => sys::llama_batch_ext_add_token(batch, seq, id),
                 TokenOrRows::Rows(data) => {
                     let embd = sys::llama_embd {
                         data,
                         n_rows: 1,
                         n_embd: n_embd_inp,
                     };
-                    sys::llama_batch_ext_add_embd(batch, 0, embd)
+                    sys::llama_batch_ext_add_embd(batch, seq, embd)
                 }
             };
             if idx < 0 {
                 bail!("the batch rejected an entry with code {idx}");
             }
-            sys::llama_batch_ext_set_pos(batch, idx, pos);
-            *pos += 1;
+            sys::llama_batch_ext_set_pos(batch, idx, pos.as_ptr());
         }
         Ok(())
     }
+}
+
+/// True when the model reads more than one rotary position for one embedding.
+fn multi_axis_rope(model: *const sys::llama_model) -> bool {
+    let kind = unsafe { sys::llama_model_rope_type(model) };
+    kind == sys::LLAMA_ROPE_TYPE_MROPE || kind == sys::LLAMA_ROPE_TYPE_IMROPE
+}
+
+/// The positions of one media row, in the order of the rotary sections.
+///
+/// One value serves every section of a model with one rotary position. A model
+/// with multi-axis rotary positions reads four sections. An image row then
+/// takes its place in the picture grid, and any other media row takes the
+/// running position.
+fn media_pos(
+    chunk: *const sys::mtmd_input_chunk,
+    kind: sys::mtmd_input_chunk_type,
+    base: sys::llama_pos,
+    row: usize,
+    mrope: bool,
+) -> [sys::llama_pos; 4] {
+    let at = base + row as sys::llama_pos;
+    if !mrope {
+        return [at, 0, 0, 0];
+    }
+    if kind == sys::MTMD_INPUT_CHUNK_TYPE_IMAGE {
+        let tokens = unsafe { sys::mtmd_input_chunk_get_tokens_image(chunk) };
+        if !tokens.is_null() {
+            let grid = unsafe { sys::mtmd_image_tokens_get_decoder_pos(tokens, base, row) };
+            return [
+                grid.t as sys::llama_pos,
+                grid.y as sys::llama_pos,
+                grid.x as sys::llama_pos,
+                grid.z as sys::llama_pos,
+            ];
+        }
+    }
+    [at, at, at, at]
 }
 
 enum TokenOrRows {
@@ -444,11 +538,11 @@ enum TokenOrRows {
     Rows(*const f32),
 }
 
-/// Copy the pooled vector of sequence 0.
-unsafe fn pooled(ctx: &LlamaContext<'_>) -> Result<Vec<f32>> {
-    let out = unsafe { sys::llama_get_embeddings_seq(ctx.as_ptr(), 0) };
+/// Copy the pooled vector of one sequence.
+unsafe fn pooled_seq(ctx: &LlamaContext<'_>, seq: sys::llama_seq_id) -> Result<Vec<f32>> {
+    let out = unsafe { sys::llama_get_embeddings_seq(ctx.as_ptr(), seq) };
     if out.is_null() {
-        bail!("the context returned no pooled embedding");
+        bail!("sequence {seq} returned no pooled embedding");
     }
     let n_out = unsafe { sys::llama_model_n_embd_out(ctx.model.as_ptr()) };
     if n_out <= 0 {
@@ -457,7 +551,6 @@ unsafe fn pooled(ctx: &LlamaContext<'_>) -> Result<Vec<f32>> {
     Ok(unsafe { std::slice::from_raw_parts(out, n_out as usize) }.to_vec())
 }
 
-/// Scale a vector to unit length.
 /// The time of one frame or clip as `MM:SS`.
 ///
 /// The seconds round down, so a part at 3.75 s reads `00:03`, the second that
@@ -481,6 +574,7 @@ pub fn window_text(times: &[f64]) -> String {
         .join(" ")
 }
 
+/// Scale a vector to unit length.
 pub fn unit(raw: &[f32]) -> Result<Vec<f32>> {
     let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm <= 0.0 {

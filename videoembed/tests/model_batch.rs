@@ -77,6 +77,63 @@ fn parts_text(parts: usize) -> String {
         .join(" ")
 }
 
+/// Four windows of one plan, from the start of the video.
+fn object_windows(frames: &[PathBuf], clips: &[PathBuf], plan: &plan::Plan) -> Vec<embed::WindowIn> {
+    let rate = plan.frame_rate();
+    (0..embed::N_WINDOW_BATCH)
+        .map(|at| {
+            let from = at as f64 * plan.stride;
+            let parts = index::frames_in(frames, from, plan.window, rate);
+            let window_clips = index::clips_in(clips, from, plan.window);
+            let times = index::window_times(from, rate, parts.len(), window_clips.len());
+            let mut media = parts;
+            media.extend(window_clips);
+            embed::WindowIn {
+                text: embed::window_text(&times),
+                media,
+            }
+        })
+        .collect()
+}
+
+/// Four windows in one call give the same vectors as one at a time.
+///
+/// This is the gate of the window batch. A vector that moves with the batch
+/// size is worthless, because the search then reads one vector for a window
+/// and the record holds another.
+#[test]
+fn one_batch_of_four_matches_four_calls_of_one() {
+    let Some((embedder, _guard)) = the_model() else {
+        eprintln!("skipped: the model is not here");
+        return;
+    };
+    let Some(video) = video() else {
+        eprintln!("skipped: the test video is not here");
+        return;
+    };
+    let dir = scratch("parity");
+    let (frames, clips) = one_second_cut(&video, &dir);
+    let plan = plan::Plan::of(plan::Preset::Object);
+    let windows = object_windows(&frames, &clips, &plan);
+    assert_eq!(windows.len(), embed::N_WINDOW_BATCH);
+
+    let mut ctx = embedder.new_context().expect("the context is made");
+    let together = embedder
+        .embed_windows_in(&mut ctx, &windows)
+        .expect("the batch comes back");
+    assert_eq!(together.len(), embed::N_WINDOW_BATCH);
+
+    for (at, window) in windows.iter().enumerate() {
+        let alone = embedder
+            .embed_windows_in(&mut ctx, std::slice::from_ref(window))
+            .expect("one window comes back");
+        let cos = embed::dot(&together[at], &alone[0]);
+        println!("window {at}: cosine {cos}");
+        assert!(cos > 0.999, "window {at} moved with the batch: cosine {cos}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The token count of the Object window, and the room of a full batch.
 ///
 /// The numbers pin `N_UBATCH` and `BUDGET_TOKENS`. The count comes from the
