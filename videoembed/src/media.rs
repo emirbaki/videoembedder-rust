@@ -199,8 +199,38 @@ pub fn source_file(video: &Path, media: &Path) -> Result<PathBuf> {
     progressive_copy(video, media)
 }
 
-/// True when an MP4 holds fragmented media. Filled in by a later task.
-pub fn is_fragmented_mp4(_path: &Path) -> Result<bool> {
+/// True when an MP4 holds fragmented media.
+///
+/// The walk reads the top level boxes. A fragmented file holds one `moof` box
+/// for each fragment, and a plain file holds none. A file that is not an MP4
+/// falls out of the walk and reads as plain.
+pub fn is_fragmented_mp4(path: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let len = file.metadata()?.len();
+    let mut at = 0u64;
+    while at + 8 <= len {
+        file.seek(SeekFrom::Start(at))?;
+        let mut head = [0u8; 8];
+        if file.read_exact(&mut head).is_err() {
+            return Ok(false);
+        }
+        let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as u64;
+        if &head[4..8] == b"moof" {
+            return Ok(true);
+        }
+        let step = match size {
+            0 => len - at,
+            1 => 16,
+            _ => size,
+        };
+        if step < 8 {
+            return Ok(false);
+        }
+        at += step;
+    }
     Ok(false)
 }
 
@@ -411,6 +441,40 @@ mod tests {
         let dir = scratch("missing");
         assert!(cut_frames(Path::new("no_such_video.mp4"), 4.0, &dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fragmented MP4 holds a `moof` box, and a plain MP4 does not.
+    #[test]
+    fn the_fragment_check_reads_the_boxes() {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        }
+        assert!(!is_fragmented_mp4(&video).unwrap());
+
+        let dir = scratch("fragmented");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fragmented = dir.join("frag.mp4");
+        let made = Command::new(FFMPEG)
+            .args(["-y", "-i"])
+            .arg(&video)
+            .args(["-t", "2", "-c", "copy", "-movflags", "frag_keyframe+empty_moov"])
+            .arg(&fragmented)
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        assert!(is_fragmented_mp4(&fragmented).unwrap());
+    }
+
+    /// A file that is not an MP4 holds no box, and it reads as plain.
+    #[test]
+    fn a_short_file_reads_as_plain() {
+        let dir = scratch("short_file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tiny.mp4");
+        std::fs::write(&file, b"not a real mp4").unwrap();
+        assert!(!is_fragmented_mp4(&file).unwrap());
     }
 
     /// A thumbnail is a JPEG, and the bytes start with the JPEG marker.
