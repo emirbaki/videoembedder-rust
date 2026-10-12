@@ -4,7 +4,7 @@
 //! go into one batch, so that one pooling step covers the whole item.
 
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use llama_cpp_2::context::LlamaContext;
@@ -113,6 +113,17 @@ fn context_params() -> LlamaContextParams {
         .with_n_ubatch(N_UBATCH)
 }
 
+/// The windows in one model call.
+pub const N_WINDOW_BATCH: usize = 4;
+
+/// The token count that one window may hold before it loses its audio.
+///
+/// The count of one window comes from the tokenizer, never from a guess. The
+/// Object window of the test video measures 257 tokens over four parts, and
+/// four of those windows fit the batch of 2048. The budget of 1024 comes from
+/// Google.
+pub const BUDGET_TOKENS: usize = 1024;
+
 pub struct Embedder {
     backend: LlamaBackend,
     device: Device,
@@ -216,6 +227,35 @@ impl Embedder {
     /// True when this machine can put layers on a card.
     pub fn supports_gpu(&self) -> bool {
         gpu_available(&self.backend)
+    }
+
+    /// Tokenize the text of one window with its media.
+    ///
+    /// The text carries one marker for each bitmap, in the same order.
+    fn tokenize(&self, text: &str, media: &[&MtmdBitmap]) -> Result<MtmdInputChunks> {
+        let input = MtmdInputText {
+            text: text.to_string(),
+            add_special: true,
+            parse_special: true,
+        };
+        Ok(self.mtmd.tokenize(input, media)?)
+    }
+
+    /// The number of tokens that one window costs, as the tokenizer counts it.
+    ///
+    /// The count comes from the model, so a budget check uses the real number.
+    pub fn tokens_of(&self, text: &str, media: &[PathBuf]) -> Result<usize> {
+        if media.is_empty() {
+            bail!("a window holds no media");
+        }
+        let mut bitmaps = Vec::with_capacity(media.len());
+        for path in media {
+            let path = path.to_str().context("media path is not utf8")?;
+            bitmaps.push(MtmdBitmap::from_file(&self.mtmd, path, false)?);
+        }
+        let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+        let chunks = self.tokenize(text, &refs)?;
+        Ok(chunks.total_tokens())
     }
 
     /// Embed one text. Returns a unit vector.
