@@ -45,6 +45,8 @@ enum Job {
     Videos(Sender<Vec<VideoRow>>),
     /// Stop the running index job. The answer says whether one ran.
     StopIndex { answer: Sender<bool> },
+    /// Hold or release the running index job. The answer names the new state.
+    SetPause { answer: Sender<Result<bool, JobError>> },
     Holds {
         path: String,
         answer: Sender<bool>,
@@ -203,6 +205,11 @@ struct Removed {
 #[derive(Serialize)]
 struct Stopping {
     stopping: bool,
+}
+
+#[derive(Serialize)]
+struct Paused {
+    paused: bool,
 }
 
 #[derive(Serialize)]
@@ -546,6 +553,7 @@ fn engine_loop(
     progress: Arc<Mutex<Progress>>,
     key: String,
     jobs: Receiver<Job>,
+    paused: Arc<AtomicBool>,
 ) {
     let mut ctx = match embedder.new_context() {
         Ok(ctx) => ctx,
@@ -557,13 +565,15 @@ fn engine_loop(
     let mut pending: Option<WebJob> = None;
     let stopped = Arc::new(AtomicBool::new(false));
     loop {
-        let request = if pending.is_some() {
+        // A paused job waits on the channel, so the loop spins on no item.
+        let request = if pending.is_some() && !paused.load(Ordering::Relaxed) {
             let done = step_job(
                 &embedder,
                 &mut ctx,
                 &mut store,
                 &progress,
                 &stopped,
+                &paused,
                 pending.as_mut().unwrap(),
             );
             if done {
@@ -571,7 +581,7 @@ fn engine_loop(
             }
             let mut held = None;
             while let Ok(job) = jobs.try_recv() {
-                if let Some(next) = handle(job, &embedder, &mut store, &progress, &key, &stopped, &mut pending) {
+                if let Some(next) = handle(job, &embedder, &mut store, &progress, &key, &stopped, &paused, &mut pending) {
                     match held {
                         // One load at a time. The loop holds one request.
                         Some(_) => next.refuse(),
@@ -582,7 +592,7 @@ fn engine_loop(
             held
         } else {
             match jobs.recv() {
-                Ok(job) => handle(job, &embedder, &mut store, &progress, &key, &stopped, &mut pending),
+                Ok(job) => handle(job, &embedder, &mut store, &progress, &key, &stopped, &paused, &mut pending),
                 Err(_) => break,
             }
         };
@@ -662,6 +672,7 @@ fn handle(
     progress: &Arc<Mutex<Progress>>,
     key: &str,
     stopped: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     pending: &mut Option<WebJob>,
 ) -> Option<Switch> {
     match job {
@@ -688,16 +699,25 @@ fn handle(
             let _ = answer.send(search(embedder, store, &query, path.as_deref()));
         }
         Job::StartIndex { folder, answer } => {
-            let _ = answer.send(start_index(progress, pending, stopped, &folder));
+            let _ = answer.send(start_index(progress, pending, stopped, paused, &folder));
         }
         Job::StopIndex { answer } => {
             let running = pending.is_some();
+            // A stop ends a pause too, because a paused job never reads the
+            // stop flag.
+            paused.store(false, Ordering::Relaxed);
+            progress.lock().unwrap().paused = false;
             stopped.store(true, Ordering::Relaxed);
             let _ = answer.send(running);
         }
+        Job::SetPause { answer } => {
+            let _ = answer.send(toggle_pause(pending.is_some(), paused, progress));
+        }
         Job::SetPlan { path, plan, answer } => {
             let media = store.media_dir();
-            let _ = answer.send(start_plan(progress, pending, stopped, &path, plan, &media));
+            let _ = answer.send(start_plan(
+                progress, pending, stopped, paused, &path, plan, &media,
+            ));
         }
         Job::SetDevice { device, answer } => {
             // The loop owns the model, so the load happens there.
@@ -752,6 +772,7 @@ fn start_index(
     progress: &Arc<Mutex<Progress>>,
     pending: &mut Option<WebJob>,
     flag: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     folder: &Path,
 ) -> Result<usize, JobError> {
     refuse_when_busy(pending)?;
@@ -770,6 +791,7 @@ fn start_index(
     }
     let count = files.len();
     flag.store(false, Ordering::Relaxed);
+    paused.store(false, Ordering::Relaxed);
     {
         let mut held = progress.lock().unwrap();
         // The model state belongs to the server, not to this job. Hold it,
@@ -808,6 +830,7 @@ fn start_plan(
     progress: &Arc<Mutex<Progress>>,
     pending: &mut Option<WebJob>,
     flag: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     path: &str,
     plan: videoembed::plan::Plan,
     media: &Path,
@@ -823,6 +846,7 @@ fn start_plan(
     let run = index::IndexRun::start_with(&video, &plan, media).map_err(JobError::from)?;
     let total = run.total();
     flag.store(false, Ordering::Relaxed);
+    paused.store(false, Ordering::Relaxed);
     let label = normalize_label(path);
     {
         let mut held = progress.lock().unwrap();
@@ -874,19 +898,25 @@ fn step_job(
     store: &mut Store,
     progress: &Arc<Mutex<Progress>>,
     flag: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     job: &mut WebJob,
 ) -> bool {
+    if hold_when_paused(paused, progress) {
+        // The job keeps its place and its cut files. The model waits on no job,
+        // so the pause costs nothing after the current window ends.
+        return false;
+    }
     if flag.load(Ordering::Relaxed) {
         // Drop the partial work of this video. A half-indexed video reads as a
         // whole one on the next search.
         job.run = None;
         job.records.clear();
-        progress.lock().unwrap().running = false;
+        end_job(progress);
         return true;
     }
     if job.run.is_none() {
         if job.file_at >= job.files.len() {
-            progress.lock().unwrap().running = false;
+            end_job(progress);
             return true;
         }
         let video = job.files[job.file_at].clone();
@@ -961,7 +991,7 @@ fn step_job(
         job.run = None;
         job.file_at += 1;
         if job.file_at >= job.files.len() {
-            progress.lock().unwrap().running = false;
+            end_job(progress);
             return true;
         }
     } else {
@@ -998,6 +1028,43 @@ fn begin_file(progress: &Arc<Mutex<Progress>>, label: String, number: usize, tot
 
 fn fail(progress: &Arc<Mutex<Progress>>, err: &anyhow::Error) {
     progress.lock().unwrap().error = Some(format!("{err:#}"));
+}
+
+/// Hold or release the running job. A job that does not run refuses the call.
+///
+/// The page sends one call for each press. The flag holds the state, and the
+/// board carries the state to the page.
+fn toggle_pause(
+    running: bool,
+    held: &Arc<AtomicBool>,
+    progress: &Arc<Mutex<Progress>>,
+) -> Result<bool, JobError> {
+    if !running {
+        return Err(JobError::Message("no job runs".to_string()));
+    }
+    let next = !held.load(Ordering::Relaxed);
+    held.store(next, Ordering::Relaxed);
+    progress.lock().unwrap().paused = next;
+    Ok(next)
+}
+
+/// True when the pause holds the job.
+///
+/// A paused job keeps its place and its cut files. The caller returns without
+/// work, and the loop waits for the next request.
+fn hold_when_paused(flag: &Arc<AtomicBool>, progress: &Arc<Mutex<Progress>>) -> bool {
+    if !flag.load(Ordering::Relaxed) {
+        return false;
+    }
+    progress.lock().unwrap().paused = true;
+    true
+}
+
+/// End the running job, and clear its pause.
+fn end_job(progress: &Arc<Mutex<Progress>>) {
+    let mut held = progress.lock().unwrap();
+    held.running = false;
+    held.paused = false;
 }
 
 fn handle_request(
@@ -1311,6 +1378,20 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
                 Err(_) => request.respond(error_reply(500, "the engine stopped"))?,
             }
         }
+        (true, "/api/pause") => {
+            let (answer, wait) = channel();
+            let _ = jobs.send(Job::SetPause { answer });
+            match wait.recv() {
+                Ok(Ok(paused)) => request.respond(json_reply(&Paused { paused }))?,
+                Ok(Err(JobError::Message(message))) => {
+                    request.respond(error_reply(400, &message))?
+                }
+                Ok(Err(JobError::Busy)) => {
+                    request.respond(error_reply(409, "an index job already runs"))?
+                }
+                Err(_) => request.respond(error_reply(500, "the engine stopped"))?,
+            }
+        }
         (true, "/api/quit") => {
             let _ = request.respond(json_reply(&Stopping { stopping: true }));
             std::thread::sleep(Duration::from_millis(200));
@@ -1334,6 +1415,10 @@ fn main() -> Result<()> {
 
     let engine_progress = Arc::clone(&progress);
     let engine_key = key.clone();
+    // The pause flag lives with the engine. The page reads the state from
+    // the progress answer.
+    let paused = Arc::new(AtomicBool::new(false));
+    let engine_paused = Arc::clone(&paused);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         let embedder = match Embedder::load(&models, None) {
@@ -1362,7 +1447,15 @@ fn main() -> Result<()> {
             println!("Imported {} records from the old store.", store.imported);
         }
         let _ = ready_tx.send(Ok(()));
-        engine_loop(embedder, models, store, engine_progress, engine_key, jobs_rx);
+        engine_loop(
+            embedder,
+            models,
+            store,
+            engine_progress,
+            engine_key,
+            jobs_rx,
+            engine_paused,
+        );
     });
 
     match ready_rx.recv().context("the engine thread stopped early")? {
@@ -1730,6 +1823,7 @@ mod tests {
         };
         let progress = Arc::new(Mutex::new(Progress::default()));
         let flag = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let mut pending = None;
 
         let media = std::env::temp_dir().join(format!("vei_web_plan_media_{}", std::process::id()));
@@ -1737,6 +1831,7 @@ mod tests {
             &progress,
             &mut pending,
             &flag,
+            &paused,
             &video.to_string_lossy(),
             videoembed::plan::Plan::of(videoembed::plan::Preset::Speech),
             &media,
@@ -1787,5 +1882,97 @@ mod tests {
     fn an_empty_plan_body_is_refused() {
         let body: PlanBody = serde_json::from_str(r#"{"path":"a.mp4"}"#).unwrap();
         assert!(body.plan().is_err());
+    }
+
+    /// The page reads the paused state from the progress answer.
+    ///
+    /// A reloaded page takes the state from this answer, so the button reads
+    /// Resume after the reload.
+    #[test]
+    fn the_progress_answer_carries_the_paused_state() {
+        let stopped = Progress {
+            running: true,
+            paused: false,
+            ..Progress::default()
+        };
+        let paused = Progress {
+            running: true,
+            paused: true,
+            ..Progress::default()
+        };
+
+        let json = serde_json::to_string(&stopped).unwrap();
+        assert!(json.contains("\"paused\":false"), "got {json}");
+        let json = serde_json::to_string(&paused).unwrap();
+        assert!(json.contains("\"paused\":true"), "got {json}");
+    }
+
+    /// A pause request needs a running job.
+    #[test]
+    fn a_job_that_does_not_run_refuses_a_pause() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let board = Arc::new(Mutex::new(Progress::default()));
+
+        let outcome = toggle_pause(false, &flag, &board);
+
+        assert!(
+            matches!(outcome, Err(JobError::Message(_))),
+            "the call must refuse a job that does not run"
+        );
+        assert!(!flag.load(Ordering::Relaxed), "the flag stays clear");
+    }
+
+    /// One call holds the job, and the next call lets it run again.
+    #[test]
+    fn a_pause_toggles_the_flag_and_the_board() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let board = Arc::new(Mutex::new(Progress {
+            running: true,
+            ..Progress::default()
+        }));
+
+        let first = toggle_pause(true, &flag, &board).unwrap();
+        assert!(first, "the first call holds the job");
+        assert!(board.lock().unwrap().paused, "the page reads the state");
+
+        let second = toggle_pause(true, &flag, &board).unwrap();
+        assert!(!second, "the second call lets it run");
+        assert!(!board.lock().unwrap().paused, "the page reads the state");
+    }
+
+    /// The gate holds a paused job, and it shows the state on the board.
+    #[test]
+    fn a_paused_job_waits_at_the_gate() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let board = Arc::new(Mutex::new(Progress {
+            running: true,
+            ..Progress::default()
+        }));
+
+        assert!(!hold_when_paused(&flag, &board), "a clear flag holds nothing");
+        assert!(!board.lock().unwrap().paused);
+
+        flag.store(true, Ordering::Relaxed);
+        assert!(hold_when_paused(&flag, &board), "a set flag holds the job");
+        assert!(board.lock().unwrap().paused, "the page reads the state");
+    }
+
+    /// The end of a job clears the pause with it.
+    ///
+    /// A pause that outlives its job leaves a job that advances on no item, and
+    /// the page shows a job that runs forever.
+    #[test]
+    fn the_end_of_a_job_clears_the_pause() {
+        let board = Arc::new(Mutex::new(Progress {
+            running: true,
+            paused: true,
+            ..Progress::default()
+        }));
+
+        end_job(&board);
+
+        let held = board.lock().unwrap();
+        assert!(!held.running, "the job ends");
+        assert!(!held.paused, "the pause goes with it");
     }
 }

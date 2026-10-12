@@ -82,6 +82,8 @@ const VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mkv", "mov", "avi", "webm"];
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
     pub running: bool,
+    /// True when the running job waits for a resume.
+    pub paused: bool,
     pub folder: String,
     pub file: String,
     pub file_index: usize,
