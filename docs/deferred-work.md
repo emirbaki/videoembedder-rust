@@ -36,8 +36,8 @@ re-cut it. Change the plan of that video to take the new default.
 Plan B landed on 2026-10-12 on the `window-batch` branch. It answered the
 window batch, the timestamp text, and the audio token budget.
 
-Plan C waits on the `search-job` branch for its merge. It answered the merged
-moment, the pause and the resume, and the reconcile pass.
+Plan C landed on 2026-10-13. It answered the merged moment, the pause and the
+resume, and the reconcile pass.
 
 ## 1. Features that wait
 
