@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS videos (
   plan_stride  REAL NOT NULL DEFAULT 0.25,
   plan_frames  INTEGER NOT NULL DEFAULT 1,
   plan_audio   INTEGER NOT NULL DEFAULT 1,
+  plan_fine    INTEGER NOT NULL DEFAULT 0,
   source_size  INTEGER,
   source_mtime INTEGER,
   done         INTEGER NOT NULL DEFAULT 0
@@ -90,11 +91,14 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
             names.push(row?);
         }
     }
-    if names.iter().any(|name| name == "plan_mode") {
-        return Ok(());
+    if !names.iter().any(|name| name == "plan_mode") {
+        conn.execute_batch("alter table videos add column plan_mode TEXT NOT NULL DEFAULT 'fine'")
+            .context("add the plan_mode column")?;
     }
-    conn.execute_batch("alter table videos add column plan_mode TEXT NOT NULL DEFAULT 'fine'")
-        .context("add the plan_mode column")?;
+    if !names.iter().any(|name| name == "plan_fine") {
+        conn.execute_batch("alter table videos add column plan_fine INTEGER NOT NULL DEFAULT 0")
+            .context("add the plan_fine column")?;
+    }
     Ok(())
 }
 
