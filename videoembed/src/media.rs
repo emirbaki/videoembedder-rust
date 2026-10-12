@@ -234,9 +234,56 @@ pub fn is_fragmented_mp4(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Rewrite a fragmented MP4 as a progressive MP4. Filled in by a later task.
-pub fn progressive_copy(_video: &Path, _media: &Path) -> Result<PathBuf> {
-    bail!("no copy yet")
+/// The name of the progressive copy of one video.
+///
+/// The name holds the source name and a hash of the full path, so two videos
+/// with one name in two folders do not share a copy.
+fn copy_name(video: &Path) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in video.to_string_lossy().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let stem = video
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .unwrap_or("video");
+    format!("{stem}_{hash:016x}.mp4")
+}
+
+/// True when the copy exists and it is not older than its source.
+fn copy_is_fresh(copy: &Path, video: &Path) -> bool {
+    let (Ok(copied), Ok(source)) = (copy.metadata(), video.metadata()) else {
+        return false;
+    };
+    let (Ok(copied), Ok(source)) = (copied.modified(), source.modified()) else {
+        return false;
+    };
+    copied >= source
+}
+
+/// Rewrite a fragmented MP4 as a progressive MP4, and give back the copy.
+///
+/// A copy that is not older than its source stands, so a re-cut skips the
+/// rewrite. The copy holds the same streams, and the index run reads it.
+pub fn progressive_copy(video: &Path, media: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(media)?;
+    let copy = media.join(copy_name(video));
+    if copy_is_fresh(&copy, video) {
+        return Ok(copy);
+    }
+    let args = vec![
+        "-y".into(),
+        "-i".into(),
+        video.to_string_lossy().to_string(),
+        "-c".into(),
+        "copy".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        copy.to_string_lossy().to_string(),
+    ];
+    run_ffmpeg(args, "rewriting a fragmented mp4")?;
+    Ok(copy)
 }
 
 /// Cut every frame of a video at `rate` frames a second.
@@ -475,6 +522,70 @@ mod tests {
         let file = dir.join("tiny.mp4");
         std::fs::write(&file, b"not a real mp4").unwrap();
         assert!(!is_fragmented_mp4(&file).unwrap());
+    }
+
+    /// Make a fragmented copy of the test clip, for the copy tests.
+    fn fragmented_clip(name: &str) -> Option<PathBuf> {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            return None;
+        }
+        let dir = scratch(name);
+        std::fs::create_dir_all(&dir).ok()?;
+        let fragmented = dir.join("frag.mp4");
+        let made = Command::new(FFMPEG)
+            .args(["-y", "-i"])
+            .arg(&video)
+            .args(["-t", "2", "-c", "copy", "-movflags", "frag_keyframe+empty_moov"])
+            .arg(&fragmented)
+            .output()
+            .ok()?;
+        made.status.success().then_some(fragmented)
+    }
+
+    /// The copy is progressive, it holds the same media, and a second call
+    /// reuses it.
+    #[test]
+    fn a_fragmented_video_takes_one_progressive_copy() {
+        let Some(fragmented) = fragmented_clip("copy_source") else {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        };
+        let media = scratch("copy_media");
+        let copy = progressive_copy(&fragmented, &media).unwrap();
+        assert!(copy.exists());
+        assert!(copy.starts_with(&media));
+        assert!(!is_fragmented_mp4(&copy).unwrap());
+        assert!(probe_duration(&copy).unwrap() > 0.0);
+
+        // A second call gives the same file, and it does not copy again.
+        let before = std::fs::metadata(&copy).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let again = progressive_copy(&fragmented, &media).unwrap();
+        assert_eq!(again, copy);
+        let after = std::fs::metadata(&again).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// A stale copy is made again.
+    #[test]
+    fn a_stale_copy_is_made_again() {
+        let Some(fragmented) = fragmented_clip("stale_source") else {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        };
+        let media = scratch("stale_media");
+        let copy = progressive_copy(&fragmented, &media).unwrap();
+        let first = std::fs::metadata(&copy).unwrap().modified().unwrap();
+
+        // A newer source makes the copy stale.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let bytes = std::fs::read(&fragmented).unwrap();
+        std::fs::write(&fragmented, bytes).unwrap();
+
+        let again = progressive_copy(&fragmented, &media).unwrap();
+        let second = std::fs::metadata(&again).unwrap().modified().unwrap();
+        assert!(second > first);
     }
 
     /// A thumbnail is a JPEG, and the bytes start with the JPEG marker.
