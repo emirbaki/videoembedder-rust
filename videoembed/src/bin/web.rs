@@ -638,6 +638,12 @@ fn engine_loop(
         };
 
         if let Some(Switch::SetDevice { device, answer }) = request {
+            if !needs_load(device, embedder.device()) {
+                // The model already runs here. A second load costs seconds and
+                // gives the same table.
+                let _ = answer.send(Ok(device.as_str().to_string()));
+                continue;
+            }
             let started = std::time::Instant::now();
             // The new model loads before the old one leaves, so a failure
             // keeps the server on the device it had.
@@ -680,6 +686,14 @@ fn engine_loop(
             }
         }
     }
+}
+
+/// True when a device change needs a model load.
+///
+/// A pick of the device already in use costs seconds and gives the same
+/// answer, so the server answers at once.
+fn needs_load(wanted: Device, in_use: Device) -> bool {
+    wanted != in_use
 }
 
 /// A change that the engine loop must make itself.
@@ -1980,6 +1994,14 @@ mod tests {
         assert!(PAGE.contains(r#"id="plan-fine""#));
         assert!(JS.contains(r#"$("plan-fine").checked"#));
         assert!(JS.contains("fine: $(\"plan-fine\").checked"));
+    }
+
+    /// A pick of the device in use needs no model load.
+    #[test]
+    fn a_pick_of_the_device_in_use_needs_no_load() {
+        assert!(!needs_load(Device::Cpu, Device::Cpu));
+        assert!(!needs_load(Device::Gpu, Device::Gpu));
+        assert!(needs_load(Device::Cpu, Device::Gpu));
     }
 
     /// The page reads the paused state from the progress answer.
