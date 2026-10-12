@@ -188,6 +188,40 @@ pub fn cut_audio(video: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(kept)
 }
 
+/// The average luma of the frame at one time, from the signalstats filter.
+///
+/// The filter writes its numbers as metadata, so `metadata=print:file=-` puts
+/// them on the standard output. A time past the end of the video gives a fault,
+/// because the filter then reports nothing.
+pub fn luma(video: &Path, at: f64) -> Result<f64> {
+    let args = vec![
+        "-y".into(),
+        "-ss".into(),
+        format!("{at}"),
+        "-i".into(),
+        video.to_string_lossy().to_string(),
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        "signalstats,metadata=print:file=-".into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ];
+    let out = Command::new(FFMPEG)
+        .args(&args)
+        .output()
+        .context("run ffmpeg for the luma")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.contains("lavfi.signalstats.YAVG="));
+    let value = line
+        .and_then(|line| line.split('=').nth(1))
+        .and_then(|value| value.trim().parse::<f64>().ok());
+    value.with_context(|| format!("no luma came from {} at {at} s", video.display()))
+}
+
 /// The file to cut: the video itself, or its progressive copy.
 ///
 /// A fragmented MP4 seeks badly, so the index run reads a copy. The copy goes
@@ -586,6 +620,51 @@ mod tests {
         let again = progressive_copy(&fragmented, &media).unwrap();
         let second = std::fs::metadata(&again).unwrap().modified().unwrap();
         assert!(second > first);
+    }
+
+    /// One clip of a flat colour, for the luma tests.
+    fn flat_clip(color: &str, name: &str) -> Option<PathBuf> {
+        if !ready() {
+            return None;
+        }
+        let dir = scratch(name);
+        std::fs::create_dir_all(&dir).ok()?;
+        let file = dir.join("flat.mp4");
+        let made = Command::new(FFMPEG)
+            .args(["-y", "-f", "lavfi", "-i"])
+            .arg(format!("color=c={color}:s=64x64:d=2"))
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&file)
+            .output()
+            .ok()?;
+        made.status.success().then_some(file)
+    }
+
+    /// A black frame gives a low luma, and a white frame a high one.
+    #[test]
+    fn the_luma_reads_a_flat_frame() {
+        let Some(black) = flat_clip("black", "luma_black") else {
+            eprintln!("skipped: ffmpeg is missing");
+            return;
+        };
+        let Some(white) = flat_clip("white", "luma_white") else {
+            eprintln!("skipped: ffmpeg is missing");
+            return;
+        };
+        // A black frame in the television range measures 16, and a white one
+        // measures 235. The two bounds below tell the two apart.
+        assert!(luma(&black, 0.5).unwrap() < 20.0);
+        assert!(luma(&white, 0.5).unwrap() > 200.0);
+    }
+
+    /// A time past the end gives a fault, and not a silent zero.
+    #[test]
+    fn a_luma_past_the_end_faults() {
+        let Some(black) = flat_clip("black", "luma_short") else {
+            eprintln!("skipped: ffmpeg is missing");
+            return;
+        };
+        assert!(luma(&black, 60.0).is_err());
     }
 
     /// A thumbnail is a JPEG, and the bytes start with the JPEG marker.
