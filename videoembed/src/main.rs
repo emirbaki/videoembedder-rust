@@ -252,7 +252,10 @@ fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
         println!("{note}");
     }
     let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
-    let records = index::index_video(embedder, &video, &plan, &media, &mut report)?;
+    let (records, notes) = index::index_video(embedder, &video, &plan, &media, &mut report)?;
+    for line in &notes {
+        println!("{line}");
+    }
     let count = records.len();
     store.forget(&label)?;
     store.append(records)?;
@@ -313,7 +316,10 @@ fn plan(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
         println!("{note}");
     }
     let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
-    let count = index::reindex(embedder, store, &path, &wanted, &mut report)?;
+    let (count, notes) = index::reindex(embedder, store, &path, &wanted, &mut report)?;
+    for line in &notes {
+        println!("{line}");
+    }
     println!("Indexed {count} records.");
     Ok(())
 }

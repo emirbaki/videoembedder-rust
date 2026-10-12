@@ -128,9 +128,14 @@ fn index_fine(embedder: &Embedder, video: &Path) -> Result<Vec<(f64, f64, Vec<f3
     let mut run = index::IndexRun::start(video)?;
     let mut ctx = embedder.new_context()?;
     let mut out = Vec::new();
-    while let Some(record) = run.step(embedder, &mut ctx)? {
-        if record.kind == KIND_FRAME {
-            out.push((record.start as f64, record.end as f64, record.vec));
+    while let Ok(records) = run.step(embedder, &mut ctx) {
+        if records.is_empty() {
+            break;
+        }
+        for record in records {
+            if record.kind == KIND_FRAME {
+                out.push((record.start as f64, record.end as f64, record.vec));
+            }
         }
     }
     Ok(out)

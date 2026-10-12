@@ -171,3 +171,43 @@ fn the_object_window_sits_under_the_batch_limit() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The run indexes every window of the test video through one batch path.
+///
+/// This is the end-to-end pin. It costs about one minute on the CPU build,
+/// because the video holds 29 windows.
+#[test]
+fn the_run_indexes_every_window_of_the_test_video() {
+    let Some((embedder, _guard)) = the_model() else {
+        eprintln!("skipped: the model is not here");
+        return;
+    };
+    let Some(video) = video() else {
+        eprintln!("skipped: the test video is not here");
+        return;
+    };
+    let media = scratch("index_media");
+    let plan = plan::Plan::of(plan::Preset::Object);
+    let duration = media::probe_duration(&video).expect("the duration comes back");
+    let want = plan.window_starts(duration).len();
+
+    let mut report = |_made: usize, _total: usize| {};
+    let (records, notes) = index::index_video(embedder, &video, &plan, &media, &mut report)
+        .expect("the run ends");
+
+    assert_eq!(records.len(), want, "one record for each window");
+    assert!(notes.is_empty(), "the Object window holds the budget: {notes:?}");
+    assert!(
+        records.iter().all(|record| !record.vec.is_empty()),
+        "every record holds a vector"
+    );
+    for pair in records.windows(2) {
+        assert!(pair[1].start > pair[0].start, "the windows come in time order");
+    }
+    // The last windows reach past the audio track, so they hold frames alone.
+    assert!(
+        records.last().unwrap().start as f64 > 20.0,
+        "the fixture covers the audio end"
+    );
+    let _ = std::fs::remove_dir_all(&media);
+}

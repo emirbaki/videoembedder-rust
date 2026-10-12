@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use llama_cpp_2::context::LlamaContext;
 use serde::Serialize;
 
-use crate::embed::Embedder;
+use crate::embed::{self, Embedder, N_WINDOW_BATCH};
 use crate::media;
 use crate::store::{self, NewRecord, Record};
 
@@ -259,6 +259,30 @@ enum Phase {
     Done,
 }
 
+/// One window of a group: its media, the time of each part, and its frames.
+///
+/// The files hold the frames first, then the clips. The times sit in the same
+/// order, so the marker of a part names the time of that part.
+#[derive(Clone, Debug, Default)]
+pub struct WindowPart {
+    /// The start of the window in the video.
+    pub start: f64,
+    /// The media files of the window, the frames first.
+    pub files: Vec<PathBuf>,
+    /// The time of each part, in the order of the files.
+    pub times: Vec<f64>,
+    /// The number of frames at the front of the files.
+    pub frames: usize,
+}
+
+impl WindowPart {
+    /// Drop the audio of this window. The frames stay.
+    pub fn keep_frames(&mut self) {
+        self.files.truncate(self.frames);
+        self.times.truncate(self.frames);
+    }
+}
+
 /// A stepwise index run for one video.
 ///
 /// The run cuts media in batches, so the temp disk stays bounded. The caller
@@ -287,6 +311,10 @@ pub struct IndexRun {
     plan: crate::plan::Plan,
     /// The start of every window. Empty in fine mode.
     windows: Vec<f64>,
+    /// The windows of the current model call. Empty in fine mode.
+    group: Vec<WindowPart>,
+    /// The lines that the run reported, in order.
+    notes: Vec<String>,
 }
 
 impl IndexRun {
@@ -339,6 +367,8 @@ impl IndexRun {
             window_at: 0,
             plan: crate::plan::Plan::of(crate::plan::Preset::Fine),
             windows: Vec::new(),
+            group: Vec::new(),
+            notes: Vec::new(),
         })
     }
 
@@ -397,6 +427,8 @@ impl IndexRun {
             window_at: 0,
             plan: *plan,
             windows,
+            group: Vec::new(),
+            notes: Vec::new(),
         })
     }
 
@@ -413,20 +445,31 @@ impl IndexRun {
         self.done
     }
 
-    /// Embed one item. Returns None when the run is complete.
+    /// The lines that the run reported, in order.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Embed the next model call. Returns the records of that call.
+    ///
+    /// Window mode reads up to `N_WINDOW_BATCH` windows in one call, so it
+    /// gives up to that many records. Fine mode gives one.
     pub fn step(
         &mut self,
         embedder: &Embedder,
         ctx: &mut LlamaContext<'_>,
-    ) -> Result<Option<NewRecord>> {
+    ) -> Result<Vec<NewRecord>> {
         if self.phase == Phase::Done {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         if self.remaining_in_batch() == 0 {
             self.cut_batch()?;
             if self.phase == Phase::Done {
-                return Ok(None);
+                return Ok(Vec::new());
             }
+        }
+        if self.phase == Phase::Windows {
+            return self.step_group(embedder, ctx);
         }
         let local = self.at() - self.batch_from;
         let path = self.files[local].clone();
@@ -442,25 +485,60 @@ impl IndexRun {
                 start + AUDIO_SECONDS,
                 embedder.embed_audio_in(ctx, &path)?,
             ),
-            Phase::Windows => {
-                let refs: Vec<&Path> = self.files.iter().map(|file| file.as_path()).collect();
-                (
-                    store::KIND_WINDOW,
-                    start + self.plan.window,
-                    embedder.embed_window_in(ctx, &refs)?,
-                )
-            }
-            Phase::Done => unreachable!(),
+            Phase::Windows | Phase::Done => unreachable!(),
         };
         self.advance();
         self.done += 1;
-        Ok(Some(NewRecord {
+        Ok(vec![NewRecord {
             kind,
             label: self.label.clone(),
             start: start as f32,
             end: end.min(self.duration) as f32,
             vec,
-        }))
+        }])
+    }
+
+    /// Embed the loaded group of windows in one model call.
+    fn step_group(
+        &mut self,
+        embedder: &Embedder,
+        ctx: &mut LlamaContext<'_>,
+    ) -> Result<Vec<NewRecord>> {
+        let parts = std::mem::take(&mut self.group);
+        let windows: Vec<embed::WindowIn> = parts
+            .iter()
+            .map(|part| embed::WindowIn {
+                text: embed::window_text(&part.times),
+                media: part.files.clone(),
+            })
+            .collect();
+        let vecs = embedder.embed_windows_in(ctx, &windows)?;
+        if vecs.len() != parts.len() {
+            bail!(
+                "the model gave {} vectors for {} windows",
+                vecs.len(),
+                parts.len()
+            );
+        }
+
+        let mut out = Vec::with_capacity(parts.len());
+        for (part, vec) in parts.iter().zip(vecs) {
+            out.push(NewRecord {
+                kind: store::KIND_WINDOW,
+                label: self.label.clone(),
+                start: part.start as f32,
+                end: (part.start + self.plan.window).min(self.duration) as f32,
+                vec,
+            });
+        }
+
+        let made = out.len();
+        self.window_at += made;
+        self.done += made;
+        if self.window_at >= self.windows.len() {
+            self.phase = Phase::Done;
+        }
+        Ok(out)
     }
 
     fn at(&self) -> usize {
@@ -478,9 +556,8 @@ impl IndexRun {
 
     fn remaining_in_batch(&self) -> usize {
         if self.phase == Phase::Windows {
-            // One window is one batch. The media of the window is ready, or it
-            // is not, and either way one item is ready.
-            return usize::from(!self.files.is_empty());
+            // One group of windows fills one model call, so one item is ready.
+            return usize::from(!self.group.is_empty());
         }
         self.files.len().saturating_sub(self.at() - self.batch_from)
     }
@@ -507,29 +584,31 @@ impl IndexRun {
                     self.phase = Phase::Done;
                 }
             }
-            Phase::Windows => {
-                self.window_at += 1;
-                self.files.clear();
-                self.batch_from = 0;
-                if self.window_at >= self.windows.len() {
-                    self.phase = Phase::Done;
-                }
-            }
-            Phase::Done => {}
+            // Window mode advances a whole group, in `step_group`.
+            Phase::Windows | Phase::Done => {}
         }
     }
 
-    /// The media of one window, as a slice of the whole-video cut.
-    ///
-    /// The frames and the clips of the window keep the order that the embedder
-    /// reads: the frames first, then the audio.
-    fn window_files(&self) -> Vec<PathBuf> {
-        let at = self.window_at;
-        let from = self.windows[at];
+    /// The next group of windows, up to one model call of them.
+    fn window_group(&self) -> Vec<WindowPart> {
         let rate = self.plan.frame_rate();
-        let mut files = frames_in(&self.frames_cut, from, self.plan.window, rate);
-        files.extend(clips_in(&self.clips_cut, from, self.plan.window));
-        files
+        let end = (self.window_at + N_WINDOW_BATCH).min(self.windows.len());
+        (self.window_at..end)
+            .map(|at| {
+                let from = self.windows[at];
+                let mut files = frames_in(&self.frames_cut, from, self.plan.window, rate);
+                let frames = files.len();
+                let clips = clips_in(&self.clips_cut, from, self.plan.window);
+                let times = window_times(from, rate, frames, clips.len());
+                files.extend(clips);
+                WindowPart {
+                    start: from,
+                    files,
+                    times,
+                    frames,
+                }
+            })
+            .collect()
     }
 
     /// Cut every frame and every clip of the video, one time.
@@ -568,14 +647,13 @@ impl IndexRun {
         }
         self.cut_media()?;
         if self.phase == Phase::Windows {
-            self.files = self.window_files();
-            self.batch_from = self.at();
-            if self.files.is_empty() {
-                bail!(
-                    "no media came from the window at {} s",
-                    self.windows[self.window_at]
-                );
+            let group = self.window_group();
+            if group.first().map_or(true, |part| part.files.is_empty()) {
+                // The plan asks for a window that the cut does not hold.
+                let at = self.windows.get(self.window_at).copied().unwrap_or_default();
+                bail!("no media came from the window at {at} s");
             }
+            self.group = group;
             return Ok(());
         }
         // Fine mode slices the whole-video cut by item, because one frame sits
@@ -617,6 +695,7 @@ impl IndexRun {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
         self.files.clear();
+        self.group.clear();
         self.frames_cut.clear();
         self.clips_cut.clear();
     }
@@ -630,24 +709,29 @@ impl Drop for IndexRun {
 
 /// Index one video under one plan. Embed every item of the plan.
 ///
-/// The callback runs after each record with the number made so far, counting
-/// from 1, and the record count of the whole video.
+/// The callback runs after each model call with the number of records made so
+/// far and the record count of the whole video. The answer holds the records
+/// and the lines that the run reported.
 pub fn index_video(
     embedder: &Embedder,
     video: &Path,
     plan: &crate::plan::Plan,
     media: &Path,
     on_step: &mut dyn FnMut(usize, usize),
-) -> Result<Vec<NewRecord>> {
+) -> Result<(Vec<NewRecord>, Vec<String>)> {
     let mut run = IndexRun::start_with(video, plan, media)?;
     let total = run.total();
     let mut ctx = embedder.new_context()?;
     let mut records = Vec::with_capacity(total);
-    while let Some(record) = run.step(embedder, &mut ctx)? {
-        records.push(record);
+    loop {
+        let made = run.step(embedder, &mut ctx)?;
+        if made.is_empty() {
+            break;
+        }
+        records.extend(made);
         on_step(run.done(), total);
     }
-    Ok(records)
+    Ok((records, run.notes().to_vec()))
 }
 
 /// Cut one video again under a new plan.
@@ -661,7 +745,7 @@ pub fn reindex(
     path: &str,
     plan: &crate::plan::Plan,
     on_step: &mut dyn FnMut(usize, usize),
-) -> Result<usize> {
+) -> Result<(usize, Vec<String>)> {
     let video = Path::new(path);
     if !video.is_file() {
         bail!("{} is not a file", video.display());
@@ -670,11 +754,11 @@ pub fn reindex(
     let label = store::normalize_label(path);
     store.set_plan(&label, plan)?;
     store.clear_records(&label)?;
-    let records = index_video(embedder, video, plan, &media, on_step)?;
+    let (records, notes) = index_video(embedder, video, plan, &media, on_step)?;
     let count = records.len();
     store.append(records)?;
     store.mark_done(&label)?;
-    Ok(count)
+    Ok((count, notes))
 }
 
 /// The items of one job for each second.
@@ -1204,6 +1288,8 @@ mod tests {
             window_at: 0,
             plan: plan::Plan::of(plan::Preset::Fine),
             windows: Vec::new(),
+            group: Vec::new(),
+            notes: Vec::new(),
         };
 
         for _ in 0..run.frames.len() {
@@ -1489,7 +1575,7 @@ mod tests {
         assert_eq!(run.frames_cut.len(), 30);
         assert_eq!(run.clips_cut.len(), 24);
         // One window of the Object plan holds two frames and two clips.
-        assert_eq!(run.files.len(), 4);
+        assert_eq!(run.group[0].files.len(), 4);
     }
 
     /// A window past the end of the audio holds the frames alone.
@@ -1506,7 +1592,83 @@ mod tests {
         // The audio stream ends at 23.1 s, so the window at 28 s holds no clip.
         run.window_at = 28;
         run.cut_batch().unwrap();
-        assert_eq!(run.files.len(), 2);
+        assert_eq!(run.group[0].files.len(), 2);
+    }
+
+    /// One model call reads four windows.
+    #[test]
+    fn the_run_takes_four_windows_at_a_time() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("group_media");
+        let plan = plan::Plan::of(plan::Preset::Object);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+
+        run.cut_batch().unwrap();
+
+        assert_eq!(run.group.len(), N_WINDOW_BATCH);
+        assert_eq!(run.group[0].frames, 2, "the Object window holds two frames");
+        assert_eq!(run.group[0].files.len(), 4, "two frames and two clips");
+        assert_eq!(run.group[0].times.len(), run.group[0].files.len());
+        assert_eq!(run.remaining_in_batch(), 1, "one group is one model call");
+    }
+
+    /// The last group holds the windows that remain.
+    #[test]
+    fn the_last_group_holds_the_windows_that_remain() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("tail_media");
+        let plan = plan::Plan::of(plan::Preset::Object);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+        let total = run.total();
+        assert!(total % N_WINDOW_BATCH != 0, "the fixture divides by four here");
+        run.window_at = total - 1;
+
+        run.cut_batch().unwrap();
+
+        assert_eq!(run.group.len(), 1, "the tail holds one window");
+        assert_eq!(run.group[0].start, run.windows[total - 1]);
+    }
+
+    /// A video that holds fewer windows than one group gives one group.
+    #[test]
+    fn a_short_video_gives_one_group() {
+        let Some(video) = spike_video_short() else {
+            return;
+        };
+        let media = scratch("short_media");
+        let plan = plan::Plan::of(plan::Preset::Object);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+
+        assert!(run.total() < N_WINDOW_BATCH, "the fixture is short here");
+        run.cut_batch().unwrap();
+        assert_eq!(run.group.len(), run.total());
+    }
+
+    /// A window past the cut names itself, and the run does not panic.
+    #[test]
+    fn a_window_past_the_cut_reports_the_window() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("cut_short_media");
+        let plan = plan::Plan::of(plan::Preset::Object);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+        run.cut_batch().unwrap();
+        // The stream claims more media than the cut holds.
+        run.frames_cut.truncate(4);
+        run.clips_cut.clear();
+        run.window_at = 10;
+
+        let err = run.cut_batch().unwrap_err();
+
+        assert!(
+            err.to_string().contains("no media came from the window"),
+            "got {err}"
+        );
     }
 
     /// The fine run cuts the whole video one time, and it keeps its record count.
@@ -1672,13 +1834,13 @@ mod tests {
         // The cut of the first window must not fail, and the window must hold
         // the frames alone. The media cut needs no model.
         run.cut_batch().unwrap();
-        assert!(!run.files.is_empty(), "the window holds its frames");
+        let files = &run.group[0].files;
+        assert!(!files.is_empty(), "the window holds its frames");
         assert!(
-            run.files
+            files
                 .iter()
                 .all(|path| path.extension().is_some_and(|e| e == "jpg")),
-            "a silent video gives frames alone: {:?}",
-            run.files
+            "a silent video gives frames alone: {files:?}"
         );
         run.clear_media();
     }

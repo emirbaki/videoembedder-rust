@@ -863,8 +863,8 @@ fn start_plan(
 /// A finished video takes the finished mark, and the mark keeps it out of
 /// every later run. A run that failed part way holds a partial answer, so it
 /// takes no mark and the next run indexes the video again.
-fn run_left_a_whole_index(outcome: &Result<Option<NewRecord>>) -> bool {
-    matches!(outcome, Ok(None))
+fn run_left_a_whole_index(outcome: &Result<Vec<NewRecord>>) -> bool {
+    matches!(outcome, Ok(records) if records.is_empty())
 }
 
 /// One media item of work. True means the whole job has finished or stopped.
@@ -926,15 +926,17 @@ fn step_job(
 
     let outcome = job.run.as_mut().unwrap().step(embedder, ctx);
     let whole = run_left_a_whole_index(&outcome);
-    let mut finished = false;
-    match outcome {
-        Ok(Some(record)) => job.records.push(record),
-        Ok(None) => finished = true,
+    let finished = match outcome {
+        Ok(records) => {
+            let empty = records.is_empty();
+            job.records.extend(records);
+            empty
+        }
         Err(err) => {
             fail(progress, &err);
-            finished = true;
+            true
         }
-    }
+    };
 
     if finished {
         let records = std::mem::take(&mut job.records);
@@ -1633,15 +1635,18 @@ mod tests {
     /// part way must leave no mark. The video then indexes again.
     #[test]
     fn only_a_run_that_reached_its_end_is_whole() {
-        let more_work = Ok(Some(NewRecord {
+        let more_work = Ok(vec![NewRecord {
             kind: videoembed::store::KIND_FRAME,
             label: "a.mp4".to_string(),
             start: 0.0,
             end: 0.25,
             vec: unit(),
-        }));
+        }]);
         assert!(!run_left_a_whole_index(&more_work), "the run is not finished");
-        assert!(run_left_a_whole_index(&Ok(None)), "the run reached its end");
+        assert!(
+            run_left_a_whole_index(&Ok(Vec::new())),
+            "the run reached its end"
+        );
         assert!(
             !run_left_a_whole_index(&Err(anyhow!("a broken frame"))),
             "a failed run holds a partial answer"
