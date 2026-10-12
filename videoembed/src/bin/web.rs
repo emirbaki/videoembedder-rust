@@ -90,6 +90,18 @@ impl From<anyhow::Error> for JobError {
     }
 }
 
+/// The reply for a failed device switch, as a code and a line.
+///
+/// A switch fails for one reason: the model will not load on that device. That
+/// fault belongs to the server, so the code is 500. A busy engine is the one
+/// exception, and it answers 409.
+fn switch_reply(err: JobError) -> (u16, String) {
+    match err {
+        JobError::Busy => (409, "an index job already runs".to_string()),
+        JobError::Message(message) => (500, message),
+    }
+}
+
 #[derive(Serialize)]
 struct State {
     version: String,
@@ -1280,11 +1292,9 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
             let _ = jobs.send(Job::SetDevice { device, answer });
             match wait.recv() {
                 Ok(Ok(device)) => request.respond(json_reply(&DeviceName { device }))?,
-                Ok(Err(JobError::Busy)) => {
-                    request.respond(error_reply(409, "an index job already runs"))?
-                }
-                Ok(Err(JobError::Message(message))) => {
-                    request.respond(error_reply(400, &message))?
+                Ok(Err(err)) => {
+                    let (code, message) = switch_reply(err);
+                    request.respond(error_reply(code, &message))?
                 }
                 Err(_) => request.respond(error_reply(500, "the engine stopped"))?,
             }
@@ -2012,5 +2022,20 @@ mod tests {
         let held = board.lock().unwrap();
         assert!(!held.running, "the job ends");
         assert!(!held.paused, "the pause goes with it");
+    }
+
+    /// A failed load is a fault of the server, and a busy engine is not.
+    ///
+    /// The page shows the code, and a person reads 400 as a bad request. A
+    /// model that will not load on the card is not the fault of the caller.
+    #[test]
+    fn a_failed_load_answers_500_and_a_busy_switch_answers_409() {
+        let (code, message) = switch_reply(JobError::Busy);
+        assert_eq!(code, 409);
+        assert!(!message.is_empty(), "the page shows a line");
+
+        let (code, message) = switch_reply(JobError::Message("the card is out of memory".to_string()));
+        assert_eq!(code, 500, "a load fault belongs to the server");
+        assert_eq!(message, "the card is out of memory");
     }
 }
