@@ -179,18 +179,42 @@ pub fn audio_starts(duration: f64) -> Vec<f64> {
     plan
 }
 
+/// The index of the first frame of one span, in the whole-video cut.
+///
+/// The cut gives frame `n` at `n / rate`, so this index names the time of the
+/// first frame of the span.
+fn first_frame(from: f64, rate: f64) -> usize {
+    (from * rate).round().max(0.0) as usize
+}
+
+/// The index after the last frame of one span, in the whole-video cut.
+fn last_frame(from: f64, window: f64, rate: f64) -> usize {
+    ((from + window) * rate).round().max(0.0) as usize
+}
+
 /// The frames of one span, from the list of a whole-video cut.
 ///
 /// Frame `i` of the list sits at `i / rate`, and the span `[from, from + window)`
 /// takes the frames inside it. A span that runs past the list takes what is left.
 pub fn frames_in(cut: &[PathBuf], from: f64, window: f64, rate: f64) -> Vec<PathBuf> {
-    let first = (from * rate).round().max(0.0) as usize;
-    let last = ((from + window) * rate).round().max(0.0) as usize;
-    let end = last.min(cut.len());
+    let first = first_frame(from, rate);
+    let end = last_frame(from, window, rate).min(cut.len());
     if first >= end {
         return Vec::new();
     }
     cut[first..end].to_vec()
+}
+
+/// The time of every media part of one window.
+///
+/// The frames come first, then the clips, in the order the embedder reads them.
+/// A frame sits at its own place in the cut, so these times match the files
+/// that `frames_in` gives. A clip sits at the second that it covers.
+pub fn window_times(from: f64, rate: f64, frames: usize, clips: usize) -> Vec<f64> {
+    let first = first_frame(from, rate);
+    let mut times: Vec<f64> = (0..frames).map(|i| (first + i) as f64 / rate).collect();
+    times.extend((0..clips).map(|k| from.floor() + k as f64));
+    times
 }
 
 /// The clips of one span, from the list of a whole-video cut.
@@ -830,6 +854,42 @@ pub fn thin_indexes(records: &[Record], factor: usize) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::plan;
+
+    /// The parts of one window carry the time of each part.
+    ///
+    /// The frames come first, then the clips, in the order the embedder reads
+    /// them. A frame sits at its own place in the cut, and a clip sits at the
+    /// second that it covers.
+    #[test]
+    fn the_part_times_of_a_window_name_each_part() {
+        // The example of the spec: a 2 s window at 3 s, one frame a second.
+        assert_eq!(window_times(3.0, 1.0, 2, 1), vec![3.0, 4.0, 3.0]);
+        // Four frames a second sit at the quarter steps of the cut.
+        assert_eq!(
+            window_times(3.0, 4.0, 4, 2),
+            vec![3.0, 3.25, 3.5, 3.75, 3.0, 4.0]
+        );
+    }
+
+    /// A window past the end of the audio track holds frames alone.
+    ///
+    /// The marker count then equals the frame count, so the model reads one
+    /// marker for each part it gets.
+    #[test]
+    fn a_window_without_audio_holds_frame_times_alone() {
+        assert_eq!(window_times(23.0, 1.0, 2, 0), vec![23.0, 24.0]);
+        assert_eq!(window_times(0.0, 1.0, 0, 0), Vec::<f64>::new());
+    }
+
+    /// The times of a window follow the files that the cut gives back.
+    #[test]
+    fn the_part_times_match_the_files_of_the_window() {
+        let cut: Vec<PathBuf> = (0..8).map(|i| PathBuf::from(format!("f{i}.jpg"))).collect();
+        let files = frames_in(&cut, 1.0, 1.0, 4.0);
+        let times = window_times(1.0, 4.0, 4, 0);
+        assert_eq!(files.len(), times.len());
+        assert_eq!(times, vec![1.0, 1.25, 1.5, 1.75]);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vei_test_{}_{name}", std::process::id()));

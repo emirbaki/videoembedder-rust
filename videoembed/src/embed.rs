@@ -458,6 +458,29 @@ unsafe fn pooled(ctx: &LlamaContext<'_>) -> Result<Vec<f32>> {
 }
 
 /// Scale a vector to unit length.
+/// The time of one frame or clip as `MM:SS`.
+///
+/// The seconds round down, so a part at 3.75 s reads `00:03`, the second that
+/// holds that part. The minutes pass 59 for a long video, because a video here
+/// can hold more than one hour of media.
+pub fn mmss(at: f64) -> String {
+    let seconds = at.max(0.0).floor() as u64;
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// The text of one window: one `MM:SS` marker before each media part.
+///
+/// The marker names the start time of its part, so the model reads the order
+/// of the events and not only the pictures. The count of the markers always
+/// matches the count of the media parts.
+pub fn window_text(times: &[f64]) -> String {
+    times
+        .iter()
+        .map(|at| format!("{} {}", mmss(*at), mtmd_default_marker()))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
 pub fn unit(raw: &[f32]) -> Result<Vec<f32>> {
     let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm <= 0.0 {
@@ -474,6 +497,48 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The marker text of one window names each part with `MM:SS`.
+    #[test]
+    fn the_window_text_names_every_part() {
+        // The example of the spec: a 2 s window at 3 s, two frames and a clip.
+        assert_eq!(
+            window_text(&[3.0, 4.0, 3.0]),
+            "00:03 <__media__> 00:04 <__media__> 00:03 <__media__>"
+        );
+    }
+
+    /// One marker for one media part, and no marker for no part.
+    #[test]
+    fn the_marker_count_matches_the_part_count() {
+        assert_eq!(window_text(&[7.0]).matches(mtmd_default_marker()).count(), 1);
+        assert_eq!(
+            window_text(&[7.0, 7.0, 7.0])
+                .matches(mtmd_default_marker())
+                .count(),
+            3
+        );
+        assert_eq!(window_text(&[]), "");
+    }
+
+    /// The seconds round down, so a part reads the second that holds it.
+    #[test]
+    fn a_part_reads_the_second_that_holds_it() {
+        assert_eq!(mmss(0.0), "00:00");
+        assert_eq!(mmss(3.0), "00:03");
+        assert_eq!(mmss(3.75), "00:03");
+        assert_eq!(mmss(59.999), "00:59");
+        assert_eq!(mmss(-1.0), "00:00");
+    }
+
+    /// An hour of video keeps a readable time.
+    #[test]
+    fn a_long_video_still_reads_as_minutes_and_seconds() {
+        assert_eq!(mmss(60.0), "01:00");
+        assert_eq!(mmss(600.0), "10:00");
+        assert_eq!(mmss(3600.0), "60:00");
+        assert_eq!(mmss(3661.0), "61:01");
+    }
 
     /// The console, the page, and the JSON field use these two names.
     #[test]
