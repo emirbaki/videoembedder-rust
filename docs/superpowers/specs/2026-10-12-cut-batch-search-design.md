@@ -3,7 +3,8 @@
 Date: 2026-10-12
 Status: approved. The user settled the four open decisions on 2026-10-12.
 Plan A: `docs/superpowers/plans/2026-10-12-cut-pass.md`.
-Plans B and C wait for their own plan document.
+Plan B: `docs/superpowers/plans/2026-10-12-window-batch.md`.
+Plan C waits for its own plan document.
 
 Sources:
 

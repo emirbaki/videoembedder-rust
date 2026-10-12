@@ -20,13 +20,17 @@ the window 21.0-23.0 s with a score of 0.78.
    one second audio clip.
 2. A window takes its own frames and clips from that one cut, so a window costs
    no further ffmpeg call.
-3. The model reads the frames, the audio, and a text marker in one batch.
-4. One decode runs, and one pooling step produces one vector for the window.
+3. The model reads four windows in one call. Each window holds its frames, its
+   audio, and a `MM:SS` marker before each part.
+4. One decode runs, and one pooling step gives one vector for each window.
 5. The vector goes into a store. A query embeds the same way and ranks the store
    by cosine similarity.
 
 Step 3 is the important part. The model sees the whole window at once. A
-separate decode for each part would pool only the last part.
+separate decode for each part would pool only the last part. Four windows share
+one call, and each window holds its own sequence, so the vectors do not move
+with the size of the batch. A window above 1024 tokens loses its audio, and the
+run reports that window on one line.
 
 Two steps keep the picture right. A fragmented MP4 is rewritten one time into a
 progressive copy, and the run reads that copy. A still near the opening steps
