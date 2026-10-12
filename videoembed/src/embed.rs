@@ -23,7 +23,12 @@ pub const DOC_PREFIX: &str = "title: none | text: ";
 
 const N_CTX: u32 = 8192;
 const N_BATCH: u32 = 8192;
-const N_UBATCH: u32 = 2048;
+/// The largest micro batch. The encoder refuses a batch above this limit.
+///
+/// One model call holds four windows, and the budget allows 1024 tokens for
+/// one window, so the worst call holds 4096 tokens. The measured Object window
+/// holds 257 tokens, and four of them hold 1028.
+const N_UBATCH: u32 = 4096;
 
 /// Offload every layer of the text model to the GPU.
 ///

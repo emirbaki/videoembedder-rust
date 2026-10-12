@@ -93,6 +93,8 @@ pub struct Progress {
     pub elapsed_ms: u64,
     /// The items of the running job for each second.
     pub per_second: f32,
+    /// The newest line of the running job. Empty when the job reports nothing.
+    pub note: String,
 }
 
 /// One matching item inside a video.
@@ -281,6 +283,18 @@ impl WindowPart {
         self.files.truncate(self.frames);
         self.times.truncate(self.frames);
     }
+}
+
+/// The line about one window that lost its audio to the token budget.
+///
+/// The run reports every such window, so the reader learns why the record
+/// holds no sound.
+pub fn budget_note(start: f64, tokens: usize) -> String {
+    format!(
+        "window at {start:.1} s holds {tokens} tokens, above the budget of {}, \
+         so the record keeps the frames alone",
+        embed::BUDGET_TOKENS
+    )
 }
 
 /// A stepwise index run for one video.
@@ -504,7 +518,19 @@ impl IndexRun {
         embedder: &Embedder,
         ctx: &mut LlamaContext<'_>,
     ) -> Result<Vec<NewRecord>> {
-        let parts = std::mem::take(&mut self.group);
+        let mut parts = std::mem::take(&mut self.group);
+        for part in &mut parts {
+            if part.files.len() == part.frames {
+                // A window with no audio cannot lose anything.
+                continue;
+            }
+            let text = embed::window_text(&part.times);
+            let count = embedder.tokens_of(&text, &part.files)?;
+            if count > embed::BUDGET_TOKENS {
+                part.keep_frames();
+                self.notes.push(budget_note(part.start, count));
+            }
+        }
         let windows: Vec<embed::WindowIn> = parts
             .iter()
             .map(|part| embed::WindowIn {
@@ -1593,6 +1619,41 @@ mod tests {
         run.window_at = 28;
         run.cut_batch().unwrap();
         assert_eq!(run.group[0].files.len(), 2);
+    }
+
+    /// The rule of one window, in words, for the reader.
+    #[test]
+    fn the_budget_note_names_the_window_and_the_count() {
+        assert_eq!(
+            budget_note(3.0, 1500),
+            "window at 3.0 s holds 1500 tokens, above the budget of 1024, \
+             so the record keeps the frames alone"
+        );
+    }
+
+    /// A window that passes the budget keeps its frames and drops its clips.
+    #[test]
+    fn a_window_that_passes_the_budget_keeps_its_frames() {
+        let mut part = WindowPart {
+            start: 3.0,
+            files: vec![
+                PathBuf::from("f0.jpg"),
+                PathBuf::from("f1.jpg"),
+                PathBuf::from("a0.wav"),
+                PathBuf::from("a1.wav"),
+            ],
+            times: vec![3.0, 4.0, 3.0, 4.0],
+            frames: 2,
+        };
+
+        part.keep_frames();
+
+        assert_eq!(part.frames, 2);
+        assert_eq!(part.times, vec![3.0, 4.0], "the markers follow the media");
+        for file in &part.files {
+            let name = file.to_string_lossy();
+            assert!(name.ends_with(".jpg"), "{name} is not a frame");
+        }
     }
 
     /// One model call reads four windows.

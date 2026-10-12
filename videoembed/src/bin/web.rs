@@ -972,6 +972,12 @@ fn step_job(
         held.indexed = done;
         held.elapsed_ms = (seconds * 1000.0) as u64;
         held.per_second = index::per_second(done, seconds);
+        held.note = job
+            .run
+            .as_ref()
+            .and_then(|run| run.notes().last())
+            .cloned()
+            .unwrap_or_default();
     }
     false
 }
@@ -986,6 +992,8 @@ fn begin_file(progress: &Arc<Mutex<Progress>>, label: String, number: usize, tot
     held.file_index = number;
     held.window = 0;
     held.window_count = total;
+    // The line of the file before it names a window of that file.
+    held.note.clear();
 }
 
 fn fail(progress: &Arc<Mutex<Progress>>, err: &anyhow::Error) {
@@ -1410,6 +1418,20 @@ mod tests {
         assert_eq!(held.file_index, 3);
         assert_eq!(held.window, 0);
         assert_eq!(held.window_count, 12);
+    }
+
+    /// A new file clears the line of the file before it.
+    ///
+    /// The line names one window of one file. A stale line then reads as a
+    /// fault of the file that runs now.
+    #[test]
+    fn a_new_file_clears_the_note_of_the_last_one() {
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        progress.lock().unwrap().note = "window at 3.0 s holds 1500 tokens".to_string();
+
+        begin_file(&progress, "clip-two.mp4".to_string(), 2, 12);
+
+        assert!(progress.lock().unwrap().note.is_empty());
     }
 
     #[test]

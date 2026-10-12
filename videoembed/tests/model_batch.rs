@@ -211,3 +211,62 @@ fn the_run_indexes_every_window_of_the_test_video() {
     );
     let _ = std::fs::remove_dir_all(&media);
 }
+
+/// A window above the token budget loses its audio, and the run says so.
+///
+/// The plan names a 10 s window of 10 frames with its audio. Ten frames and
+/// their clips pass the budget of 1024 tokens, so the window drops its clips.
+/// The frames alone stay under the budget, so the record keeps them.
+#[test]
+fn a_ten_second_window_drops_its_audio() {
+    let Some((embedder, _guard)) = the_model() else {
+        eprintln!("skipped: the model is not here");
+        return;
+    };
+    let Some(video) = video() else {
+        eprintln!("skipped: the test video is not here");
+        return;
+    };
+    let plan = plan::Plan {
+        mode: plan::Mode::Window,
+        window: 10.0,
+        stride: 10.0,
+        frames: 10,
+        audio: true,
+    };
+    let media = scratch("budget_media");
+    let mut run = index::IndexRun::start_with(&video, &plan, &media).expect("the run starts");
+    let mut ctx = embedder.new_context().expect("the context is made");
+
+    let mut records = Vec::new();
+    loop {
+        let made = run.step(embedder, &mut ctx).expect("the step ends");
+        if made.is_empty() {
+            break;
+        }
+        records.extend(made);
+    }
+
+    let duration = media::probe_duration(&video).expect("the duration comes back");
+    assert_eq!(records.len(), plan.window_starts(duration).len());
+    assert!(!run.notes().is_empty(), "a window over the budget reports one line");
+    assert!(
+        run.notes().iter().all(|line| line.contains("above the budget")),
+        "got {:?}",
+        run.notes()
+    );
+
+    // The frames alone stay under the budget, so the record keeps them.
+    let (frames, _clips) = one_second_cut(&video, &scratch("budget_frames"));
+    let alone = index::frames_in(&frames, 0.0, 10.0, 1.0);
+    let times = index::window_times(0.0, 1.0, alone.len(), 0);
+    let count = embedder
+        .tokens_of(&embed::window_text(&times), &alone)
+        .expect("the count comes back");
+    println!("the frames alone: {count} tokens over {} parts", alone.len());
+    assert!(
+        count < embed::BUDGET_TOKENS,
+        "the frames alone hold {count} tokens, above the budget"
+    );
+    let _ = std::fs::remove_dir_all(&media);
+}

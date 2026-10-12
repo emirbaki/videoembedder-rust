@@ -272,10 +272,11 @@ function showProgress(p) {
   }
   if (p.running) {
     const rate = p.per_second > 0 ? " - " + p.per_second.toFixed(2) + " items a second" : "";
+    const note = p.note ? " " + p.note : "";
     $("progress-text").textContent =
       "File " + p.file_index + "/" + p.file_count +
       ", item " + p.window + "/" + p.window_count +
-      " - " + p.file + rate;
+      " - " + p.file + rate + note;
   } else {
     const rate = p.per_second > 0 ? " at " + p.per_second.toFixed(2) + " items a second" : "";
     $("progress-text").textContent =
