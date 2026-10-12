@@ -188,6 +188,32 @@ pub fn cut_audio(video: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(kept)
 }
 
+/// The times a thumbnail probe tries, in seconds.
+///
+/// The list is Google's (`VideoThumbnails.kt:35-62`).
+pub const PROBE_OFFSETS: [f64; 6] = [0.0, 0.2, 0.5, 1.0, 2.0, 4.0];
+/// A frame below this average luma reads as black.
+///
+/// A black frame in the television range measures 16, so the bound sits above
+/// that level. A dark but real frame near the opening still reads as a picture.
+pub const BLACK_LUMA: f64 = 24.0;
+
+/// The first probe offset at or after `at` that holds a still that is not black.
+///
+/// A request past the last offset keeps its own time, so the probe costs
+/// nothing after the opening of a video. When every candidate is black the last
+/// one stands, because a black still beats no still.
+pub fn probe_offset(video: &Path, at: f64) -> Result<f64> {
+    let mut last = at;
+    for offset in PROBE_OFFSETS.into_iter().filter(|offset| *offset >= at - 0.001) {
+        last = offset;
+        if luma(video, offset)? >= BLACK_LUMA {
+            return Ok(offset);
+        }
+    }
+    Ok(last)
+}
+
 /// The average luma of the frame at one time, from the signalstats filter.
 ///
 /// The filter writes its numbers as metadata, so `metadata=print:file=-` puts
@@ -665,6 +691,62 @@ mod tests {
             return;
         };
         assert!(luma(&black, 60.0).is_err());
+    }
+
+    /// A clip that is black at the start and white after one second.
+    fn black_then_colour() -> Option<PathBuf> {
+        if !ready() {
+            return None;
+        }
+        let dir = scratch("black_open");
+        std::fs::create_dir_all(&dir).ok()?;
+        let file = dir.join("open.mp4");
+        let made = Command::new(FFMPEG)
+            .args(["-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=4"])
+            .args([
+                "-vf",
+                "drawbox=x=0:y=0:w=64:h=64:color=white@1:t=fill:enable='gte(t,1)'",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&file)
+            .output()
+            .ok()?;
+        made.status.success().then_some(file)
+    }
+
+    /// The probe steps past a black opening frame.
+    #[test]
+    fn the_probe_steps_past_a_black_opening() {
+        let Some(video) = black_then_colour() else {
+            eprintln!("skipped: ffmpeg is missing");
+            return;
+        };
+        // The offsets 0, 0.2, and 0.5 are black, and 1.0 is white.
+        assert_eq!(probe_offset(&video, 0.0).unwrap(), 1.0);
+        // A request at 2 s keeps its own offset, because 2.0 is white.
+        assert_eq!(probe_offset(&video, 2.0).unwrap(), 2.0);
+    }
+
+    /// A request past the probe window keeps its own time.
+    #[test]
+    fn a_late_request_keeps_its_time() {
+        let Some(video) = black_then_colour() else {
+            eprintln!("skipped: ffmpeg is missing");
+            return;
+        };
+        assert_eq!(probe_offset(&video, 8.0).unwrap(), 8.0);
+    }
+
+    /// The test clip holds no black frame, so its first offset stands.
+    #[test]
+    fn a_plain_clip_keeps_its_first_offset() {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        }
+        assert_eq!(probe_offset(&video, 0.0).unwrap(), 0.0);
     }
 
     /// A thumbnail is a JPEG, and the bytes start with the JPEG marker.
