@@ -241,7 +241,6 @@ enum Phase {
 /// drives it: one `step` call embeds one frame or one audio clip.
 #[derive(Debug)]
 pub struct IndexRun {
-    video: PathBuf,
     /// The file to cut. It is the video itself, or its progressive copy.
     source: PathBuf,
     /// Every frame of the whole-video cut. Empty until the first cut.
@@ -299,7 +298,6 @@ impl IndexRun {
             bail!("{} is shorter than one frame", video.display());
         }
         Ok(Self {
-            video: video.to_path_buf(),
             source: source.to_path_buf(),
             frames_cut: Vec::new(),
             clips_cut: Vec::new(),
@@ -358,7 +356,6 @@ impl IndexRun {
             );
         }
         Ok(Self {
-            video: video.to_path_buf(),
             source: source.to_path_buf(),
             frames_cut: Vec::new(),
             clips_cut: Vec::new(),
@@ -571,16 +568,22 @@ impl IndexRun {
             Phase::Windows | Phase::Done => unreachable!(),
         };
         let end = (at + count).min(whole.len());
+        if at >= end {
+            // The cut holds fewer items than the plan of this stream, so the
+            // stream is over. A stream duration that over-reports gives this
+            // case, and a video without an audio track gives it too.
+            self.phase = if self.phase == Phase::Audio || self.audios.is_empty() {
+                Phase::Done
+            } else {
+                Phase::Audio
+            };
+            self.audio_at = 0;
+            self.files.clear();
+            self.batch_from = 0;
+            return Ok(());
+        }
         self.files = whole[at..end].to_vec();
         self.batch_from = at;
-        if self.files.is_empty() {
-            if self.phase == Phase::Audio {
-                // A video without an audio track is normal.
-                self.phase = Phase::Done;
-                return Ok(());
-            }
-            bail!("no frames came from {}", self.video.display());
-        }
         Ok(())
     }
 
@@ -1124,7 +1127,6 @@ mod tests {
     #[test]
     fn the_run_ends_after_the_frames_when_the_audio_plan_is_empty() {
         let mut run = IndexRun {
-            video: PathBuf::from("silent.mp4"),
             source: PathBuf::from("silent.mp4"),
             frames_cut: Vec::new(),
             clips_cut: Vec::new(),
@@ -1462,6 +1464,37 @@ mod tests {
         assert_eq!(run.clips_cut.len(), 24);
         assert_eq!(run.files.len(), FRAME_BATCH);
         // The first batch of frames starts at the first frame.
+        assert_eq!(run.batch_from, 0);
+    }
+
+    /// A cut that holds fewer items than the plan stops the phase.
+    ///
+    /// A stream whose duration over-reports gives a plan longer than the cut.
+    /// The run keeps the records that the cut can serve, and it does not stop
+    /// the index of the other files of a folder.
+    #[test]
+    fn a_cut_shorter_than_the_plan_stops_the_phase() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let mut run = IndexRun::start(&video).unwrap();
+        run.cut_batch().unwrap();
+        assert_eq!(run.frames_cut.len(), 120);
+
+        // The stream claims 50 s, and the cut holds 30 s of frames.
+        run.frames = (0..200).map(|i| i as f64 * FRAME_STEP).collect();
+        run.frame_at = 150;
+        run.files.clear();
+
+        // The second batch starts past the cut, so the frames are over.
+        run.cut_batch().unwrap();
+        assert!(run.files.is_empty());
+        assert_eq!(run.phase, Phase::Audio, "the audio phase comes next");
+
+        // The audio phase then cuts its own batch from the clip list.
+        run.cut_batch().unwrap();
+        assert_eq!(run.phase, Phase::Audio);
+        assert_eq!(run.files.len(), 24);
         assert_eq!(run.batch_from, 0);
     }
 
