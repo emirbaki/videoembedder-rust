@@ -310,6 +310,31 @@ fn decode(text: &str) -> String {
         .into_owned()
 }
 
+/// The time of one still, with the black-frame probe.
+///
+/// The probe runs one time for each video in the life of the process, because
+/// it costs one ffmpeg call for each offset it tries. A request past the probe
+/// window keeps its own time and fills no map.
+fn pick_thumb_time(chosen: &mut HashMap<String, f64>, video: &Path, at: f64) -> f64 {
+    let last = media::PROBE_OFFSETS[media::PROBE_OFFSETS.len() - 1];
+    if at > last {
+        return at;
+    }
+    let key = video.to_string_lossy().to_string();
+    if let Some(picked) = chosen.get(&key) {
+        // A later request inside the window still reads the picked still, so
+        // the page shows one picture of the opening.
+        return picked.max(at);
+    }
+    match media::probe_offset(video, at) {
+        Ok(picked) => {
+            chosen.insert(key, picked);
+            picked
+        }
+        Err(_) => at,
+    }
+}
+
 /// One key for one thumbnail. The time is rounded to the tenth of a second.
 fn thumb_key(path: &str, at: f32, width: u32) -> String {
     format!("{path}|{:.1}|{width}", at)
@@ -971,6 +996,7 @@ fn handle_request(
     progress: &Arc<Mutex<Progress>>,
     key: &str,
     thumbs: &Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+    chosen: &Arc<Mutex<HashMap<String, f64>>>,
 ) -> Result<()> {
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
@@ -979,7 +1005,7 @@ fn handle_request(
     // A thumbnail cuts a frame on this thread, so a search and an index keep
     // running. The route never waits on the engine loop.
     if path == "/api/frame" && request.method() == &Method::Get {
-        return serve_frame(request, &url, key, jobs, thumbs);
+        return serve_frame(request, &url, key, jobs, thumbs, chosen);
     }
 
     match path.as_str() {
@@ -1050,6 +1076,7 @@ fn serve_frame(
     http_key: &str,
     jobs: &Sender<Job>,
     thumbs: &Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+    chosen: &Arc<Mutex<HashMap<String, f64>>>,
 ) -> Result<()> {
     // `params` reads the whole URL, so a query alone gives no pair.
     let args = params(url);
@@ -1092,7 +1119,15 @@ fn serve_frame(
         return Ok(());
     }
 
-    match media::thumb_jpeg(Path::new(&path), at as f64, width) {
+    // The opening of a video is often black. The probe steps the time forward
+    // to the first frame with a picture. The cache key keeps the time the page
+    // asked for, so the map holds one entry for each requested time.
+    let picked = {
+        let mut map = chosen.lock().unwrap();
+        pick_thumb_time(&mut map, Path::new(&path), at as f64)
+    };
+
+    match media::thumb_jpeg(Path::new(&path), picked, width) {
         Ok(bytes) => {
             cache_thumb(&mut thumbs.lock().unwrap(), key, bytes.clone());
             request.respond(bytes_reply(200, "image/jpeg", bytes))?;
@@ -1281,6 +1316,8 @@ fn main() -> Result<()> {
     let store_path = PathBuf::from("store/index.db");
     let progress = Arc::new(Mutex::new(Progress::default()));
     let thumbs = Arc::new(Mutex::new(HashMap::new()));
+    // One picked offset for each video, so the probe runs one time only.
+    let chosen = Arc::new(Mutex::new(HashMap::new()));
     let (jobs_tx, jobs_rx) = channel::<Job>();
     let (ready_tx, ready_rx) = channel::<Result<(), String>>();
     let key = make_key();
@@ -1333,8 +1370,9 @@ fn main() -> Result<()> {
         let progress = Arc::clone(&progress);
         let key = key.clone();
         let thumbs = Arc::clone(&thumbs);
+        let chosen = Arc::clone(&chosen);
         std::thread::spawn(move || {
-            if let Err(err) = handle_request(request, &jobs, &progress, &key, &thumbs) {
+            if let Err(err) = handle_request(request, &jobs, &progress, &key, &thumbs, &chosen) {
                 eprintln!("A request failed: {err:#}");
             }
         });
@@ -1447,6 +1485,34 @@ mod tests {
         let raw = vec![b' '; MAX_BODY + 1];
         let err = parse_body::<PathBody>(&raw).unwrap_err();
         assert_eq!(err.0, 413);
+    }
+
+    /// The chosen offset stands for the life of the process.
+    #[test]
+    fn the_chosen_offset_stands_in_the_map() {
+        let mut chosen = HashMap::new();
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let first = pick_thumb_time(&mut chosen, &video, 0.0);
+        assert_eq!(first, 0.0);
+        assert_eq!(chosen.len(), 1);
+
+        // A second call reads the map, and it cuts no frame of its own.
+        let again = pick_thumb_time(&mut chosen, &video, 0.0);
+        assert_eq!(again, 0.0);
+        assert_eq!(chosen.len(), 1);
+    }
+
+    /// A request past the probe window keeps its own time, and it fills no map.
+    #[test]
+    fn a_late_request_fills_no_map() {
+        let mut chosen = HashMap::new();
+        let Some(video) = spike_video() else {
+            return;
+        };
+        assert_eq!(pick_thumb_time(&mut chosen, &video, 8.0), 8.0);
+        assert!(chosen.is_empty());
     }
 
     #[test]
