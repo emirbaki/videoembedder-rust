@@ -234,18 +234,22 @@ async function togglePause() {
 
 // Load the model again on the chosen device.
 async function switchDevice() {
+  const want = $("device").value;
   $("device").disabled = true;
+  // The select shows the active mode until the new model holds the device.
+  $("device").value = mode;
   note("");
   try {
-    const answer = await api("/api/device", { device: $("device").value });
+    const answer = await api("/api/device", { device: want });
     mode = answer.device === "GPU" ? "gpu" : "cpu";
-    $("device").value = mode;
   } catch (err) {
     // The load failed, so the old mode is still the active one.
-    $("device").value = mode;
     note(err.message);
   }
+  $("device").value = mode;
   $("device").disabled = false;
+  // Read the state again, so the speed line drops the old device.
+  api("/api/progress").then(showProgress).catch(() => {});
 }
 
 // The active mode, and a word about the card when the build has none.

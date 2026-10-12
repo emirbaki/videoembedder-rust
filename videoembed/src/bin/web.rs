@@ -2041,4 +2041,24 @@ mod tests {
         assert_eq!(code, 500, "a load fault belongs to the server");
         assert_eq!(message, "the card is out of memory");
     }
+
+    /// A device switch reads the state again, so the speed line is not stale.
+    ///
+    /// The page holds no test runner, so this pins the call in the source. The
+    /// select and the speed line both come from the progress answer.
+    #[test]
+    fn the_page_reads_the_state_again_after_a_switch() {
+        let at = JS
+            .find("async function switchDevice")
+            .expect("the page holds the switch");
+        // The file holds CRLF endings, so the scan looks for the brace alone.
+        let body = &JS[at..];
+        let open = body.find('{').expect("the switch opens");
+        let rest = &body[open..];
+        let end = rest.find("\n}").expect("the switch ends");
+        assert!(
+            rest[..end].contains("/api/progress"),
+            "a switch must read the state again, or the page keeps the old device"
+        );
+    }
 }
