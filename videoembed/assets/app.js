@@ -280,9 +280,19 @@ function showProgress(p) {
   const width = p.window_count > 0 ? (p.window * 100) / p.window_count : 0;
   $("progress-bar").style.width = width + "%";
   // The speed line is set first, so an error cannot leave stale text.
-  $("speed").textContent = p.elapsed_ms > 0
-    ? ((p.elapsed_ms / 1000).toFixed(1) + " s of work, " + deviceLabel(p))
+  // The cold load holds its own number, apart from the warm work.
+  const load = p.load_ms > 0 ? "load " + p.load_ms + " ms" : "";
+  const work = p.elapsed_ms > 0
+    ? (p.elapsed_ms / 1000).toFixed(1) + " s of work, " + deviceLabel(p)
     : "";
+  const parts = [load, work].filter(function (s) { return s !== ""; });
+  const runs = (p.runs || []).map(function (r) {
+    return r.items + " items in " + (r.ms / 1000).toFixed(1) + " s";
+  });
+  if (runs.length > 0) {
+    parts.push("last runs: " + runs.join(", "));
+  }
+  $("speed").textContent = parts.join(" - ");
 
   if (p.error !== null) {
     $("progress-text").textContent = p.error;

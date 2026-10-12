@@ -73,6 +73,20 @@ pub fn is_weak(score: f32, cut: f32) -> bool {
 
 const VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mkv", "mov", "avi", "webm"];
 
+/// One finished run of the index job.
+///
+/// The load of the model holds its own number, `Progress::load_ms`, so this
+/// sample holds the warm work alone.
+#[derive(Clone, Debug, Serialize)]
+pub struct RunSample {
+    /// The items of the run.
+    pub items: usize,
+    /// The milliseconds of the run.
+    pub ms: u64,
+    /// The items of the run for each second.
+    pub per_second: f32,
+}
+
 /// The progress of the running index job. The server reads a copy.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
@@ -99,6 +113,8 @@ pub struct Progress {
     pub per_second: f32,
     /// The newest line of the running job. Empty when the job reports nothing.
     pub note: String,
+    /// The last runs of this session, newest last.
+    pub runs: Vec<RunSample>,
 }
 
 /// One matching item inside a video.

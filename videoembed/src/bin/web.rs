@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use videoembed::embed::{Device, Embedder, QUERY_PREFIX};
-use videoembed::index::{self, Group, Progress};
+use videoembed::index::{self, Group, Progress, RunSample};
 use videoembed::media;
 use videoembed::store::{NewRecord, Store, normalize_label};
 
@@ -862,6 +862,8 @@ fn start_index(
         let device = held.device.clone();
         let gpu_available = held.gpu_available;
         let load_ms = held.load_ms;
+        // The runs of this session belong to the server, not to this job.
+        let runs = held.runs.clone();
         *held = Progress {
             running: true,
             folder: folder.display().to_string(),
@@ -869,6 +871,7 @@ fn start_index(
             device,
             gpu_available,
             load_ms,
+            runs,
             ..Progress::default()
         };
     }
@@ -918,6 +921,8 @@ fn start_plan(
         let device = held.device.clone();
         let gpu_available = held.gpu_available;
         let load_ms = held.load_ms;
+        // The runs of this session belong to the server, not to this job.
+        let runs = held.runs.clone();
         *held = Progress {
             running: true,
             folder: String::new(),
@@ -929,6 +934,7 @@ fn start_plan(
             device,
             gpu_available,
             load_ms,
+            runs,
             ..Progress::default()
         };
     }
@@ -1123,11 +1129,36 @@ fn hold_when_paused(flag: &Arc<AtomicBool>, progress: &Arc<Mutex<Progress>>) -> 
     true
 }
 
+/// How many runs the page keeps in its speed report.
+const RUN_KEEP: usize = 5;
+
+/// Add one run sample, and keep the last five.
+///
+/// A slow run stays in the list, so the page shows the shape of the work and
+/// not one average.
+fn keep_run(runs: &mut Vec<RunSample>, sample: RunSample) {
+    runs.push(sample);
+    if runs.len() > RUN_KEEP {
+        runs.remove(0);
+    }
+}
+
 /// End the running job, and clear its pause.
+///
+/// The call records one speed sample. The sample holds the warm work alone,
+/// because the load of the model holds its own field.
 fn end_job(progress: &Arc<Mutex<Progress>>) {
     let mut held = progress.lock().unwrap();
     held.running = false;
     held.paused = false;
+    if held.elapsed_ms > 0 {
+        let sample = RunSample {
+            items: held.indexed,
+            ms: held.elapsed_ms,
+            per_second: held.per_second,
+        };
+        keep_run(&mut held.runs, sample);
+    }
 }
 
 fn handle_request(
@@ -2002,6 +2033,32 @@ mod tests {
         assert!(!needs_load(Device::Cpu, Device::Cpu));
         assert!(!needs_load(Device::Gpu, Device::Gpu));
         assert!(needs_load(Device::Cpu, Device::Gpu));
+    }
+
+    /// The speed report keeps the last five runs.
+    #[test]
+    fn the_speed_report_keeps_the_last_five_runs() {
+        let mut runs = Vec::new();
+        for items in 1..=7 {
+            keep_run(
+                &mut runs,
+                RunSample {
+                    items,
+                    ms: 100,
+                    per_second: 1.0,
+                },
+            );
+        }
+        assert_eq!(runs.len(), 5, "seven runs leave five");
+        assert_eq!(runs[0].items, 3, "the two oldest runs leave");
+        assert_eq!(runs[4].items, 7, "the newest run stays");
+    }
+
+    /// The page shows the model load apart from the runs.
+    #[test]
+    fn the_page_shows_the_load_apart_from_the_runs() {
+        assert!(JS.contains("p.load_ms > 0"), "the load has its own words");
+        assert!(JS.contains("p.runs"), "the runs reach the page");
     }
 
     /// The page reads the paused state from the progress answer.
