@@ -222,6 +222,49 @@ pub fn extract_audio(video: &Path, from: f64, to: f64, dir: &Path) -> Result<Vec
     Ok(kept)
 }
 
+/// Cut the audio of a whole video into one-second 16 kHz mono WAV clips.
+///
+/// One ffmpeg call covers the whole track. Clip number `k` counts from zero
+/// and covers `[k, k + 1)`, so the caller slices the list by time. A video with
+/// no audio track gives an empty list.
+pub fn cut_audio(video: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
+    if !has_audio(video) {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(dir)?;
+    let pattern = dir.join("a%05d.wav").to_string_lossy().to_string();
+    let args = vec![
+        "-y".into(),
+        "-i".into(),
+        video.to_string_lossy().to_string(),
+        "-vn".into(),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        "16000".into(),
+        "-f".into(),
+        "segment".into(),
+        "-segment_time".into(),
+        "1".into(),
+        "-reset_timestamps".into(),
+        "1".into(),
+        pattern,
+    ];
+    run_ffmpeg(args, "extracting audio")?;
+    let found = read_media(dir, &["wav"])?;
+    // Drop a segment with no samples, so the index skips it instead of
+    // stopping on it.
+    let mut kept = Vec::new();
+    for path in found {
+        match std::fs::read(&path) {
+            Ok(bytes) if wav_has_samples(&bytes) => kept.push(path),
+            Ok(_) => {}
+            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+        }
+    }
+    Ok(kept)
+}
+
 /// Cut every frame of a video at `rate` frames a second.
 ///
 /// One ffmpeg call covers the whole video, so a plan with many windows pays
@@ -401,6 +444,51 @@ mod tests {
         let dir = scratch("whole_frames_fast");
         let fast = cut_frames(&video, 4.0, &dir).unwrap();
         assert_eq!(fast.len(), 120, "got {}", fast.len());
+    }
+
+    /// One pass gives one clip for each second of the audio stream.
+    ///
+    /// The audio stream of the clip is 23.1 s long, so the count follows the
+    /// stream and not the 30 s of the file.
+    #[test]
+    fn a_whole_video_audio_cut_follows_the_audio_stream() {
+        let video = test_video();
+        if !ready() || !video.exists() {
+            eprintln!("skipped: ffmpeg or the test video is missing");
+            return;
+        }
+        let dir = scratch("whole_audio");
+        let clips = cut_audio(&video, &dir).unwrap();
+        assert_eq!(clips.len(), 24, "got {}", clips.len());
+        assert!(clips.iter().all(|file| file.exists()));
+        for clip in &clips {
+            assert!(wav_has_samples(&std::fs::read(clip).unwrap()));
+        }
+    }
+
+    /// A video with no audio track gives no clip, and no fault.
+    #[test]
+    fn a_silent_video_gives_no_clip() {
+        if !ready() {
+            eprintln!("skipped: ffmpeg is missing");
+            return;
+        }
+        let dir = scratch("silent_source");
+        std::fs::create_dir_all(&dir).unwrap();
+        let silent = dir.join("silent.mp4");
+        let made = Command::new(FFMPEG)
+            .args(["-y", "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=2", "-pix_fmt", "yuv420p"])
+            .arg(&silent)
+            .output();
+        match made {
+            Ok(out) if out.status.success() => {}
+            _ => {
+                eprintln!("skipped: ffmpeg cannot make the silent clip");
+                return;
+            }
+        }
+        let out = scratch("silent_out");
+        assert!(cut_audio(&silent, &out).unwrap().is_empty());
     }
 
     #[test]
