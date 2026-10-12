@@ -29,17 +29,12 @@ pub const FRAME_STEP: f64 = 0.25;
 /// The length of one audio clip in seconds.
 pub const AUDIO_SECONDS: f64 = 1.0;
 
-/// The largest gap between two hits that still joins one moment.
-///
-/// The gap is one frame step. Hits of one run of frames touch, so the gap is
-/// zero. A run with one frame missing has a gap of one step.
-pub const MOMENT_GAP: f32 = FRAME_STEP as f32;
-
-/// The distance in seconds below which two rows of one video join one row.
+/// The distance in seconds below which two hits of one video join one moment.
 ///
 /// Google folds hits within 500 ms into one interval
 /// (`VideoMomentFinderViewModel.kt:1020-1036`). A search shows rows, so three
-/// near hits must read as one row.
+/// near hits must read as one row. The one gap holds for the console search
+/// and for the page, and for the window grid and the fine grid.
 pub const MERGE_GAP: f32 = 0.5;
 
 /// The median score of one ranked list. An empty list gives 0.0.
@@ -1031,7 +1026,7 @@ pub fn merge_hits_with(hits: Vec<Hit>, gap: f32) -> Vec<Hit> {
 
 /// Join the touching hits of one video into one moment.
 pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
-    merge_hits_with(hits, MOMENT_GAP)
+    merge_hits_with(hits, MERGE_GAP)
 }
 
 /// The indexes of the records that stay after the thinning.
@@ -1545,6 +1540,24 @@ mod tests {
         assert_eq!(groups[0].hits.len(), 1, "four touching frames make one moment");
         assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
         assert!((groups[0].hits[0].end - 1.0).abs() < 1e-6);
+    }
+
+    /// The page folds its groups at the same gap as the console search.
+    ///
+    /// The spec gives one rule for a search, and the page shows the rows. Two
+    /// hits of one video 0.3 s apart must read as one moment. A fold at the
+    /// frame step leaves two rows, and the page then parts from the console.
+    #[test]
+    fn a_group_folds_two_hits_inside_the_merge_gap() {
+        let records = vec![record("a.mp4", 0.0, 0.25), record("a.mp4", 0.55, 0.8)];
+        let ranked = vec![(0, 0.9), (1, 0.8)];
+
+        let groups = group_hits(&records, &ranked, 0.0);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hits.len(), 1, "0.3 s sits inside the merge gap");
+        assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
+        assert!((groups[0].hits[0].end - 0.8).abs() < 1e-6);
     }
 
     /// Two touching windows of one video show as one row.
