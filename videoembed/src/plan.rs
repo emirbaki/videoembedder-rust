@@ -77,6 +77,8 @@ pub struct Plan {
     pub frames: usize,
     /// The window record holds the window audio.
     pub audio: bool,
+    /// The plan also cuts the 0.25 s fine grid.
+    pub fine: bool,
 }
 
 /// The shortest window the plan accepts, in seconds.
@@ -94,6 +96,7 @@ impl Plan {
                 stride: 0.25,
                 frames: 1,
                 audio: true,
+                fine: false,
             },
             // The probe measured this shape at 10 hits of 10 with the window
             // audio, against 6 of 10 without it. Google's Object preset holds
@@ -104,6 +107,7 @@ impl Plan {
                 stride: 1.0,
                 frames: 2,
                 audio: true,
+                fine: false,
             },
             Preset::Action => Plan {
                 mode: Mode::Window,
@@ -111,6 +115,7 @@ impl Plan {
                 stride: 2.0,
                 frames: 4,
                 audio: false,
+                fine: false,
             },
             Preset::Speech => Plan {
                 mode: Mode::Window,
@@ -118,6 +123,7 @@ impl Plan {
                 stride: 3.0,
                 frames: 6,
                 audio: true,
+                fine: false,
             },
         }
     }
@@ -173,6 +179,7 @@ impl Plan {
                         .map_err(|_| anyhow::anyhow!("{value} is not a frame count"))?;
                 }
                 "audio" => plan.audio = parse_flag(value)?,
+                "fine" => plan.fine = parse_flag(value)?,
                 _ => bail!("{key} is not a plan value"),
             }
         }
@@ -233,6 +240,23 @@ mod tests {
 
         let fine = Plan::of(Preset::Fine);
         assert_eq!(fine.mode, Mode::Fine);
+
+        assert!(!object.fine, "a preset holds no fine grid");
+    }
+
+    /// The fine key adds the grid and leaves the window values alone.
+    #[test]
+    fn the_fine_key_adds_the_grid_beside_the_window() {
+        let base = Plan::of(Preset::Object);
+        let both = base.set_words("fine=on").unwrap();
+        assert!(both.fine);
+        assert_eq!(both.window, base.window);
+        assert_eq!(both.frames, base.frames);
+        assert!(both.audio);
+        let off = base.set_words("window=4 fine=off").unwrap();
+        assert!(!off.fine);
+        assert_eq!(off.window, 4.0);
+        assert_eq!(off.stride, 2.0);
     }
 
     /// The default plan is the Object preset.

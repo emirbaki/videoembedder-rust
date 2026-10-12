@@ -337,6 +337,8 @@ impl Store {
             stride,
             frames: frames as usize,
             audio: audio != 0,
+            // Task 2 replaces this line with the stored column.
+            fine: false,
         }))
     }
 
