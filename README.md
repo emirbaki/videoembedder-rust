@@ -154,6 +154,15 @@ The app opens `http://127.0.0.1:8787/` in your browser.
 6. Press Forget on a row to drop one video from the index.
 7. Press Quit to stop the server.
 
+The Search list shows one row for each moment.
+
+- Two rows of one video that sit within 0.5 s join one row, and the row shows
+  the whole range.
+- The Pause button holds the running job. The job keeps its place and its cut
+  files. The button reads Resume while the job waits.
+- A folder run clears the finished mark of a video that holds no records. The
+  server prints the count when the count is not zero.
+
 The server binds to `127.0.0.1` only, so another machine cannot reach it.
 
 Each `/api/` call carries the header `X-VEI: 1`. A foreign page cannot set that
@@ -171,6 +180,7 @@ takes a random key in the query instead. The page reads that key from
 | `/api/pick-folder` | POST | Open the folder dialog. |
 | `/api/index` | POST | Index every video under a folder. |
 | `/api/plan` | POST | Set the plan of one video. The reply names the item count. |
+| `/api/pause` | POST | Hold or release the running job. The reply names the new state. |
 | `/api/forget` | POST | Drop one video from the index. |
 | `/api/video` | GET | The video bytes, with byte ranges. |
 | `/api/quit` | POST | Stop the server. |

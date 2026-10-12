@@ -406,6 +406,34 @@ impl Store {
         Ok(())
     }
 
+    /// Clear the done mark of every video that holds no records.
+    ///
+    /// A fault can land between the record write and the mark write, so a video
+    /// can hold a mark with no records. Every later run then skips it. A run
+    /// calls this pass at the start, and the caller reports the count.
+    pub fn reconcile(&mut self) -> Result<usize> {
+        let stale: Vec<String> = self
+            .done
+            .iter()
+            .filter(|label| !self.holds_video(label))
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = self.conn.transaction().context("begin the reconcile")?;
+        for label in &stale {
+            tx.execute("update videos set done = 0 where path = ?1", [label])?;
+        }
+        tx.commit().context("commit the reconcile")?;
+
+        for label in &stale {
+            self.done.remove(label);
+        }
+        Ok(stale.len())
+    }
+
     /// True when the store holds a video record with this exact path.
     pub fn holds_video(&self, path: &str) -> bool {
         let want = normalize_label(path);
@@ -1019,6 +1047,59 @@ mod tests {
         let mut store = Store::open(&path).unwrap();
         store.mark_done(r"sub\a.mp4").unwrap();
         assert!(store.is_done("sub/a.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mark with no records goes, and the pass counts it.
+    #[test]
+    fn a_done_video_with_no_records_loses_its_mark() {
+        let dir = scratch("reconcile");
+        let path = dir.join("index.db");
+        let mut store = Store::open(&path).unwrap();
+        store.mark_done("a.mp4").unwrap();
+
+        let count = store.reconcile().unwrap();
+
+        assert_eq!(count, 1, "one mark holds no record");
+        assert!(!store.is_done("a.mp4"), "the mark goes");
+        let again = Store::open(&path).unwrap();
+        assert!(!again.is_done("a.mp4"), "the mark must reach the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A done video that holds records keeps its mark.
+    #[test]
+    fn a_done_video_with_records_keeps_its_mark() {
+        let dir = scratch("reconcile_held");
+        let path = dir.join("index.db");
+        let mut store = Store::open(&path).unwrap();
+        store.append(vec![new_record("a.mp4", 0.0, 4.0)]).unwrap();
+        store.mark_done("a.mp4").unwrap();
+
+        let count = store.reconcile().unwrap();
+
+        assert_eq!(count, 0, "every mark holds a record");
+        assert!(store.is_done("a.mp4"), "the mark stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pass counts every stale mark, and it keeps the good ones.
+    #[test]
+    fn the_pass_counts_every_stale_mark() {
+        let dir = scratch("reconcile_pair");
+        let path = dir.join("index.db");
+        let mut store = Store::open(&path).unwrap();
+        store.append(vec![new_record("kept.mp4", 0.0, 4.0)]).unwrap();
+        store.mark_done("kept.mp4").unwrap();
+        store.mark_done("gone.mp4").unwrap();
+        store.mark_done("also_gone.mp4").unwrap();
+
+        let count = store.reconcile().unwrap();
+
+        assert_eq!(count, 2, "two marks hold no record");
+        assert!(store.is_done("kept.mp4"), "a held video keeps its mark");
+        assert!(!store.is_done("gone.mp4"));
+        assert!(!store.is_done("also_gone.mp4"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

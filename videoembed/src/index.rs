@@ -29,11 +29,13 @@ pub const FRAME_STEP: f64 = 0.25;
 /// The length of one audio clip in seconds.
 pub const AUDIO_SECONDS: f64 = 1.0;
 
-/// The largest gap between two hits that still joins one moment.
+/// The distance in seconds below which two hits of one video join one moment.
 ///
-/// The gap is one frame step. Hits of one run of frames touch, so the gap is
-/// zero. A run with one frame missing has a gap of one step.
-pub const MOMENT_GAP: f32 = FRAME_STEP as f32;
+/// Google folds hits within 500 ms into one interval
+/// (`VideoMomentFinderViewModel.kt:1020-1036`). A search shows rows, so three
+/// near hits must read as one row. The one gap holds for the console search
+/// and for the page, and for the window grid and the fine grid.
+pub const MERGE_GAP: f32 = 0.5;
 
 /// The median score of one ranked list. An empty list gives 0.0.
 ///
@@ -75,6 +77,8 @@ const VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mkv", "mov", "avi", "webm"];
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
     pub running: bool,
+    /// True when the running job waits for a resume.
+    pub paused: bool,
     pub folder: String,
     pub file: String,
     pub file_index: usize,
@@ -125,6 +129,20 @@ pub struct Group {
     pub score: f32,
     pub hits: Vec<Hit>,
     pub cells: Vec<Cell>,
+}
+
+/// One row of a search answer.
+///
+/// The row holds a whole moment after the fold, so the range is the range the
+/// user reads. A note is a row too. A note holds no time, so a note never folds.
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub note: bool,
+    pub label: String,
+    pub start: f32,
+    pub end: f32,
+    pub score: f32,
+    pub margin: f32,
 }
 
 /// List the video files under one folder, in name order.
@@ -908,11 +926,79 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
     groups
 }
 
-/// Join hits that touch into one moment.
+/// The rows of a search answer, best first, with the near rows of one video
+/// joined into one moment.
+///
+/// The list is cut to `cap` rows first, because one merged moment counts as one
+/// row of the cap. Then the rows of one video fold when they sit within `gap` of
+/// each other. A note holds no time, so a note stays its own row.
+pub fn search_rows(
+    records: &[Record],
+    ranked: &[(usize, f32)],
+    baseline: f32,
+    cap: usize,
+    gap: f32,
+) -> Vec<Row> {
+    let mut videos: Vec<(String, Hit)> = Vec::new();
+    let mut notes: Vec<Row> = Vec::new();
+    for (index, score) in ranked.iter().take(cap) {
+        let Some(record) = records.get(*index) else {
+            continue;
+        };
+        if !store::is_video(record.kind) {
+            notes.push(Row {
+                note: true,
+                label: record.label.clone(),
+                start: record.start,
+                end: record.end,
+                score: *score,
+                margin: *score - baseline,
+            });
+            continue;
+        }
+        videos.push((
+            store::normalize_label(&record.label),
+            Hit {
+                start: record.start,
+                end: record.end,
+                score: *score,
+                margin: *score - baseline,
+            },
+        ));
+    }
+
+    // One video at a time, because a moment belongs to one video.
+    let mut labels: Vec<String> = videos.iter().map(|(label, _)| label.clone()).collect();
+    labels.sort();
+    labels.dedup();
+    let mut rows: Vec<Row> = Vec::new();
+    for label in labels {
+        let hits: Vec<Hit> = videos
+            .iter()
+            .filter(|(held, _)| *held == label)
+            .map(|(_, hit)| hit.clone())
+            .collect();
+        for hit in merge_hits_with(hits, gap) {
+            rows.push(Row {
+                note: false,
+                label: label.clone(),
+                start: hit.start,
+                end: hit.end,
+                score: hit.score,
+                margin: hit.margin,
+            });
+        }
+    }
+    rows.extend(notes);
+    rows.sort_by(|a, b| b.score.total_cmp(&a.score));
+    rows
+}
+
+/// Join the hits of one video that sit near each other into one moment.
 ///
 /// The moment spans the whole run. Its score and its margin come from the best
 /// hit of the run, so a moment never claims more than one hit earned.
-pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
+pub fn merge_hits_with(hits: Vec<Hit>, gap: f32) -> Vec<Hit> {
     if hits.len() < 2 {
         return hits;
     }
@@ -922,7 +1008,7 @@ pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
     let mut moments: Vec<Hit> = Vec::new();
     for hit in by_time {
         match moments.last_mut() {
-            Some(last) if hit.start - last.end <= MOMENT_GAP => {
+            Some(last) if hit.start - last.end <= gap => {
                 if hit.score > last.score {
                     last.score = hit.score;
                     last.margin = hit.margin;
@@ -936,6 +1022,11 @@ pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
     }
     moments.sort_by(|a, b| b.score.total_cmp(&a.score));
     moments
+}
+
+/// Join the touching hits of one video into one moment.
+pub fn merge_hits(hits: Vec<Hit>) -> Vec<Hit> {
+    merge_hits_with(hits, MERGE_GAP)
 }
 
 /// The indexes of the records that stay after the thinning.
@@ -1449,6 +1540,127 @@ mod tests {
         assert_eq!(groups[0].hits.len(), 1, "four touching frames make one moment");
         assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
         assert!((groups[0].hits[0].end - 1.0).abs() < 1e-6);
+    }
+
+    /// The page folds its groups at the same gap as the console search.
+    ///
+    /// The spec gives one rule for a search, and the page shows the rows. Two
+    /// hits of one video 0.3 s apart must read as one moment. A fold at the
+    /// frame step leaves two rows, and the page then parts from the console.
+    #[test]
+    fn a_group_folds_two_hits_inside_the_merge_gap() {
+        let records = vec![record("a.mp4", 0.0, 0.25), record("a.mp4", 0.55, 0.8)];
+        let ranked = vec![(0, 0.9), (1, 0.8)];
+
+        let groups = group_hits(&records, &ranked, 0.0);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hits.len(), 1, "0.3 s sits inside the merge gap");
+        assert!((groups[0].hits[0].start - 0.0).abs() < 1e-6);
+        assert!((groups[0].hits[0].end - 0.8).abs() < 1e-6);
+    }
+
+    /// Two touching windows of one video show as one row.
+    ///
+    /// This is the gate of the fold. The window grid holds windows that touch,
+    /// so three near hits of one moment must read as one row.
+    #[test]
+    fn two_touching_windows_of_one_video_join_one_row() {
+        let records = vec![record("a.mp4", 0.0, 2.0), record("a.mp4", 2.0, 4.0)];
+        let ranked = vec![(0, 0.9), (1, 0.5)];
+
+        let rows = search_rows(&records, &ranked, 0.0, 10, MERGE_GAP);
+
+        assert_eq!(rows.len(), 1, "the two windows make one moment");
+        assert_eq!(rows[0].start, 0.0);
+        assert_eq!(rows[0].end, 4.0);
+        assert_eq!(rows[0].score, 0.9, "the moment keeps the best score");
+    }
+
+    /// Two frames that sit past the gap keep two rows.
+    #[test]
+    fn two_frames_past_the_gap_keep_two_rows() {
+        let records = vec![
+            record("a.mp4", 0.0, 0.25),
+            record("a.mp4", 1.0, 1.25),
+        ];
+        let ranked = vec![(0, 0.9), (1, 0.8)];
+
+        let rows = search_rows(&records, &ranked, 0.0, 10, MERGE_GAP);
+
+        assert_eq!(rows.len(), 2, "a gap of 0.75 s holds two moments");
+    }
+
+    /// The rows of two videos never join, whatever their times.
+    #[test]
+    fn a_row_of_another_video_keeps_its_own_row() {
+        let records = vec![record("a.mp4", 0.0, 2.0), record("b.mp4", 2.0, 4.0)];
+        let ranked = vec![(0, 0.9), (1, 0.8)];
+
+        let rows = search_rows(&records, &ranked, 0.0, 10, MERGE_GAP);
+
+        assert_eq!(rows.len(), 2, "the two videos keep one row each");
+    }
+
+    /// A note holds no time, so a note never joins a video row.
+    #[test]
+    fn a_note_never_joins_a_row() {
+        let records = vec![
+            record("a.mp4", 0.0, 2.0),
+            record_of(crate::store::KIND_NOTE, "blue", 0.0, 0.0),
+        ];
+        let ranked = vec![(0, 0.9), (1, 0.85)];
+
+        let rows = search_rows(&records, &ranked, 0.0, 10, MERGE_GAP);
+
+        assert_eq!(rows.len(), 2, "the note stands alone");
+        assert!(rows.iter().any(|row| row.note), "the note is marked");
+    }
+
+    /// The cap counts the rows that enter the fold.
+    #[test]
+    fn the_cap_counts_the_rows_before_the_fold() {
+        let records: Vec<Record> = (0..12)
+            .map(|at| record("a.mp4", at as f32, at as f32 + 0.25))
+            .collect();
+        let ranked: Vec<(usize, f32)> = (0..12).map(|at| (at, 0.9 - at as f32 / 100.0)).collect();
+
+        let rows = search_rows(&records, &ranked, 0.0, 10, MERGE_GAP);
+
+        assert_eq!(rows.len(), 10, "a gap of 0.75 s keeps every kept row");
+    }
+
+    /// Ten rows that sit near each other leave one moment.
+    #[test]
+    fn ten_near_rows_leave_one_row() {
+        let records: Vec<Record> = (0..12)
+            .map(|at| record("a.mp4", at as f32 * 0.2, at as f32 * 0.2 + 0.25))
+            .collect();
+        let ranked: Vec<(usize, f32)> = (0..12).map(|at| (at, 0.9 - at as f32 / 100.0)).collect();
+
+        let rows = search_rows(&records, &ranked, 0.0, 10, MERGE_GAP);
+
+        assert_eq!(rows.len(), 1, "the ten rows chain into one moment");
+        assert_eq!(rows[0].score, 0.9, "the moment keeps the best score");
+    }
+
+    /// The folded rows come back best first.
+    #[test]
+    fn the_folded_rows_come_back_best_first() {
+        let records = vec![
+            record("a.mp4", 0.0, 0.25),
+            record("b.mp4", 9.0, 9.25),
+        ];
+        let ranked = vec![(1, 0.95), (0, 0.6)];
+
+        let rows = search_rows(&records, &ranked, 0.5, 10, MERGE_GAP);
+
+        assert_eq!(rows[0].label, "b.mp4");
+        assert!(
+            (rows[0].margin - 0.45).abs() < 1e-6,
+            "the margin follows the baseline, got {}",
+            rows[0].margin
+        );
     }
 
     #[test]

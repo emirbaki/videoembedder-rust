@@ -224,6 +224,14 @@ async function stopIndex() {
   }
 }
 
+async function togglePause() {
+  try {
+    await api("/api/pause", {});
+  } catch (err) {
+    note(err.message);
+  }
+}
+
 // Load the model again on the chosen device.
 async function switchDevice() {
   $("device").disabled = true;
@@ -258,6 +266,9 @@ function showProgress(p) {
   mode = modeName(p);
   $("device").value = mode;
   $("device").disabled = p.running;
+  // A pause works on a running job only, and it names the next action.
+  $("pause").disabled = !p.running;
+  $("pause").textContent = p.paused ? "Resume" : "Pause";
   $("progress").hidden = !p.running && p.indexed === 0 && !p.error;
   const width = p.window_count > 0 ? (p.window * 100) / p.window_count : 0;
   $("progress-bar").style.width = width + "%";
@@ -271,6 +282,12 @@ function showProgress(p) {
     return;
   }
   if (p.running) {
+    if (p.paused) {
+      $("progress-text").textContent =
+        "Paused. File " + p.file_index + "/" + p.file_count +
+        ", item " + p.window + "/" + p.window_count + " - " + p.file;
+      return;
+    }
     const rate = p.per_second > 0 ? " - " + p.per_second.toFixed(2) + " items a second" : "";
     const note = p.note ? " " + p.note : "";
     $("progress-text").textContent =
@@ -508,6 +525,7 @@ function boot() {
   $("pick").addEventListener("click", pickFolder);
   $("start").addEventListener("click", startIndex);
   $("stop").addEventListener("click", stopIndex);
+  $("pause").addEventListener("click", togglePause);
   $("device").addEventListener("change", switchDevice);
   $("search-form").addEventListener("submit", runSearch);
   $("quit").addEventListener("click", quit);
