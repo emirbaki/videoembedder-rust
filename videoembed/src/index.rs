@@ -494,17 +494,34 @@ impl IndexRun {
                 plan.window
             );
         }
+        // The flag adds the fine grid beside the windows. The grid follows
+        // each stream length, as the fine mode does.
+        let (frames, audios) = if plan.fine {
+            let video_len = media::probe_stream_duration(source, "v")?
+                .unwrap_or(duration)
+                .min(duration);
+            let audio_len = if media::has_audio(source) {
+                media::probe_stream_duration(source, "a")?
+                    .unwrap_or(duration)
+                    .min(duration)
+            } else {
+                0.0
+            };
+            (frames(video_len), audio_starts(audio_len))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Self {
             source: source.to_path_buf(),
             frames_cut: Vec::new(),
             clips_cut: Vec::new(),
             label: store::normalize_label(&video.to_string_lossy()),
             duration,
-            frames: Vec::new(),
-            audios: Vec::new(),
+            frames,
+            audios,
             frame_at: 0,
             audio_at: 0,
-            phase: Phase::Windows,
+            phase: if plan.fine { Phase::Frames } else { Phase::Windows },
             dir: PathBuf::new(),
             files: Vec::new(),
             batch_from: 0,
@@ -519,10 +536,7 @@ impl IndexRun {
 
     /// The number of records this run will make.
     pub fn total(&self) -> usize {
-        if self.phase == Phase::Windows {
-            return self.windows.len();
-        }
-        self.frames.len() + self.audios.len()
+        self.frames.len() + self.audios.len() + self.windows.len()
     }
 
     /// The number of records made so far.
@@ -659,14 +673,26 @@ impl IndexRun {
         self.files.len().saturating_sub(self.at() - self.batch_from)
     }
 
+    /// The phase after the fine grid of a video.
+    ///
+    /// A window plan with the flag runs its windows after the grid. A fine
+    /// plan has no window, so its run ends.
+    fn after_fine(&self) -> Phase {
+        if self.windows.is_empty() {
+            Phase::Done
+        } else {
+            Phase::Windows
+        }
+    }
+
     fn advance(&mut self) {
         match self.phase {
             Phase::Frames => {
                 self.frame_at += 1;
                 if self.frame_at >= self.frames.len() {
-                    // A video with no audio track has no second phase.
+                    // A video with no audio track goes to its windows.
                     self.phase = if self.audios.is_empty() {
-                        Phase::Done
+                        self.after_fine()
                     } else {
                         Phase::Audio
                     };
@@ -678,7 +704,7 @@ impl IndexRun {
             Phase::Audio => {
                 self.audio_at += 1;
                 if self.audio_at >= self.audios.len() {
-                    self.phase = Phase::Done;
+                    self.phase = self.after_fine();
                 }
             }
             // Window mode advances a whole group, in `step_group`.
@@ -749,8 +775,12 @@ impl IndexRun {
 
     fn cut_batch(&mut self) -> Result<()> {
         self.files.clear();
-        if self.phase == Phase::Done || self.starts().is_empty() {
-            self.phase = Phase::Done;
+        if self.phase == Phase::Done {
+            return Ok(());
+        }
+        if self.starts().is_empty() {
+            // The fine stream of this video is over. The windows may still run.
+            self.phase = self.after_fine();
             return Ok(());
         }
         self.cut_media()?;
@@ -774,34 +804,49 @@ impl IndexRun {
             return Ok(());
         }
         // Fine mode slices the whole-video cut by item, because one frame sits
-        // at one frame step and one clip at one audio second.
+        // at one fine step and one clip at one audio second.
         let at = self.at();
-        let count = match self.phase {
-            Phase::Frames => FRAME_BATCH,
-            Phase::Audio => AUDIO_BATCH,
-            Phase::Windows | Phase::Done => unreachable!(),
-        };
-        let whole = match self.phase {
-            Phase::Frames => &self.frames_cut,
-            Phase::Audio => &self.clips_cut,
-            Phase::Windows | Phase::Done => unreachable!(),
-        };
-        let end = (at + count).min(whole.len());
+        if self.phase == Phase::Frames {
+            // A dense cut holds more frames than the fine grid wants, so the
+            // grid takes every `cut_rate / 4` frame.
+            let step = (self.cut_rate() / FRAME_RATE).round().max(1.0) as usize;
+            // The cut can hold fewer frames than the stream plan claims, so the
+            // guard counts the frames of the cut, and not the frames of the plan.
+            let held = (self.frames_cut.len() + step - 1) / step;
+            let end = (at + FRAME_BATCH).min(held);
+            if at >= end {
+                // The cut holds fewer frames than the grid, so the frame phase
+                // is over. A video without an audio track goes to its windows.
+                self.phase = if self.audios.is_empty() {
+                    self.after_fine()
+                } else {
+                    Phase::Audio
+                };
+                self.audio_at = 0;
+                self.files.clear();
+                self.batch_from = 0;
+                return Ok(());
+            }
+            self.files = self
+                .frames_cut
+                .iter()
+                .step_by(step)
+                .skip(at)
+                .take(end - at)
+                .cloned()
+                .collect();
+            self.batch_from = at;
+            return Ok(());
+        }
+        let end = (at + AUDIO_BATCH).min(self.clips_cut.len());
         if at >= end {
-            // The cut holds fewer items than the plan of this stream, so the
-            // stream is over. A stream duration that over-reports gives this
-            // case, and a video without an audio track gives it too.
-            self.phase = if self.phase == Phase::Audio || self.audios.is_empty() {
-                Phase::Done
-            } else {
-                Phase::Audio
-            };
+            self.phase = self.after_fine();
             self.audio_at = 0;
             self.files.clear();
             self.batch_from = 0;
             return Ok(());
         }
-        self.files = whole[at..end].to_vec();
+        self.files = self.clips_cut[at..end].to_vec();
         self.batch_from = at;
         Ok(())
     }
@@ -1202,6 +1247,81 @@ mod tests {
         let left = frames_in_dense(&cut, 3.0, 2.0, 1.0, 4.0);
         assert_eq!(left, vec![PathBuf::from("f12.jpg")]);
         assert!(frames_in_dense(&cut, 40.0, 2.0, 1.0, 4.0).is_empty());
+    }
+
+    /// A plan with the flag runs the fine grid and then the windows.
+    #[test]
+    fn the_flag_runs_the_fine_grid_and_the_windows() {
+        let mut plan = plan::Plan::of(plan::Preset::Object);
+        plan.fine = true;
+        let mut run = IndexRun {
+            source: PathBuf::from("a.mp4"),
+            frames_cut: Vec::new(),
+            clips_cut: Vec::new(),
+            label: "a.mp4".to_string(),
+            duration: 2.0,
+            frames: vec![0.0, 0.25],
+            audios: vec![0.0],
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::new(),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+            window_at: 0,
+            plan,
+            windows: vec![0.0],
+            group: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        assert_eq!(run.total(), 4, "two frames, one clip, one window");
+        run.advance();
+        run.advance();
+        assert!(
+            run.phase == Phase::Audio,
+            "the grid comes before the windows"
+        );
+        run.advance();
+        assert!(run.phase == Phase::Windows, "the windows come last");
+        run.advance();
+        assert!(run.phase == Phase::Windows, "a window waits for its group");
+    }
+
+    /// A grid with no audio track hands its video straight to the windows.
+    #[test]
+    fn a_grid_with_no_audio_goes_to_its_windows() {
+        let mut plan = plan::Plan::of(plan::Preset::Object);
+        plan.fine = true;
+        let mut run = IndexRun {
+            source: PathBuf::from("a.mp4"),
+            frames_cut: Vec::new(),
+            clips_cut: Vec::new(),
+            label: "a.mp4".to_string(),
+            duration: 2.0,
+            frames: vec![0.0],
+            audios: Vec::new(),
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::new(),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+            window_at: 0,
+            plan,
+            windows: vec![0.0],
+            group: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        assert_eq!(run.total(), 2, "one frame and one window");
+        run.advance();
+        assert!(
+            run.phase == Phase::Windows,
+            "no audio track, so the grid hands over"
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {
