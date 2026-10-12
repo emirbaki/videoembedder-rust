@@ -1,7 +1,9 @@
 # The cut, the batch, and the search - design
 
 Date: 2026-10-12
-Status: the four decisions came from the user. The rest waits for review.
+Status: approved. The user settled the four open decisions on 2026-10-12.
+Plan A: `docs/superpowers/plans/2026-10-12-cut-pass.md`.
+Plans B and C wait for their own plan document.
 
 Sources:
 

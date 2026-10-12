@@ -16,14 +16,21 @@ the window 21.0-23.0 s with a score of 0.78.
 
 ## How it works
 
-1. ffmpeg cuts a window into four JPEG frames and one WAV clip.
-2. The model reads the frames, the audio, and a text marker in one batch.
-3. One decode runs, and one pooling step produces one vector for the window.
-4. The vector goes into a store. A query embeds the same way and ranks the store
+1. ffmpeg cuts the whole video one time: every frame at the plan rate, and every
+   one second audio clip.
+2. A window takes its own frames and clips from that one cut, so a window costs
+   no further ffmpeg call.
+3. The model reads the frames, the audio, and a text marker in one batch.
+4. One decode runs, and one pooling step produces one vector for the window.
+5. The vector goes into a store. A query embeds the same way and ranks the store
    by cosine similarity.
 
-Step 2 is the important part. The model sees the whole window at once. A
+Step 3 is the important part. The model sees the whole window at once. A
 separate decode for each part would pool only the last part.
+
+Two steps keep the picture right. A fragmented MP4 is rewritten one time into a
+progressive copy, and the run reads that copy. A still near the opening steps
+forward past a black frame to the first frame with a picture.
 
 The model is `google/embeddinggemma-2`, in the `Q8_0` format, with its
 multimodal projection. The engine is `llama.cpp`, linked into the binary
