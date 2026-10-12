@@ -55,18 +55,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Take the mode flag out of the arguments.
+/// Take the mode flag out of the head of the arguments.
 ///
-/// `--gpu` and `--cpu` name the device for the model load. Every other word
-/// stays in the command line, so a foreign flag reaches the command parser.
+/// `--gpu` and `--cpu` name the device for the model load, and they come
+/// before the command. A flag past the command is a word of the command, so a
+/// query with the text `--gpu` keeps it.
 fn split_device(args: Vec<String>) -> (Option<Device>, Vec<String>) {
     let mut asked = None;
     let mut rest = Vec::new();
+    let mut head = true;
     for word in args {
-        match word.strip_prefix("--").and_then(Device::parse) {
-            Some(device) => asked = Some(device),
-            None => rest.push(word),
+        if head {
+            match word.strip_prefix("--").and_then(Device::parse) {
+                Some(device) => {
+                    asked = Some(device);
+                    continue;
+                }
+                None => head = false,
+            }
         }
+        rest.push(word);
     }
     (asked, rest)
 }
@@ -519,9 +527,20 @@ mod tests {
         assert_eq!(asked, Some(Device::Cpu));
         assert_eq!(rest, vec!["index"]);
 
+        let (asked, rest) = split_device(vec!["--gpu".into(), "--cpu".into(), "index".into()]);
+        assert_eq!(asked, Some(Device::Cpu), "the last leading flag wins");
+        assert_eq!(rest, vec!["index"]);
+    }
+
+    /// A flag past the command is a word of the command, not a mode.
+    ///
+    /// The mode comes before the command. A word `--gpu` after the command
+    /// belongs to the command, and the run must not load another model for it.
+    #[test]
+    fn a_flag_after_the_command_stays_in_the_command() {
         let (asked, rest) = split_device(vec!["search".into(), "--gpu".into(), "blue".into()]);
-        assert_eq!(asked, Some(Device::Gpu));
-        assert_eq!(rest, vec!["search", "blue"]);
+        assert_eq!(asked, None);
+        assert_eq!(rest, vec!["search", "--gpu", "blue"]);
     }
 
     /// A word that starts with `--` is not a mode, and it stays in the command.
