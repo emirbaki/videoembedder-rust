@@ -102,6 +102,20 @@ fn switch_reply(err: JobError) -> (u16, String) {
     }
 }
 
+/// Put a queued device switch at the head of a turn.
+///
+/// The model holds the device for every job after the switch, so the switch
+/// runs first. Two clicks in one turn then give one outcome, and not two.
+fn switch_first(queued: &mut Vec<Job>) {
+    if let Some(at) = queued
+        .iter()
+        .position(|job| matches!(job, Job::SetDevice { .. }))
+    {
+        let job = queued.remove(at);
+        queued.insert(0, job);
+    }
+}
+
 #[derive(Serialize)]
 struct State {
     version: String,
@@ -591,8 +605,15 @@ fn engine_loop(
             if done {
                 pending = None;
             }
-            let mut held = None;
+            // The queue of this turn. A device switch takes the head of it, so
+            // the order of two clicks does not change the outcome.
+            let mut queued = Vec::new();
             while let Ok(job) = jobs.try_recv() {
+                queued.push(job);
+            }
+            switch_first(&mut queued);
+            let mut held = None;
+            for job in queued {
                 if let Some(next) = handle(job, &embedder, &mut store, &progress, &key, &stopped, &paused, &mut pending) {
                     match held {
                         // One load at a time. The loop holds one request.
@@ -2040,6 +2061,50 @@ mod tests {
         let (code, message) = switch_reply(JobError::Message("the card is out of memory".to_string()));
         assert_eq!(code, 500, "a load fault belongs to the server");
         assert_eq!(message, "the card is out of memory");
+    }
+
+    /// A device switch takes the head of a turn that also holds a job.
+    ///
+    /// The model holds the device for every job after the switch, so the
+    /// switch runs first. Two clicks in one turn then give one outcome.
+    #[test]
+    fn a_device_switch_takes_the_head_of_a_turn() {
+        let (index, _wait) = channel();
+        let (device, _wait2) = channel();
+        let mut queued = vec![
+            Job::StartIndex {
+                folder: PathBuf::from("videos"),
+                answer: index,
+            },
+            Job::SetDevice {
+                device: Device::Cpu,
+                answer: device,
+            },
+        ];
+
+        switch_first(&mut queued);
+
+        assert!(
+            matches!(queued[0], Job::SetDevice { .. }),
+            "the switch runs first, so the index takes the new device"
+        );
+        assert!(
+            matches!(queued[1], Job::StartIndex { .. }),
+            "the job keeps its place behind the switch"
+        );
+    }
+
+    /// A turn with no switch keeps the arrival order.
+    #[test]
+    fn a_turn_with_no_switch_keeps_its_order() {
+        let (first, _wait) = channel();
+        let (second, _wait2) = channel();
+        let mut queued = vec![Job::StopIndex { answer: first }, Job::State(second)];
+
+        switch_first(&mut queued);
+
+        assert!(matches!(queued[0], Job::StopIndex { .. }), "the order holds");
+        assert!(matches!(queued[1], Job::State(_)), "the order holds");
     }
 
     /// A device switch reads the state again, so the speed line is not stale.
