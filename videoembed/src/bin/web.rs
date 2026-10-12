@@ -699,7 +699,9 @@ fn handle(
             let _ = answer.send(search(embedder, store, &query, path.as_deref()));
         }
         Job::StartIndex { folder, answer } => {
-            let _ = answer.send(start_index(progress, pending, stopped, paused, &folder));
+            let _ = answer.send(start_index(
+                store, progress, pending, stopped, paused, &folder,
+            ));
         }
         Job::StopIndex { answer } => {
             let running = pending.is_some();
@@ -769,6 +771,7 @@ fn refuse_when_busy(pending: &Option<WebJob>) -> Result<(), JobError> {
 }
 
 fn start_index(
+    store: &mut Store,
     progress: &Arc<Mutex<Progress>>,
     pending: &mut Option<WebJob>,
     flag: &Arc<AtomicBool>,
@@ -790,6 +793,12 @@ fn start_index(
         )));
     }
     let count = files.len();
+    // A video can hold a mark with no records, because a fault lands between
+    // the two writes. The pass clears those marks, so the run indexes them.
+    let cleared = store.reconcile().map_err(JobError::from)?;
+    if cleared > 0 {
+        println!("Cleared {cleared} finished marks with no records.");
+    }
     flag.store(false, Ordering::Relaxed);
     paused.store(false, Ordering::Relaxed);
     {
@@ -1814,6 +1823,35 @@ mod tests {
 
     /// A plan job points the progress at the video that it cuts.
     ///
+    /// A folder run clears the mark of a video that holds no records.
+    ///
+    /// The mark would keep the video out of every later run, so the run must
+    /// clear it before it walks the folder.
+    #[test]
+    fn a_folder_run_clears_the_mark_of_a_video_with_no_records() {
+        let dir = std::env::temp_dir().join(format!("vei_web_reconcile_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("a.mp4");
+        std::fs::write(&clip, b"not a video").unwrap();
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        store.mark_done(&clip.to_string_lossy()).unwrap();
+
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let flag = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut pending = None;
+
+        let count = start_index(&mut store, &progress, &mut pending, &flag, &paused, &dir).unwrap();
+
+        assert_eq!(count, 1, "the folder holds one video");
+        assert!(
+            !store.is_done(&clip.to_string_lossy()),
+            "the stale mark goes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The page shows the file name and the item count of the running job. A
     /// zero count gives an empty bar and an item count of "N/0".
     #[test]
