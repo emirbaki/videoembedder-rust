@@ -347,10 +347,14 @@ impl Embedder {
         }
         let raw = match filled {
             Ok(()) => unsafe {
-                sys::llama_process(ctx.as_ptr(), sys::LLAMA_PROCESS_TYPE_DECODE, batch);
-                (0..windows.len())
-                    .map(|seq| pooled_seq(ctx, seq as sys::llama_seq_id))
-                    .collect::<Result<Vec<Vec<f32>>>>()
+                let rc = sys::llama_process(ctx.as_ptr(), sys::LLAMA_PROCESS_TYPE_DECODE, batch);
+                if rc != 0 {
+                    Err(anyhow::anyhow!("llama_process failed with code {rc}"))
+                } else {
+                    (0..windows.len())
+                        .map(|seq| pooled_seq(ctx, seq as sys::llama_seq_id))
+                        .collect::<Result<Vec<Vec<f32>>>>()
+                }
             },
             Err(err) => Err(err),
         };

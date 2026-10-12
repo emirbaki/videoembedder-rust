@@ -674,10 +674,19 @@ impl IndexRun {
         self.cut_media()?;
         if self.phase == Phase::Windows {
             let group = self.window_group();
-            if group.first().map_or(true, |part| part.files.is_empty()) {
-                // The plan asks for a window that the cut does not hold.
-                let at = self.windows.get(self.window_at).copied().unwrap_or_default();
-                bail!("no media came from the window at {at} s");
+            // The plan asks for a window that the cut does not hold. A window
+            // with no media has no vector, so the run reports the first one.
+            let empty = group
+                .iter()
+                .find(|part| part.files.is_empty())
+                .map(|part| part.start)
+                .or_else(|| {
+                    group
+                        .is_empty()
+                        .then(|| self.windows.get(self.window_at).copied().unwrap_or_default())
+                });
+            if let Some(start) = empty {
+                bail!("no media came from the window at {start} s");
             }
             self.group = group;
             return Ok(());
@@ -1728,6 +1737,32 @@ mod tests {
 
         assert!(
             err.to_string().contains("no media came from the window"),
+            "got {err}"
+        );
+    }
+
+    /// A window with no media inside a group reports its own time.
+    ///
+    /// The cut ends before the plan does, so a window of the group holds no
+    /// file. The run must name that window and must not embed an empty one.
+    #[test]
+    fn a_window_with_no_media_inside_a_group_reports_its_time() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("short_cut_media");
+        let plan = plan::Plan::of(plan::Preset::Object);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+        run.cut_batch().unwrap();
+        // The frame stream ends at 28 s, and the plan asks for more.
+        run.frames_cut.truncate(28);
+        run.clips_cut.clear();
+        run.window_at = 27;
+
+        let err = run.cut_batch().unwrap_err();
+
+        assert!(
+            err.to_string().contains("no media came from the window at 28 s"),
             "got {err}"
         );
     }
