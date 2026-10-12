@@ -1436,6 +1436,41 @@ mod tests {
         assert_eq!(run.files.len(), 2);
     }
 
+    /// The fine run cuts the whole video one time, and it keeps its record count.
+    #[test]
+    fn the_fine_run_cuts_the_whole_video_once() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let mut run = IndexRun::start(&video).unwrap();
+        // 120 frames of 0.25 s, and 23 audio clips of the short audio track.
+        assert_eq!(run.total(), 143);
+
+        run.cut_batch().unwrap();
+        assert_eq!(run.frames_cut.len(), 120);
+        assert_eq!(run.clips_cut.len(), 24);
+        assert_eq!(run.files.len(), FRAME_BATCH);
+        // The first batch of frames starts at the first frame.
+        assert_eq!(run.batch_from, 0);
+    }
+
+    /// A video with no audio track gives frame records alone.
+    #[test]
+    fn a_silent_video_gives_frame_records_alone() {
+        let Some(video) = spike_video_without_audio() else {
+            return;
+        };
+        let media = scratch("silent_pass_media");
+        let plan = plan::Plan::of(plan::Preset::Fine);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+
+        assert!(run.audios.is_empty(), "a silent clip holds no audio item");
+        run.cut_batch().unwrap();
+        assert_eq!(run.frames_cut.len(), 120);
+        assert!(run.clips_cut.is_empty());
+        assert_eq!(run.files.len(), FRAME_BATCH);
+    }
+
     /// The spike clip, when it is here.
     fn spike_video() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from("../spike/testvideo_nolabels.mp4");
