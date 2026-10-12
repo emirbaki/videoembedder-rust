@@ -133,6 +133,7 @@ struct VideoRow {
     window: f64,
     frames: usize,
     audio: bool,
+    fine: bool,
 }
 
 #[derive(Serialize)]
@@ -178,6 +179,8 @@ struct PlanBody {
     frames: Option<usize>,
     #[serde(default)]
     audio: Option<bool>,
+    #[serde(default)]
+    fine: Option<bool>,
 }
 
 impl PlanBody {
@@ -197,6 +200,9 @@ impl PlanBody {
         }
         if let Some(audio) = self.audio {
             words.push(format!("audio={}", if audio { "on" } else { "off" }));
+        }
+        if let Some(fine) = self.fine {
+            words.push(format!("fine={}", if fine { "on" } else { "off" }));
         }
         if words.is_empty() {
             return Err(JobError::Message("no plan value arrived".into()));
@@ -553,6 +559,7 @@ fn videos(store: &Store) -> Vec<VideoRow> {
             window: plan.window,
             frames: plan.frames,
             audio: plan.audio,
+            fine: plan.fine,
         });
     }
     rows
@@ -1951,6 +1958,28 @@ mod tests {
     fn an_empty_plan_body_is_refused() {
         let body: PlanBody = serde_json::from_str(r#"{"path":"a.mp4"}"#).unwrap();
         assert!(body.plan().is_err());
+    }
+
+    /// The plan body reads the fine flag.
+    #[test]
+    fn the_plan_body_reads_the_fine_flag() {
+        let body: PlanBody = serde_json::from_str(
+            r#"{"path":"a.mp4","window":2.0,"frames":2,"audio":true,"fine":true}"#,
+        )
+        .unwrap();
+        assert!(body.plan().unwrap().fine);
+        let off: PlanBody =
+            serde_json::from_str(r#"{"path":"a.mp4","window":2.0,"frames":2,"audio":true}"#)
+                .unwrap();
+        assert!(!off.plan().unwrap().fine);
+    }
+
+    /// The page holds a checkbox for the fine grid.
+    #[test]
+    fn the_page_holds_a_box_for_the_fine_grid() {
+        assert!(PAGE.contains(r#"id="plan-fine""#));
+        assert!(JS.contains(r#"$("plan-fine").checked"#));
+        assert!(JS.contains("fine: $(\"plan-fine\").checked"));
     }
 
     /// The page reads the paused state from the progress answer.
