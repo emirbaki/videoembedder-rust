@@ -179,6 +179,35 @@ pub fn audio_starts(duration: f64) -> Vec<f64> {
     plan
 }
 
+/// The frames of one span, from the list of a whole-video cut.
+///
+/// Frame `i` of the list sits at `i / rate`, and the span `[from, from + window)`
+/// takes the frames inside it. A span that runs past the list takes what is left.
+pub fn frames_in(cut: &[PathBuf], from: f64, window: f64, rate: f64) -> Vec<PathBuf> {
+    let first = (from * rate).round().max(0.0) as usize;
+    let last = ((from + window) * rate).round().max(0.0) as usize;
+    let end = last.min(cut.len());
+    if first >= end {
+        return Vec::new();
+    }
+    cut[first..end].to_vec()
+}
+
+/// The clips of one span, from the list of a whole-video cut.
+///
+/// Clip `k` of the list covers `[k, k + 1)`, and the span takes every clip that
+/// touches it. A span past the end of the audio takes none, because a video
+/// often holds less audio than video.
+pub fn clips_in(cut: &[PathBuf], from: f64, window: f64) -> Vec<PathBuf> {
+    let first = from.floor().max(0.0) as usize;
+    let last = (from + window).ceil().max(0.0) as usize;
+    let end = last.min(cut.len());
+    if first >= end {
+        return Vec::new();
+    }
+    cut[first..end].to_vec()
+}
+
 /// A fresh working folder for one batch of ffmpeg output.
 pub fn work_dir(at: usize) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1257,6 +1286,53 @@ mod tests {
         let kept = thin_indexes(&records, 2);
 
         assert_eq!(kept, vec![0, 2]);
+    }
+
+    /// The frames of a span, from the list of a whole-video cut.
+    ///
+    /// Frame `i` sits at `i / rate`, and a span holds the frames inside it.
+    #[test]
+    fn a_span_takes_the_frames_inside_it() {
+        let cut: Vec<PathBuf> = (0..30)
+            .map(|i| PathBuf::from(format!("f{i:05}.jpg")))
+            .collect();
+
+        // One frame a second: a 0 s window takes 0 and 1, a 1 s window 1 and 2.
+        let first = frames_in(&cut, 0.0, 2.0, 1.0);
+        assert_eq!(first.len(), 2);
+        assert!(first[0].ends_with("f00000.jpg"));
+        assert!(first[1].ends_with("f00001.jpg"));
+
+        let second = frames_in(&cut, 1.0, 2.0, 1.0);
+        assert!(second[0].ends_with("f00001.jpg"));
+        assert!(second[1].ends_with("f00002.jpg"));
+
+        // Four frames a second: a 0.25 s span takes one frame.
+        let fine = frames_in(&cut, 0.25, 0.25, 4.0);
+        assert_eq!(fine.len(), 1);
+        assert!(fine[0].ends_with("f00001.jpg"));
+
+        // The list ends, so the last span holds what is left.
+        assert_eq!(frames_in(&cut, 29.0, 2.0, 1.0).len(), 1);
+        assert!(frames_in(&cut, 40.0, 2.0, 1.0).is_empty());
+    }
+
+    /// The clips of a span, from the list of a whole-video cut.
+    ///
+    /// Clip `k` covers `[k, k + 1)`, and a span takes every clip that touches
+    /// it. A span past the end of the audio takes none.
+    #[test]
+    fn a_span_takes_the_clips_that_touch_it() {
+        let cut: Vec<PathBuf> = (0..24)
+            .map(|i| PathBuf::from(format!("a{i:05}.wav")))
+            .collect();
+
+        assert_eq!(clips_in(&cut, 0.0, 2.0).len(), 2);
+        assert_eq!(clips_in(&cut, 1.0, 2.0).len(), 2);
+        assert_eq!(clips_in(&cut, 0.5, 2.0).len(), 3);
+        assert_eq!(clips_in(&cut, 23.0, 2.0).len(), 1);
+        assert!(clips_in(&cut, 24.0, 2.0).is_empty());
+        assert!(clips_in(&[], 0.0, 2.0).is_empty());
     }
 
     /// The spike clip, when it is here.
