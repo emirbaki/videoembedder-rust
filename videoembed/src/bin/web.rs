@@ -90,6 +90,32 @@ impl From<anyhow::Error> for JobError {
     }
 }
 
+/// The reply for a failed device switch, as a code and a line.
+///
+/// A switch fails for one reason: the model will not load on that device. That
+/// fault belongs to the server, so the code is 500. A busy engine is the one
+/// exception, and it answers 409.
+fn switch_reply(err: JobError) -> (u16, String) {
+    match err {
+        JobError::Busy => (409, "the engine runs another job".to_string()),
+        JobError::Message(message) => (500, message),
+    }
+}
+
+/// Put a queued device switch at the head of a turn.
+///
+/// The model holds the device for every job after the switch, so the switch
+/// runs first. Two clicks in one turn then give one outcome, and not two.
+fn switch_first(queued: &mut Vec<Job>) {
+    if let Some(at) = queued
+        .iter()
+        .position(|job| matches!(job, Job::SetDevice { .. }))
+    {
+        let job = queued.remove(at);
+        queued.insert(0, job);
+    }
+}
+
 #[derive(Serialize)]
 struct State {
     version: String,
@@ -579,8 +605,15 @@ fn engine_loop(
             if done {
                 pending = None;
             }
-            let mut held = None;
+            // The queue of this turn. A device switch takes the head of it, so
+            // the order of two clicks does not change the outcome.
+            let mut queued = Vec::new();
             while let Ok(job) = jobs.try_recv() {
+                queued.push(job);
+            }
+            switch_first(&mut queued);
+            let mut held = None;
+            for job in queued {
                 if let Some(next) = handle(job, &embedder, &mut store, &progress, &key, &stopped, &paused, &mut pending) {
                     match held {
                         // One load at a time. The loop holds one request.
@@ -1280,11 +1313,9 @@ fn api(mut request: Request, path: &str, post: bool, jobs: &Sender<Job>) -> Resu
             let _ = jobs.send(Job::SetDevice { device, answer });
             match wait.recv() {
                 Ok(Ok(device)) => request.respond(json_reply(&DeviceName { device }))?,
-                Ok(Err(JobError::Busy)) => {
-                    request.respond(error_reply(409, "an index job already runs"))?
-                }
-                Ok(Err(JobError::Message(message))) => {
-                    request.respond(error_reply(400, &message))?
+                Ok(Err(err)) => {
+                    let (code, message) = switch_reply(err);
+                    request.respond(error_reply(code, &message))?
                 }
                 Err(_) => request.respond(error_reply(500, "the engine stopped"))?,
             }
@@ -2012,5 +2043,87 @@ mod tests {
         let held = board.lock().unwrap();
         assert!(!held.running, "the job ends");
         assert!(!held.paused, "the pause goes with it");
+    }
+
+    /// A failed load is a fault of the server, and a busy engine is not.
+    ///
+    /// The page shows the code, and a person reads 400 as a bad request. A
+    /// model that will not load on the card is not the fault of the caller.
+    #[test]
+    fn a_failed_load_answers_500_and_a_busy_switch_answers_409() {
+        let (code, message) = switch_reply(JobError::Busy);
+        assert_eq!(code, 409);
+        // The engine refuses a switch for two reasons: a job runs, or another
+        // switch loads. The line must fit both, and it must not name a job
+        // that does not exist.
+        assert_eq!(message, "the engine runs another job");
+
+        let (code, message) = switch_reply(JobError::Message("the card is out of memory".to_string()));
+        assert_eq!(code, 500, "a load fault belongs to the server");
+        assert_eq!(message, "the card is out of memory");
+    }
+
+    /// A device switch takes the head of a turn that also holds a job.
+    ///
+    /// The model holds the device for every job after the switch, so the
+    /// switch runs first. Two clicks in one turn then give one outcome.
+    #[test]
+    fn a_device_switch_takes_the_head_of_a_turn() {
+        let (index, _wait) = channel();
+        let (device, _wait2) = channel();
+        let mut queued = vec![
+            Job::StartIndex {
+                folder: PathBuf::from("videos"),
+                answer: index,
+            },
+            Job::SetDevice {
+                device: Device::Cpu,
+                answer: device,
+            },
+        ];
+
+        switch_first(&mut queued);
+
+        assert!(
+            matches!(queued[0], Job::SetDevice { .. }),
+            "the switch runs first, so the index takes the new device"
+        );
+        assert!(
+            matches!(queued[1], Job::StartIndex { .. }),
+            "the job keeps its place behind the switch"
+        );
+    }
+
+    /// A turn with no switch keeps the arrival order.
+    #[test]
+    fn a_turn_with_no_switch_keeps_its_order() {
+        let (first, _wait) = channel();
+        let (second, _wait2) = channel();
+        let mut queued = vec![Job::StopIndex { answer: first }, Job::State(second)];
+
+        switch_first(&mut queued);
+
+        assert!(matches!(queued[0], Job::StopIndex { .. }), "the order holds");
+        assert!(matches!(queued[1], Job::State(_)), "the order holds");
+    }
+
+    /// A device switch reads the state again, so the speed line is not stale.
+    ///
+    /// The page holds no test runner, so this pins the call in the source. The
+    /// select and the speed line both come from the progress answer.
+    #[test]
+    fn the_page_reads_the_state_again_after_a_switch() {
+        let at = JS
+            .find("async function switchDevice")
+            .expect("the page holds the switch");
+        // The file holds CRLF endings, so the scan looks for the brace alone.
+        let body = &JS[at..];
+        let open = body.find('{').expect("the switch opens");
+        let rest = &body[open..];
+        let end = rest.find("\n}").expect("the switch ends");
+        assert!(
+            rest[..end].contains("/api/progress"),
+            "a switch must read the state again, or the page keeps the old device"
+        );
     }
 }

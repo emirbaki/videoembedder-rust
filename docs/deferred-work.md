@@ -16,7 +16,10 @@ Item 5 still waits.
 
 Items 1 and 7 of section 1 of this list are done. The `cut-pass` branch landed
 the one-pass cut, the progressive copy of a fragmented MP4, and the black-frame
-probe. The list below holds the rank of the work that remains.
+probe.
+
+Item 2 of section 1 landed on 2026-10-13. A failed load on the card loads on
+the processor instead. The list below holds the rank of the work that remains.
 
 The `indexing-plan` branch merged into `main` on 2026-10-12. The full suite
 passes on the merged tree: 108 lib tests, 15 console tests, and 25 web tests.
@@ -46,11 +49,10 @@ The rank weighs the gain against the cost.
 | # | Item | Gain | Cost |
 | --- | --- | --- | --- |
 | 1 | Both grids for one video | Medium | Medium |
-| 2 | A fallback when the card fails | Medium | Low |
-| 3 | The model download | Medium | Medium |
-| 4 | The cold and warm speed report | Small | Low |
-| 5 | Finer steps in the plan panel | Small | Low |
-| 6 | A pause inside one window | Small | Low |
+| 2 | The model download | Medium | Medium |
+| 3 | The cold and warm speed report | Small | Low |
+| 4 | Finer steps in the plan panel | Small | Low |
+| 5 | A pause inside one window | Small | Low |
 
 ### 1.1 Both grids for one video
 
@@ -60,45 +62,37 @@ here" and "which second" together. The comparison doc calls this a hybrid.
 
 The cost is more records for one video, plus a search that mixes two grids.
 
-### 1.2 A fallback when the card fails
-
-Google tries the preferred backend and falls back to the CPU when init fails
-(`OnDeviceEmbedder.kt:374-409`). The web server answers an error instead. This
-app keeps the audio on the same context as the frames, and Google keeps the
-audio on the CPU in every branch (`OnDeviceEmbedder.kt:318-333`).
-
-### 1.3 The model download
+### 1.2 The model download
 
 The user fetches the model by hand. Google downloads with a range resume and a
 temporary file.
 
-### 1.4 The cold and warm speed report
+### 1.3 The cold and warm speed report
 
 The page shows items a second and the model load in milliseconds. Google
 reports the cold init apart from the warm init, and it keeps the raw samples for
 each run. It never blends the numbers into one figure.
 
-### 1.5 Finer steps in the plan panel
+### 1.4 Finer steps in the plan panel
 
 The two sliders run in whole seconds. The Fine preset holds a 0.25 s window, so
 the panel cannot show it. The Fine button applies at once for that reason. A
 step of 0.25 s in the window slider would show every preset in the controls.
 
-### 1.6 A pause inside one window
+### 1.5 A pause inside one window
 
 The engine reads the pause flag between items, so a press waits for the window
 in the model. A finer check costs a flag read inside `IndexRun::step`.
 
 ## 2. Small fixes from the device-mode review
 
+Five of the six landed on `small-fixes` on 2026-10-13: the turn order, the
+refusal text, the page mode, the flag stripping, and the load-failure code.
+The fallback when the card fails also landed there. One item still waits.
+
 | # | Item |
 | --- | --- |
-| 1 | A switch and a Start in one engine turn are order-dependent. |
-| 2 | A refused second switch says an index job runs. No such job exists. |
 | 3 | `/api/device` reloads the model when the mode is already active. The console guards this. The page does not. |
-| 4 | The page shows the picked mode before the load ends, and holds stale text after. |
-| 5 | The `--gpu` and `--cpu` flags are stripped from any place in the arguments. |
-| 6 | A load failure on the server answers HTTP 400. |
 
 ## 3. Optimisations
 

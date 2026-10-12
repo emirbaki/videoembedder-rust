@@ -55,18 +55,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Take the mode flag out of the arguments.
+/// Take the mode flag out of the head of the arguments.
 ///
-/// `--gpu` and `--cpu` name the device for the model load. Every other word
-/// stays in the command line, so a foreign flag reaches the command parser.
+/// `--gpu` and `--cpu` name the device for the model load, and they come
+/// before the command. A flag past the command is a word of the command, so a
+/// query with the text `--gpu` keeps it.
 fn split_device(args: Vec<String>) -> (Option<Device>, Vec<String>) {
     let mut asked = None;
     let mut rest = Vec::new();
+    let mut head = true;
     for word in args {
-        match word.strip_prefix("--").and_then(Device::parse) {
-            Some(device) => asked = Some(device),
-            None => rest.push(word),
+        if head {
+            match word.strip_prefix("--").and_then(Device::parse) {
+                Some(device) => {
+                    asked = Some(device);
+                    continue;
+                }
+                None => head = false,
+            }
         }
+        rest.push(word);
     }
     (asked, rest)
 }
@@ -114,6 +122,18 @@ fn split_command(line: &str) -> (&str, &str) {
     }
 }
 
+/// The line that reports a finished device change.
+///
+/// The device in use leads. A load on the card may fall back to the
+/// processor, and the user must learn which device serves.
+fn change_report(asked: Device, in_use: Device) -> String {
+    if asked == in_use {
+        format!("Now on {}.", in_use.as_str())
+    } else {
+        format!("The card refused the model. Now on {}.", in_use.as_str())
+    }
+}
+
 /// Load the model again on another device.
 ///
 /// The load takes some seconds, and the old model serves until the new one is
@@ -128,7 +148,7 @@ fn device(embedder: &mut Embedder, models: &Path, rest: &str) -> Result<()> {
     }
     println!("Loading the model on {}.", device.as_str());
     embedder.reload(models, device)?;
-    println!("Now on {}.", device.as_str());
+    println!("{}", change_report(device, embedder.device()));
     Ok(())
 }
 
@@ -519,9 +539,20 @@ mod tests {
         assert_eq!(asked, Some(Device::Cpu));
         assert_eq!(rest, vec!["index"]);
 
+        let (asked, rest) = split_device(vec!["--gpu".into(), "--cpu".into(), "index".into()]);
+        assert_eq!(asked, Some(Device::Cpu), "the last leading flag wins");
+        assert_eq!(rest, vec!["index"]);
+    }
+
+    /// A flag past the command is a word of the command, not a mode.
+    ///
+    /// The mode comes before the command. A word `--gpu` after the command
+    /// belongs to the command, and the run must not load another model for it.
+    #[test]
+    fn a_flag_after_the_command_stays_in_the_command() {
         let (asked, rest) = split_device(vec!["search".into(), "--gpu".into(), "blue".into()]);
-        assert_eq!(asked, Some(Device::Gpu));
-        assert_eq!(rest, vec!["search", "blue"]);
+        assert_eq!(asked, None);
+        assert_eq!(rest, vec!["search", "--gpu", "blue"]);
     }
 
     /// A word that starts with `--` is not a mode, and it stays in the command.
@@ -835,5 +866,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&dir.join("index.db")).unwrap();
         (dir, store)
+    }
+
+    /// A load that falls back reports the device that answered.
+    ///
+    /// The user asked for the card and the model landed on the processor. The
+    /// line must name the processor, or the user believes the card serves.
+    #[test]
+    fn a_fallback_reports_the_device_that_answered() {
+        let line = change_report(Device::Gpu, Device::Cpu);
+        assert!(line.contains("CPU"), "the line names the device in use: {line}");
+        assert!(
+            !line.contains("GPU"),
+            "the line does not name the device the user asked for: {line}"
+        );
+    }
+
+    /// A load that holds its device reports one device.
+    #[test]
+    fn a_load_that_holds_reports_its_device() {
+        assert_eq!(change_report(Device::Cpu, Device::Cpu), "Now on CPU.");
     }
 }

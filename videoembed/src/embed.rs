@@ -85,6 +85,34 @@ fn choose_device(backend: &LlamaBackend, asked: Option<Device>) -> Result<Device
     }
 }
 
+/// The device to try after a load fails on `device`, if one is left.
+///
+/// The processor is the last device. A failure there has no fall back.
+fn fallback_device(device: Device) -> Option<Device> {
+    match device {
+        Device::Gpu => Some(Device::Cpu),
+        Device::Cpu => None,
+    }
+}
+
+/// Load on one device, then on the fall back when the first load fails.
+///
+/// The card is the fast path, and a machine may hold one that cannot take the
+/// model. Google falls back to the processor when init fails. The function
+/// returns the device that answered, so the caller reports the truth.
+fn try_devices<T, F>(device: Device, mut open: F) -> Result<(Device, T)>
+where
+    F: FnMut(Device) -> Result<T>,
+{
+    match open(device) {
+        Ok(value) => Ok((device, value)),
+        Err(err) => match fallback_device(device) {
+            Some(next) => open(next).map(|value| (next, value)),
+            None => Err(err),
+        },
+    }
+}
+
 /// The model parameters for one mode. The GPU keeps every layer on the card.
 ///
 /// The CPU mode asks for zero layers in words. The default is -1, and
@@ -157,7 +185,8 @@ impl Embedder {
         send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
         let backend = LlamaBackend::init()?;
         let device = choose_device(&backend, asked)?;
-        let (model, mtmd) = Self::open(models, &backend, device)?;
+        let (device, (model, mtmd)) =
+            try_devices(device, |device| Self::open(models, &backend, device))?;
         Ok(Self {
             backend,
             device,
@@ -193,14 +222,17 @@ impl Embedder {
     ///
     /// The call takes the embedder by shared reference, so a caller may keep a
     /// context open while the new model loads. The old model stays in place
-    /// until [`Embedder::swap`], so a failure here changes nothing.
+    /// until [`Embedder::swap`], so a failure here changes nothing. A failed
+    /// load on the card falls back to the processor, and the answer names the
+    /// device that took the model.
     pub fn prepare(
         &self,
         models: &Path,
         device: Device,
     ) -> Result<(Device, LlamaModel, MtmdContext)> {
         let device = choose_device(&self.backend, Some(device))?;
-        let (model, mtmd) = Self::open(models, &self.backend, device)?;
+        let (device, (model, mtmd)) =
+            try_devices(device, |device| Self::open(models, &self.backend, device))?;
         Ok((device, model, mtmd))
     }
 
@@ -713,5 +745,46 @@ mod tests {
                 "a card that is not here is an error, not a fall back"
             );
         }
+    }
+
+    /// A failed load on the card falls back to the processor.
+    ///
+    /// Google tries the preferred backend and falls back when init fails. The
+    /// caller reports the device that answered, so the user learns the truth.
+    #[test]
+    fn a_failed_card_load_falls_back_to_the_processor() {
+        let tried = std::cell::RefCell::new(Vec::new());
+        let answer = try_devices(Device::Gpu, |device| {
+            tried.borrow_mut().push(device);
+            if device == Device::Gpu {
+                bail!("the card is out of memory")
+            }
+            Ok("the processor model")
+        })
+        .unwrap();
+        assert_eq!(*tried.borrow(), vec![Device::Gpu, Device::Cpu]);
+        assert_eq!(answer.0, Device::Cpu);
+        assert_eq!(answer.1, "the processor model");
+    }
+
+    /// A card that loads keeps its place. The processor never loads.
+    #[test]
+    fn a_card_that_loads_is_kept() {
+        let tried = std::cell::RefCell::new(Vec::new());
+        let answer = try_devices(Device::Gpu, |device| {
+            tried.borrow_mut().push(device);
+            Ok("the card model")
+        })
+        .unwrap();
+        assert_eq!(*tried.borrow(), vec![Device::Gpu]);
+        assert_eq!(answer.0, Device::Gpu);
+        assert_eq!(answer.1, "the card model");
+    }
+
+    /// The processor is the last device. A failure there is an error.
+    #[test]
+    fn a_failed_processor_load_is_an_error() {
+        let answer: Result<(Device, &str)> = try_devices(Device::Cpu, |_| bail!("no room"));
+        assert!(answer.is_err());
     }
 }
