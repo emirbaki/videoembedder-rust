@@ -671,7 +671,8 @@ fn handle(
             let _ = answer.send(running);
         }
         Job::SetPlan { path, plan, answer } => {
-            let _ = answer.send(start_plan(progress, pending, stopped, &path, plan));
+            let media = store.media_dir();
+            let _ = answer.send(start_plan(progress, pending, stopped, &path, plan, &media));
         }
         Job::SetDevice { device, answer } => {
             // The loop owns the model, so the load happens there.
@@ -784,6 +785,7 @@ fn start_plan(
     flag: &Arc<AtomicBool>,
     path: &str,
     plan: videoembed::plan::Plan,
+    media: &Path,
 ) -> Result<usize, JobError> {
     refuse_when_busy(pending)?;
     let video = PathBuf::from(path);
@@ -793,7 +795,7 @@ fn start_plan(
             video.display()
         )));
     }
-    let run = index::IndexRun::start_with(&video, &plan).map_err(JobError::from)?;
+    let run = index::IndexRun::start_with(&video, &plan, media).map_err(JobError::from)?;
     let total = run.total();
     flag.store(false, Ordering::Relaxed);
     let label = normalize_label(path);
@@ -873,7 +875,8 @@ fn step_job(
                 videoembed::plan::Plan::default_plan()
             }
         };
-        match index::IndexRun::start_with(&video, &plan) {
+        let media = store.media_dir();
+        match index::IndexRun::start_with(&video, &plan, &media) {
             Ok(run) => {
                 if store.is_done(&label) {
                     job.file_at += 1;
@@ -1636,12 +1639,14 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let mut pending = None;
 
+        let media = std::env::temp_dir().join(format!("vei_web_plan_media_{}", std::process::id()));
         let total = start_plan(
             &progress,
             &mut pending,
             &flag,
             &video.to_string_lossy(),
             videoembed::plan::Plan::of(videoembed::plan::Preset::Speech),
+            &media,
         )
         .unwrap();
 

@@ -239,7 +239,8 @@ fn index(embedder: &Embedder, store: &mut Store, rest: &str) -> Result<()> {
     println!("Video: {}", video.display());
     println!("{}", index_line(&plan));
     let mut report = |n: usize, total: usize| println!("  item {n:5}/{total}");
-    let records = index::index_video(embedder, &video, &plan, &mut report)?;
+    let media = store.media_dir();
+    let records = index::index_video(embedder, &video, &plan, &media, &mut report)?;
     let count = records.len();
     store.forget(&label)?;
     store.append(records)?;

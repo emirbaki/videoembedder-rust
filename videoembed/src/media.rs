@@ -145,83 +145,6 @@ pub fn has_audio(video: &Path) -> bool {
     }
 }
 
-/// Cut one span into JPEG frames at `rate` frames a second.
-///
-/// One ffmpeg call cuts the whole span. The seek flag comes before the input,
-/// so ffmpeg seeks fast and reads only the span.
-pub fn extract_frames(
-    video: &Path,
-    from: f64,
-    to: f64,
-    rate: f64,
-    dir: &Path,
-) -> Result<Vec<PathBuf>> {
-    std::fs::create_dir_all(dir)?;
-    let pattern = dir.join("f%05d.jpg").to_string_lossy().to_string();
-    let args = vec![
-        "-y".into(),
-        "-ss".into(),
-        format!("{from}"),
-        "-i".into(),
-        video.to_string_lossy().to_string(),
-        "-t".into(),
-        format!("{}", to - from),
-        "-vf".into(),
-        format!("fps={rate}"),
-        "-q:v".into(),
-        "2".into(),
-        pattern,
-    ];
-    run_ffmpeg(args, "extracting frames")?;
-    read_media(dir, &["jpg", "jpeg", "png"])
-}
-
-/// Cut one span into one-second 16 kHz mono WAV clips.
-///
-/// The segment muxer names the clips in time order. A video with no audio
-/// track gives an empty list, because a cut would fail.
-pub fn extract_audio(video: &Path, from: f64, to: f64, dir: &Path) -> Result<Vec<PathBuf>> {
-    if !has_audio(video) {
-        return Ok(Vec::new());
-    }
-    std::fs::create_dir_all(dir)?;
-    let pattern = dir.join("a%05d.wav").to_string_lossy().to_string();
-    let args = vec![
-        "-y".into(),
-        "-ss".into(),
-        format!("{from}"),
-        "-i".into(),
-        video.to_string_lossy().to_string(),
-        "-t".into(),
-        format!("{}", to - from),
-        "-vn".into(),
-        "-ac".into(),
-        "1".into(),
-        "-ar".into(),
-        "16000".into(),
-        "-f".into(),
-        "segment".into(),
-        "-segment_time".into(),
-        "1".into(),
-        "-reset_timestamps".into(),
-        "1".into(),
-        pattern,
-    ];
-    run_ffmpeg(args, "extracting audio")?;
-    let found = read_media(dir, &["wav"])?;
-    // Drop a segment with no samples, so the index skips it instead of
-    // stopping on it.
-    let mut kept = Vec::new();
-    for path in found {
-        match std::fs::read(&path) {
-            Ok(bytes) if wav_has_samples(&bytes) => kept.push(path),
-            Ok(_) => {}
-            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-        }
-    }
-    Ok(kept)
-}
-
 /// Cut the audio of a whole video into one-second 16 kHz mono WAV clips.
 ///
 /// One ffmpeg call covers the whole track. Clip number `k` counts from zero
@@ -263,6 +186,27 @@ pub fn cut_audio(video: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(kept)
+}
+
+/// The file to cut: the video itself, or its progressive copy.
+///
+/// A fragmented MP4 seeks badly, so the index run reads a copy. The copy goes
+/// in `<store>/media/`, and this call makes it when it is missing or stale.
+pub fn source_file(video: &Path, media: &Path) -> Result<PathBuf> {
+    if !is_fragmented_mp4(video)? {
+        return Ok(video.to_path_buf());
+    }
+    progressive_copy(video, media)
+}
+
+/// True when an MP4 holds fragmented media. Filled in by a later task.
+pub fn is_fragmented_mp4(_path: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+/// Rewrite a fragmented MP4 as a progressive MP4. Filled in by a later task.
+pub fn progressive_copy(_video: &Path, _media: &Path) -> Result<PathBuf> {
+    bail!("no copy yet")
 }
 
 /// Cut every frame of a video at `rate` frames a second.
@@ -393,36 +337,6 @@ mod tests {
         assert!(probe_stream_duration(&video, "s").unwrap().is_none());
     }
 
-    #[test]
-    fn extract_frames_cuts_one_frame_every_quarter_second() {
-        let video = test_video();
-        if !ready() || !video.exists() {
-            eprintln!("skipped: ffmpeg or the test video is missing");
-            return;
-        }
-        let dir = scratch("frames");
-        let frames = extract_frames(&video, 0.0, 2.0, 4.0, &dir).unwrap();
-        assert_eq!(frames.len(), 8, "got {}", frames.len());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn extract_audio_cuts_one_clip_a_second() {
-        let video = test_video();
-        if !ready() || !video.exists() {
-            eprintln!("skipped: ffmpeg or the test video is missing");
-            return;
-        }
-        if !has_audio(&video) {
-            eprintln!("skipped: the test video holds no audio track");
-            return;
-        }
-        let dir = scratch("audio");
-        let clips = extract_audio(&video, 0.0, 3.0, &dir).unwrap();
-        assert_eq!(clips.len(), 3, "got {}", clips.len());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// One pass over the whole video gives one frame for each step of the rate.
     #[test]
     fn a_whole_video_cut_gives_a_frame_a_step() {
@@ -491,11 +405,11 @@ mod tests {
         assert!(cut_audio(&silent, &out).unwrap().is_empty());
     }
 
+    /// A missing file gives a fault, and not an empty list.
     #[test]
-    fn extract_frames_fails_on_a_missing_file() {
+    fn a_whole_video_cut_fails_on_a_missing_file() {
         let dir = scratch("missing");
-        let outcome = extract_frames(Path::new("no_such_video.mp4"), 0.0, 1.0, 4.0, &dir);
-        assert!(outcome.is_err());
+        assert!(cut_frames(Path::new("no_such_video.mp4"), 4.0, &dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

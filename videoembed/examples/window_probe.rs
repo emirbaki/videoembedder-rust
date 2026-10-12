@@ -99,21 +99,27 @@ fn index_windows(
     audio: bool,
 ) -> Result<Vec<(f64, f64, Vec<f32>)>> {
     let duration = media::probe_duration(video)?;
+    // One pass cuts every frame and every clip, so a window costs no ffmpeg
+    // call of its own.
+    let dir = index::work_dir(0);
+    let frames = media::cut_frames(video, FPS, &dir)?;
+    let clips = if audio {
+        media::cut_audio(video, &dir)?
+    } else {
+        Vec::new()
+    };
     let mut out = Vec::new();
     let mut ctx = embedder.new_context()?;
     let mut t = 0.0;
     while t + WINDOW <= duration {
-        let dir = index::work_dir(out.len());
-        let mut parts = media::extract_frames(video, t, t + WINDOW, FPS, &dir)?;
-        if audio {
-            parts.extend(media::extract_audio(video, t, t + WINDOW, &dir)?);
-        }
+        let mut parts = index::frames_in(&frames, t, WINDOW, FPS);
+        parts.extend(index::clips_in(&clips, t, WINDOW));
         let refs: Vec<&Path> = parts.iter().map(|path| path.as_path()).collect();
         let vec = embedder.embed_window_in(&mut ctx, &refs)?;
         out.push((t, t + WINDOW, vec));
-        let _ = std::fs::remove_dir_all(&dir);
         t += STRIDE;
     }
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(out)
 }
 

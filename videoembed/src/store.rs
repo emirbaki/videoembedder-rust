@@ -101,6 +101,15 @@ impl Store {
         Ok(store)
     }
 
+    /// The folder that holds the progressive copies of the videos.
+    pub fn media_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|dir| dir.to_path_buf())
+            .unwrap_or_default()
+            .join("media")
+    }
+
     /// Import the records of an old `VEI1` file beside the store.
     ///
     /// The import runs when the old file is here and the database holds no
@@ -663,6 +672,14 @@ mod tests {
         let path = dir.join("index.db");
         let store = Store::open(&path).unwrap();
         (dir, store)
+    }
+
+    /// The media folder sits beside the store file.
+    #[test]
+    fn the_media_folder_sits_beside_the_store() {
+        let (dir, store) = opened("media_dir");
+        assert_eq!(store.media_dir(), dir.join("media"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn scratch(name: &str) -> PathBuf {

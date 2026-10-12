@@ -231,6 +231,12 @@ enum Phase {
 #[derive(Debug)]
 pub struct IndexRun {
     video: PathBuf,
+    /// The file to cut. It is the video itself, or its progressive copy.
+    source: PathBuf,
+    /// Every frame of the whole-video cut. Empty until the first cut.
+    frames_cut: Vec<PathBuf>,
+    /// Every audio clip of the whole-video cut. Empty until the first cut.
+    clips_cut: Vec<PathBuf>,
     label: String,
     duration: f64,
     frames: Vec<f64>,
@@ -257,12 +263,21 @@ impl IndexRun {
     /// refuses it. A short audio track is normal, so the audio plan is often
     /// shorter than the frame plan.
     pub fn start(video: &Path) -> Result<Self> {
-        let duration = media::probe_duration(video)?;
-        let video_len = media::probe_stream_duration(video, "v")?
+        Self::start_from(video, video)
+    }
+
+    /// Probe the video and build the frame and the audio plan.
+    ///
+    /// `source` names the file to cut, and `video` names the video of the
+    /// user. The two differ only for a fragmented MP4, which the run reads
+    /// through its progressive copy.
+    fn start_from(source: &Path, video: &Path) -> Result<Self> {
+        let duration = media::probe_duration(source)?;
+        let video_len = media::probe_stream_duration(source, "v")?
             .unwrap_or(duration)
             .min(duration);
-        let audio_len = if media::has_audio(video) {
-            media::probe_stream_duration(video, "a")?
+        let audio_len = if media::has_audio(source) {
+            media::probe_stream_duration(source, "a")?
                 .unwrap_or(duration)
                 .min(duration)
         } else {
@@ -274,6 +289,9 @@ impl IndexRun {
         }
         Ok(Self {
             video: video.to_path_buf(),
+            source: source.to_path_buf(),
+            frames_cut: Vec::new(),
+            clips_cut: Vec::new(),
             label: store::normalize_label(&video.to_string_lossy()),
             duration,
             frames,
@@ -294,11 +312,13 @@ impl IndexRun {
     /// Probe the video and build the plan of the run.
     ///
     /// Fine mode follows the length of each stream, not the length of the file.
-    /// Window mode follows the duration and the plan.
-    pub fn start_with(video: &Path, plan: &crate::plan::Plan) -> Result<Self> {
+    /// Window mode follows the duration and the plan. `media` names the folder
+    /// that holds a progressive copy of a fragmented video.
+    pub fn start_with(video: &Path, plan: &crate::plan::Plan, media: &Path) -> Result<Self> {
+        let source = media::source_file(video, media)?;
         match plan.mode {
-            crate::plan::Mode::Window => Self::start_window(video, plan),
-            crate::plan::Mode::Fine => Self::start(video),
+            crate::plan::Mode::Window => Self::start_window(&source, plan, video),
+            crate::plan::Mode::Fine => Self::start_from(&source, video),
         }
     }
 
@@ -316,8 +336,8 @@ impl IndexRun {
     }
 
     /// Probe the video and build the window plan.
-    fn start_window(video: &Path, plan: &crate::plan::Plan) -> Result<Self> {
-        let duration = media::probe_duration(video)?;
+    fn start_window(source: &Path, plan: &crate::plan::Plan, video: &Path) -> Result<Self> {
+        let duration = media::probe_duration(source)?;
         let windows = plan.window_starts(duration);
         if windows.is_empty() {
             bail!(
@@ -328,6 +348,9 @@ impl IndexRun {
         }
         Ok(Self {
             video: video.to_path_buf(),
+            source: source.to_path_buf(),
+            frames_cut: Vec::new(),
+            clips_cut: Vec::new(),
             label: store::normalize_label(&video.to_string_lossy()),
             duration,
             frames: Vec::new(),
@@ -464,49 +487,80 @@ impl IndexRun {
         }
     }
 
+    /// The media of one window, as a slice of the whole-video cut.
+    ///
+    /// The frames and the clips of the window keep the order that the embedder
+    /// reads: the frames first, then the audio.
+    fn window_files(&self) -> Vec<PathBuf> {
+        let at = self.window_at;
+        let from = self.windows[at];
+        let rate = self.plan.frame_rate();
+        let mut files = frames_in(&self.frames_cut, from, self.plan.window, rate);
+        files.extend(clips_in(&self.clips_cut, from, self.plan.window));
+        files
+    }
+
+    /// Cut every frame and every clip of the video, one time.
+    ///
+    /// One window of a plan costs no ffmpeg call after this cut. A video with a
+    /// short audio track cuts fewer clips than frames, and a window past the
+    /// audio end holds frames alone.
+    fn cut_media(&mut self) -> Result<()> {
+        if !self.frames_cut.is_empty() || !self.clips_cut.is_empty() {
+            return Ok(());
+        }
+        self.clear_media();
+        self.dir = work_dir(0);
+        std::fs::create_dir_all(&self.dir)?;
+        let rate = match self.plan.mode {
+            crate::plan::Mode::Window => self.plan.frame_rate(),
+            crate::plan::Mode::Fine => FRAME_RATE,
+        };
+        let frame_dir = self.dir.join("frames");
+        self.frames_cut = media::cut_frames(&self.source, rate, &frame_dir)?;
+        // Fine mode always holds audio records. Window mode holds them only
+        // when the plan asks for them.
+        let wants_audio = self.plan.audio || !self.audios.is_empty();
+        if wants_audio {
+            let audio_dir = self.dir.join("audio");
+            self.clips_cut = media::cut_audio(&self.source, &audio_dir)?;
+        }
+        Ok(())
+    }
+
     fn cut_batch(&mut self) -> Result<()> {
-        self.clear_dir();
+        self.files.clear();
         if self.phase == Phase::Done || self.starts().is_empty() {
             self.phase = Phase::Done;
             return Ok(());
         }
+        self.cut_media()?;
         if self.phase == Phase::Windows {
-            let at = self.at();
-            let from = self.windows[at];
-            let to = (from + self.plan.window).min(self.duration);
-            self.dir = work_dir(at);
-            std::fs::create_dir_all(&self.dir)?;
-            let mut files =
-                media::extract_frames(&self.video, from, to, self.plan.frame_rate(), &self.dir)?;
-            if self.plan.audio {
-                // The audio is dropped when the clip gives nothing. The window
-                // then holds the frames alone.
-                files.extend(media::extract_audio(&self.video, from, to, &self.dir)?);
+            self.files = self.window_files();
+            self.batch_from = self.at();
+            if self.files.is_empty() {
+                bail!(
+                    "no media came from the window at {} s",
+                    self.windows[self.window_at]
+                );
             }
-            if files.is_empty() {
-                bail!("no media came from the window at {from} s");
-            }
-            self.files = files;
-            self.batch_from = at;
             return Ok(());
         }
+        // Fine mode slices the whole-video cut by item, because one frame sits
+        // at one frame step and one clip at one audio second.
         let at = self.at();
-        let (count, step) = match self.phase {
-            Phase::Frames => (FRAME_BATCH, FRAME_STEP),
-            Phase::Audio => (AUDIO_BATCH, AUDIO_SECONDS),
+        let count = match self.phase {
+            Phase::Frames => FRAME_BATCH,
+            Phase::Audio => AUDIO_BATCH,
             Phase::Windows | Phase::Done => unreachable!(),
         };
-        let starts = self.starts();
-        let from = starts[at];
-        let last = (at + count).min(starts.len()) - 1;
-        let to = (starts[last] + step).min(self.duration);
-        self.dir = work_dir(at);
-        std::fs::create_dir_all(&self.dir)?;
-        self.files = match self.phase {
-            Phase::Frames => media::extract_frames(&self.video, from, to, FRAME_RATE, &self.dir)?,
-            Phase::Audio => media::extract_audio(&self.video, from, to, &self.dir)?,
+        let whole = match self.phase {
+            Phase::Frames => &self.frames_cut,
+            Phase::Audio => &self.clips_cut,
             Phase::Windows | Phase::Done => unreachable!(),
         };
+        let end = (at + count).min(whole.len());
+        self.files = whole[at..end].to_vec();
         self.batch_from = at;
         if self.files.is_empty() {
             if self.phase == Phase::Audio {
@@ -519,17 +573,20 @@ impl IndexRun {
         Ok(())
     }
 
-    fn clear_dir(&mut self) {
+    /// Remove the work folder and the whole-video cut.
+    fn clear_media(&mut self) {
         if !self.dir.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
         self.files.clear();
+        self.frames_cut.clear();
+        self.clips_cut.clear();
     }
 }
 
 impl Drop for IndexRun {
     fn drop(&mut self) {
-        self.clear_dir();
+        self.clear_media();
     }
 }
 
@@ -541,9 +598,10 @@ pub fn index_video(
     embedder: &Embedder,
     video: &Path,
     plan: &crate::plan::Plan,
+    media: &Path,
     on_step: &mut dyn FnMut(usize, usize),
 ) -> Result<Vec<NewRecord>> {
-    let mut run = IndexRun::start_with(video, plan)?;
+    let mut run = IndexRun::start_with(video, plan, media)?;
     let total = run.total();
     let mut ctx = embedder.new_context()?;
     let mut records = Vec::with_capacity(total);
@@ -570,10 +628,11 @@ pub fn reindex(
     if !video.is_file() {
         bail!("{} is not a file", video.display());
     }
+    let media = store.media_dir();
     let label = store::normalize_label(path);
     store.set_plan(&label, plan)?;
     store.clear_records(&label)?;
-    let records = index_video(embedder, video, plan, on_step)?;
+    let records = index_video(embedder, video, plan, &media, on_step)?;
     let count = records.len();
     store.append(records)?;
     store.mark_done(&label)?;
@@ -1055,6 +1114,9 @@ mod tests {
     fn the_run_ends_after_the_frames_when_the_audio_plan_is_empty() {
         let mut run = IndexRun {
             video: PathBuf::from("silent.mp4"),
+            source: PathBuf::from("silent.mp4"),
+            frames_cut: Vec::new(),
+            clips_cut: Vec::new(),
             label: "silent.mp4".to_string(),
             duration: 1.0,
             frames: vec![0.0, 0.25, 0.5, 0.75],
@@ -1335,6 +1397,45 @@ mod tests {
         assert!(clips_in(&[], 0.0, 2.0).is_empty());
     }
 
+    /// The window run cuts the whole video one time.
+    ///
+    /// The cut holds every frame and every clip of the plan, so a window costs
+    /// no ffmpeg call at all.
+    #[test]
+    fn the_window_run_cuts_the_whole_video_once() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("one_pass_media");
+        let plan = plan::Plan::of(plan::Preset::Object);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+        // A plain video is its own source, so no copy comes.
+        assert_eq!(media::source_file(&video, &media).unwrap(), video);
+
+        run.cut_batch().unwrap();
+        assert_eq!(run.frames_cut.len(), 30);
+        assert_eq!(run.clips_cut.len(), 24);
+        // One window of the Object plan holds two frames and two clips.
+        assert_eq!(run.files.len(), 4);
+    }
+
+    /// A window past the end of the audio holds the frames alone.
+    #[test]
+    fn a_window_past_the_audio_holds_frames_alone() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("late_window_media");
+        let plan = plan::Plan::of(plan::Preset::Object);
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+        run.cut_batch().unwrap();
+
+        // The audio stream ends at 23.1 s, so the window at 28 s holds no clip.
+        run.window_at = 28;
+        run.cut_batch().unwrap();
+        assert_eq!(run.files.len(), 2);
+    }
+
     /// The spike clip, when it is here.
     fn spike_video() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from("../spike/testvideo_nolabels.mp4");
@@ -1376,7 +1477,8 @@ mod tests {
             return;
         };
         let plan = plan::Plan::of(plan::Preset::Object);
-        let run = IndexRun::start_with(&video, &plan).unwrap();
+        let media = scratch("window_count_media");
+        let run = IndexRun::start_with(&video, &plan, &media).unwrap();
 
         let seconds = crate::media::probe_duration(&video).unwrap();
         let windows = plan.window_starts(seconds).len();
@@ -1396,7 +1498,8 @@ mod tests {
             return;
         };
         let plan = plan::Plan::of(plan::Preset::Speech);
-        let mut run = IndexRun::start_with(&video, &plan).unwrap();
+        let media = scratch("silent_window_media");
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
 
         assert!(run.total() > 0, "the windows must still come");
         // The cut of the first window must not fail, and the window must hold
@@ -1410,7 +1513,7 @@ mod tests {
             "a silent video gives frames alone: {:?}",
             run.files
         );
-        run.clear_dir();
+        run.clear_media();
     }
 
     /// A video shorter than one window is refused, and the message names the
@@ -1422,10 +1525,11 @@ mod tests {
         };
         let plan = plan::Plan::of(plan::Preset::Speech);
         // The run must refuse the video, and the message must name the window.
-        let err = IndexRun::start_with(&video, &plan).unwrap_err();
+        let media = scratch("short_window_media");
+        let err = IndexRun::start_with(&video, &plan, &media).unwrap_err();
         assert!(format!("{err}").contains("shorter than one"), "{err}");
         // The same video is long enough for the 2 s Object window.
         let object = plan::Plan::of(plan::Preset::Object);
-        assert!(IndexRun::start_with(&video, &object).is_ok());
+        assert!(IndexRun::start_with(&video, &object, &media).is_ok());
     }
 }
