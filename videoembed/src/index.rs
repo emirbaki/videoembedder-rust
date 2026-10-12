@@ -199,6 +199,26 @@ pub fn audio_starts(duration: f64) -> Vec<f64> {
     plan
 }
 
+/// The rate of a cut that holds the window grid and the fine grid.
+///
+/// The cut is a whole multiple of the plan rate and of 4 fps, so both paths
+/// take whole steps over it. A plan at 1 fps gives 4 fps. A plan at 3 fps
+/// gives 12 fps.
+pub fn dense_rate(plan_rate: f64) -> f64 {
+    let base = plan_rate.max(FRAME_RATE);
+    for n in 1..=64u32 {
+        let rate = base * f64::from(n);
+        let plan_step = rate / plan_rate;
+        let fine_step = rate / FRAME_RATE;
+        if (plan_step - plan_step.round()).abs() < 1e-9
+            && (fine_step - fine_step.round()).abs() < 1e-9
+        {
+            return rate;
+        }
+    }
+    base
+}
+
 /// The index of the first frame of one span, in the whole-video cut.
 ///
 /// The cut gives frame `n` at `n / rate`, so this index names the time of the
@@ -217,12 +237,28 @@ fn last_frame(from: f64, window: f64, rate: f64) -> usize {
 /// Frame `i` of the list sits at `i / rate`, and the span `[from, from + window)`
 /// takes the frames inside it. A span that runs past the list takes what is left.
 pub fn frames_in(cut: &[PathBuf], from: f64, window: f64, rate: f64) -> Vec<PathBuf> {
-    let first = first_frame(from, rate);
-    let end = last_frame(from, window, rate).min(cut.len());
+    frames_in_dense(cut, from, window, rate, rate)
+}
+
+/// The frames of one span, from a cut that holds the fine grid too.
+///
+/// A plan with the fine flag cuts at a rate above its own, so the window path
+/// takes every `cut_rate / rate` frame of the span. The frames sit at the times
+/// of its own rate, and the window keeps their count.
+pub fn frames_in_dense(
+    cut: &[PathBuf],
+    from: f64,
+    window: f64,
+    rate: f64,
+    cut_rate: f64,
+) -> Vec<PathBuf> {
+    let first = first_frame(from, cut_rate);
+    let end = last_frame(from, window, cut_rate).min(cut.len());
     if first >= end {
         return Vec::new();
     }
-    cut[first..end].to_vec()
+    let step = (cut_rate / rate).round().max(1.0) as usize;
+    cut[first..end].iter().step_by(step).cloned().collect()
 }
 
 /// The time of every media part of one window.
@@ -231,8 +267,25 @@ pub fn frames_in(cut: &[PathBuf], from: f64, window: f64, rate: f64) -> Vec<Path
 /// A frame sits at its own place in the cut, so these times match the files
 /// that `frames_in` gives. A clip sits at the second that it covers.
 pub fn window_times(from: f64, rate: f64, frames: usize, clips: usize) -> Vec<f64> {
-    let first = first_frame(from, rate);
-    let mut times: Vec<f64> = (0..frames).map(|i| (first + i) as f64 / rate).collect();
+    window_times_dense(from, rate, frames, clips, rate)
+}
+
+/// The time of every part of one window, from a cut that holds the fine grid.
+///
+/// The picked frames sit at the times of the plan rate, and the cut rate names
+/// the place of each one in the dense cut.
+pub fn window_times_dense(
+    from: f64,
+    rate: f64,
+    frames: usize,
+    clips: usize,
+    cut_rate: f64,
+) -> Vec<f64> {
+    let first = first_frame(from, cut_rate);
+    let step = (cut_rate / rate).round().max(1.0) as usize;
+    let mut times: Vec<f64> = (0..frames)
+        .map(|i| (first + i * step) as f64 / cut_rate)
+        .collect();
     times.extend((0..clips).map(|k| from.floor() + k as f64));
     times
 }
@@ -633,17 +686,31 @@ impl IndexRun {
         }
     }
 
+    /// The rate of the whole-video cut.
+    ///
+    /// The cut holds the fine grid when the plan asks for it, so it runs at a
+    /// rate that serves both paths at whole steps.
+    fn cut_rate(&self) -> f64 {
+        match self.plan.mode {
+            crate::plan::Mode::Window if self.plan.fine => dense_rate(self.plan.frame_rate()),
+            crate::plan::Mode::Window => self.plan.frame_rate(),
+            crate::plan::Mode::Fine => FRAME_RATE,
+        }
+    }
+
     /// The next group of windows, up to one model call of them.
     fn window_group(&self) -> Vec<WindowPart> {
         let rate = self.plan.frame_rate();
+        let cut_rate = self.cut_rate();
         let end = (self.window_at + N_WINDOW_BATCH).min(self.windows.len());
         (self.window_at..end)
             .map(|at| {
                 let from = self.windows[at];
-                let mut files = frames_in(&self.frames_cut, from, self.plan.window, rate);
+                let mut files =
+                    frames_in_dense(&self.frames_cut, from, self.plan.window, rate, cut_rate);
                 let frames = files.len();
                 let clips = clips_in(&self.clips_cut, from, self.plan.window);
-                let times = window_times(from, rate, frames, clips.len());
+                let times = window_times_dense(from, rate, frames, clips.len(), cut_rate);
                 files.extend(clips);
                 WindowPart {
                     start: from,
@@ -667,10 +734,7 @@ impl IndexRun {
         self.clear_media();
         self.dir = work_dir(0);
         std::fs::create_dir_all(&self.dir)?;
-        let rate = match self.plan.mode {
-            crate::plan::Mode::Window => self.plan.frame_rate(),
-            crate::plan::Mode::Fine => FRAME_RATE,
-        };
+        let rate = self.cut_rate();
         let frame_dir = self.dir.join("frames");
         self.frames_cut = media::cut_frames(&self.source, rate, &frame_dir)?;
         // Fine mode always holds audio records. Window mode holds them only
@@ -1099,6 +1163,45 @@ mod tests {
         let times = window_times(1.0, 4.0, 4, 0);
         assert_eq!(files.len(), times.len());
         assert_eq!(times, vec![1.0, 1.25, 1.5, 1.75]);
+    }
+
+    /// The dense cut serves both rates at whole steps.
+    #[test]
+    fn the_dense_cut_serves_both_rates() {
+        assert_eq!(dense_rate(1.0), 4.0);
+        assert_eq!(dense_rate(3.0), 12.0);
+        for rate in [0.5, 1.0, 1.5, 2.5, 4.0, 10.0] {
+            let cut = dense_rate(rate);
+            let plan_step = cut / rate;
+            let fine_step = cut / FRAME_RATE;
+            assert!(
+                (plan_step - plan_step.round()).abs() < 1e-9,
+                "the window step is whole at {rate} fps"
+            );
+            assert!(
+                (fine_step - fine_step.round()).abs() < 1e-9,
+                "the fine step is whole at {rate} fps"
+            );
+        }
+    }
+
+    /// A dense cut gives the window the frames of its own rate.
+    #[test]
+    fn a_dense_cut_gives_the_window_its_own_frames() {
+        // Four frames a second, so index `n` sits at `n / 4` s.
+        let cut: Vec<PathBuf> = (0..16).map(|n| PathBuf::from(format!("f{n}.jpg"))).collect();
+        // A 2 s window at 1 fps wants 2 frames, at 0 s and 1 s.
+        let files = frames_in_dense(&cut, 0.0, 2.0, 1.0, 4.0);
+        assert_eq!(files, vec![PathBuf::from("f0.jpg"), PathBuf::from("f4.jpg")]);
+        let times = window_times_dense(0.0, 1.0, files.len(), 0, 4.0);
+        assert_eq!(times, vec![0.0, 1.0]);
+        // The second window starts at 1 s, on its own frame.
+        let next = frames_in_dense(&cut, 1.0, 2.0, 1.0, 4.0);
+        assert_eq!(next[0], PathBuf::from("f4.jpg"));
+        // A window past the end of the cut takes what is left, and no more.
+        let left = frames_in_dense(&cut, 3.0, 2.0, 1.0, 4.0);
+        assert_eq!(left, vec![PathBuf::from("f12.jpg")]);
+        assert!(frames_in_dense(&cut, 40.0, 2.0, 1.0, 4.0).is_empty());
     }
 
     fn scratch(name: &str) -> PathBuf {
