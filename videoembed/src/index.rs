@@ -108,6 +108,8 @@ pub struct Hit {
     pub end: f32,
     pub score: f32,
     pub margin: f32,
+    /// The record kind of this hit, from `store::KIND_*`.
+    pub kind: u8,
 }
 
 /// One slice of a video, with the score of the whole slice.
@@ -138,6 +140,8 @@ pub struct Group {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub note: bool,
+    /// The record kind of this row, from `store::KIND_*`.
+    pub kind: u8,
     pub label: String,
     pub start: f32,
     pub end: f32,
@@ -974,6 +978,7 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
             end: record.end,
             score: *score,
             margin: *score - baseline,
+            kind: record.kind,
         };
         match groups.iter_mut().find(|g| g.video == name) {
             Some(group) => {
@@ -1057,6 +1062,7 @@ pub fn search_rows(
         if !store::is_video(record.kind) {
             notes.push(Row {
                 note: true,
+                kind: record.kind,
                 label: record.label.clone(),
                 start: record.start,
                 end: record.end,
@@ -1072,6 +1078,7 @@ pub fn search_rows(
                 end: record.end,
                 score: *score,
                 margin: *score - baseline,
+                kind: record.kind,
             },
         ));
     }
@@ -1090,6 +1097,7 @@ pub fn search_rows(
         for hit in merge_hits_with(hits, gap) {
             rows.push(Row {
                 note: false,
+                kind: hit.kind,
                 label: label.clone(),
                 start: hit.start,
                 end: hit.end,
@@ -1121,6 +1129,7 @@ pub fn merge_hits_with(hits: Vec<Hit>, gap: f32) -> Vec<Hit> {
                 if hit.score > last.score {
                     last.score = hit.score;
                     last.margin = hit.margin;
+                    last.kind = hit.kind;
                 }
                 if hit.end > last.end {
                     last.end = hit.end;
@@ -1322,6 +1331,21 @@ mod tests {
             run.phase == Phase::Windows,
             "no audio track, so the grid hands over"
         );
+    }
+
+    /// A hit names the kind of its record.
+    #[test]
+    fn a_hit_names_its_kind() {
+        let records = vec![
+            record_of(store::KIND_WINDOW, "a.mp4", 0.0, 2.0),
+            record_of(store::KIND_FRAME, "a.mp4", 5.0, 5.25),
+        ];
+        let ranked = vec![(0usize, 0.9f32), (1usize, 0.5f32)];
+        let rows = search_rows(&records, &ranked, 0.2, 10, MERGE_GAP);
+        assert_eq!(rows.len(), 2, "the two sit apart, so neither folds");
+        let kinds: Vec<u8> = rows.iter().map(|row| row.kind).collect();
+        assert!(kinds.contains(&store::KIND_WINDOW));
+        assert!(kinds.contains(&store::KIND_FRAME));
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1689,9 +1713,9 @@ mod tests {
     #[test]
     fn touching_hits_join_one_moment() {
         let hits = vec![
-            Hit { start: 0.0, end: 0.25, score: 0.70, margin: 0.10 },
-            Hit { start: 0.25, end: 0.5, score: 0.80, margin: 0.20 },
-            Hit { start: 0.5, end: 0.75, score: 0.60, margin: 0.05 },
+            Hit { start: 0.0, end: 0.25, score: 0.70, margin: 0.10, kind: 0 },
+            Hit { start: 0.25, end: 0.5, score: 0.80, margin: 0.20, kind: 0 },
+            Hit { start: 0.5, end: 0.75, score: 0.60, margin: 0.05, kind: 0 },
         ];
         let moments = merge_hits(hits);
 
@@ -1706,8 +1730,8 @@ mod tests {
     #[test]
     fn a_gap_of_two_frame_steps_keeps_two_moments() {
         let hits = vec![
-            Hit { start: 0.0, end: 0.25, score: 0.80, margin: 0.20 },
-            Hit { start: 1.0, end: 1.25, score: 0.70, margin: 0.10 },
+            Hit { start: 0.0, end: 0.25, score: 0.80, margin: 0.20, kind: 0 },
+            Hit { start: 1.0, end: 1.25, score: 0.70, margin: 0.10, kind: 0 },
         ];
         let moments = merge_hits(hits);
 
@@ -1718,8 +1742,8 @@ mod tests {
     #[test]
     fn the_moments_come_back_best_first() {
         let hits = vec![
-            Hit { start: 0.0, end: 0.25, score: 0.60, margin: 0.01 },
-            Hit { start: 2.0, end: 2.25, score: 0.90, margin: 0.30 },
+            Hit { start: 0.0, end: 0.25, score: 0.60, margin: 0.01, kind: 0 },
+            Hit { start: 2.0, end: 2.25, score: 0.90, margin: 0.30, kind: 0 },
         ];
         let moments = merge_hits(hits);
 
@@ -1730,7 +1754,7 @@ mod tests {
 
     #[test]
     fn one_hit_stays_one_hit() {
-        let hits = vec![Hit { start: 1.0, end: 1.25, score: 0.5, margin: 0.0 }];
+        let hits = vec![Hit { start: 1.0, end: 1.25, score: 0.5, margin: 0.0, kind: 0 }];
         assert_eq!(merge_hits(hits).len(), 1);
         assert!(merge_hits(Vec::new()).is_empty());
     }
@@ -1743,9 +1767,9 @@ mod tests {
     #[test]
     fn touching_audio_hits_join_one_moment() {
         let hits = vec![
-            Hit { start: 0.0, end: 1.0, score: 0.70, margin: 0.10 },
-            Hit { start: 1.0, end: 2.0, score: 0.75, margin: 0.15 },
-            Hit { start: 2.0, end: 3.0, score: 0.72, margin: 0.12 },
+            Hit { start: 0.0, end: 1.0, score: 0.70, margin: 0.10, kind: 0 },
+            Hit { start: 1.0, end: 2.0, score: 0.75, margin: 0.15, kind: 0 },
+            Hit { start: 2.0, end: 3.0, score: 0.72, margin: 0.12, kind: 0 },
         ];
         assert_eq!(merge_hits(hits).len(), 1);
     }

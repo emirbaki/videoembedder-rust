@@ -567,6 +567,7 @@ mod tests {
     fn row(label: &str, start: f32, end: f32, score: f32, note: bool) -> index::Row {
         index::Row {
             note,
+            kind: 0,
             label: label.to_string(),
             start,
             end,
