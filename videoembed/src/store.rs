@@ -312,7 +312,8 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "select plan_mode, plan_window, plan_stride, plan_frames, plan_audio
+                "select plan_mode, plan_window, plan_stride, plan_frames, plan_audio,
+                        plan_fine
                  from videos where path = ?1",
                 [&want],
                 |row| {
@@ -322,12 +323,13 @@ impl Store {
                         row.get::<_, f64>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 },
             )
             .optional()
             .context("read the plan")?;
-        let Some((mode, window, stride, frames, audio)) = row else {
+        let Some((mode, window, stride, frames, audio, fine)) = row else {
             return Ok(None);
         };
         let mode = plan::Mode::parse(&mode).unwrap_or(plan::Mode::Fine);
@@ -337,6 +339,7 @@ impl Store {
             stride,
             frames: frames as usize,
             audio: audio != 0,
+            fine: fine != 0,
         }))
     }
 
@@ -349,21 +352,23 @@ impl Store {
         self.conn
             .execute(
                 "insert into videos(path, plan_mode, plan_window, plan_stride, plan_frames,
-                                    plan_audio)
-                 values (?1, ?2, ?3, ?4, ?5, ?6)
+                                    plan_audio, plan_fine)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  on conflict(path) do update set
                    plan_mode = excluded.plan_mode,
                    plan_window = excluded.plan_window,
                    plan_stride = excluded.plan_stride,
                    plan_frames = excluded.plan_frames,
-                   plan_audio = excluded.plan_audio",
+                   plan_audio = excluded.plan_audio,
+                   plan_fine = excluded.plan_fine",
                 params![
                     want,
                     plan.mode.as_str(),
                     plan.window,
                     plan.stride,
                     plan.frames as i64,
-                    plan.audio as i64
+                    plan.audio as i64,
+                    plan.fine as i64
                 ],
             )
             .context("write the plan")?;
@@ -1404,6 +1409,45 @@ mod tests {
         let again = Store::open(&dir.join("index.db")).unwrap();
         let held = again.plan_of("a.mp4").unwrap().unwrap();
         assert_eq!(held, plan::Plan::of(plan::Preset::Action));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fine flag survives the store.
+    #[test]
+    fn the_fine_flag_round_trips_through_the_store() {
+        let (dir, mut store) = opened("plan_fine");
+        store
+            .append(vec![new_record("a.mp4", 0.0, 0.25)])
+            .unwrap();
+        let mut plan = plan::Plan::of(plan::Preset::Object);
+        plan.fine = true;
+        store.set_plan("a.mp4", &plan).unwrap();
+
+        let again = Store::open(&dir.join("index.db")).unwrap();
+        let held = again.plan_of("a.mp4").unwrap().unwrap();
+        assert!(held.fine, "the flag reads back");
+        assert_eq!(held.window, plan.window);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store from before this change gains the fine column.
+    #[test]
+    fn an_old_store_gains_the_fine_column() {
+        let dir = scratch("old_store");
+        let path = dir.join("index.db");
+        {
+            let store = Store::open(&path).unwrap();
+            drop(store);
+            // A store of the version before the flag holds no fine column.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("alter table videos drop column plan_fine")
+                .unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let plan = plan::Plan::of(plan::Preset::Object);
+        store.set_plan("a.mp4", &plan).unwrap();
+        let held = store.plan_of("a.mp4").unwrap().unwrap();
+        assert!(!held.fine, "the new column reads back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

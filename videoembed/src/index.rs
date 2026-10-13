@@ -73,6 +73,18 @@ pub fn is_weak(score: f32, cut: f32) -> bool {
 
 const VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mkv", "mov", "avi", "webm"];
 
+/// One finished run of the index job.
+///
+/// The load of the model holds its own number, `Progress::load_ms`, so this
+/// sample holds the warm work alone.
+#[derive(Clone, Debug, Serialize)]
+pub struct RunSample {
+    /// The items of the run.
+    pub items: usize,
+    /// The milliseconds of the run.
+    pub ms: u64,
+}
+
 /// The progress of the running index job. The server reads a copy.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
@@ -99,6 +111,8 @@ pub struct Progress {
     pub per_second: f32,
     /// The newest line of the running job. Empty when the job reports nothing.
     pub note: String,
+    /// The last runs of this session, newest last.
+    pub runs: Vec<RunSample>,
 }
 
 /// One matching item inside a video.
@@ -108,6 +122,8 @@ pub struct Hit {
     pub end: f32,
     pub score: f32,
     pub margin: f32,
+    /// The record kind of this hit, from `store::KIND_*`.
+    pub kind: u8,
 }
 
 /// One slice of a video, with the score of the whole slice.
@@ -138,6 +154,8 @@ pub struct Group {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub note: bool,
+    /// The record kind of this row, from `store::KIND_*`.
+    pub kind: u8,
     pub label: String,
     pub start: f32,
     pub end: f32,
@@ -199,6 +217,26 @@ pub fn audio_starts(duration: f64) -> Vec<f64> {
     plan
 }
 
+/// The rate of a cut that holds the window grid and the fine grid.
+///
+/// The cut is a whole multiple of the plan rate and of 4 fps, so both paths
+/// take whole steps over it. A plan at 1 fps gives 4 fps. A plan at 3 fps
+/// gives 12 fps.
+pub fn dense_rate(plan_rate: f64) -> f64 {
+    let base = plan_rate.max(FRAME_RATE);
+    for n in 1..=64u32 {
+        let rate = base * f64::from(n);
+        let plan_step = rate / plan_rate;
+        let fine_step = rate / FRAME_RATE;
+        if (plan_step - plan_step.round()).abs() < 1e-9
+            && (fine_step - fine_step.round()).abs() < 1e-9
+        {
+            return rate;
+        }
+    }
+    base
+}
+
 /// The index of the first frame of one span, in the whole-video cut.
 ///
 /// The cut gives frame `n` at `n / rate`, so this index names the time of the
@@ -217,12 +255,28 @@ fn last_frame(from: f64, window: f64, rate: f64) -> usize {
 /// Frame `i` of the list sits at `i / rate`, and the span `[from, from + window)`
 /// takes the frames inside it. A span that runs past the list takes what is left.
 pub fn frames_in(cut: &[PathBuf], from: f64, window: f64, rate: f64) -> Vec<PathBuf> {
-    let first = first_frame(from, rate);
-    let end = last_frame(from, window, rate).min(cut.len());
+    frames_in_dense(cut, from, window, rate, rate)
+}
+
+/// The frames of one span, from a cut that holds the fine grid too.
+///
+/// A plan with the fine flag cuts at a rate above its own, so the window path
+/// takes every `cut_rate / rate` frame of the span. The frames sit at the times
+/// of its own rate, and the window keeps their count.
+pub fn frames_in_dense(
+    cut: &[PathBuf],
+    from: f64,
+    window: f64,
+    rate: f64,
+    cut_rate: f64,
+) -> Vec<PathBuf> {
+    let first = first_frame(from, cut_rate);
+    let end = last_frame(from, window, cut_rate).min(cut.len());
     if first >= end {
         return Vec::new();
     }
-    cut[first..end].to_vec()
+    let step = (cut_rate / rate).round().max(1.0) as usize;
+    cut[first..end].iter().step_by(step).cloned().collect()
 }
 
 /// The time of every media part of one window.
@@ -231,8 +285,25 @@ pub fn frames_in(cut: &[PathBuf], from: f64, window: f64, rate: f64) -> Vec<Path
 /// A frame sits at its own place in the cut, so these times match the files
 /// that `frames_in` gives. A clip sits at the second that it covers.
 pub fn window_times(from: f64, rate: f64, frames: usize, clips: usize) -> Vec<f64> {
-    let first = first_frame(from, rate);
-    let mut times: Vec<f64> = (0..frames).map(|i| (first + i) as f64 / rate).collect();
+    window_times_dense(from, rate, frames, clips, rate)
+}
+
+/// The time of every part of one window, from a cut that holds the fine grid.
+///
+/// The picked frames sit at the times of the plan rate, and the cut rate names
+/// the place of each one in the dense cut.
+pub fn window_times_dense(
+    from: f64,
+    rate: f64,
+    frames: usize,
+    clips: usize,
+    cut_rate: f64,
+) -> Vec<f64> {
+    let first = first_frame(from, cut_rate);
+    let step = (cut_rate / rate).round().max(1.0) as usize;
+    let mut times: Vec<f64> = (0..frames)
+        .map(|i| (first + i * step) as f64 / cut_rate)
+        .collect();
     times.extend((0..clips).map(|k| from.floor() + k as f64));
     times
 }
@@ -441,17 +512,34 @@ impl IndexRun {
                 plan.window
             );
         }
+        // The flag adds the fine grid beside the windows. The grid follows
+        // each stream length, as the fine mode does.
+        let (frames, audios) = if plan.fine {
+            let video_len = media::probe_stream_duration(source, "v")?
+                .unwrap_or(duration)
+                .min(duration);
+            let audio_len = if media::has_audio(source) {
+                media::probe_stream_duration(source, "a")?
+                    .unwrap_or(duration)
+                    .min(duration)
+            } else {
+                0.0
+            };
+            (frames(video_len), audio_starts(audio_len))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Self {
             source: source.to_path_buf(),
             frames_cut: Vec::new(),
             clips_cut: Vec::new(),
             label: store::normalize_label(&video.to_string_lossy()),
             duration,
-            frames: Vec::new(),
-            audios: Vec::new(),
+            frames,
+            audios,
             frame_at: 0,
             audio_at: 0,
-            phase: Phase::Windows,
+            phase: if plan.fine { Phase::Frames } else { Phase::Windows },
             dir: PathBuf::new(),
             files: Vec::new(),
             batch_from: 0,
@@ -464,12 +552,39 @@ impl IndexRun {
         })
     }
 
+    /// True when the whole-video cut is here.
+    ///
+    /// `cut_media` makes the cut folder, so the folder names the cut.
+    fn cut_is_here(&self) -> bool {
+        !self.dir.as_os_str().is_empty()
+    }
+
+    /// The frames of the fine grid. The cut is the authority once it is here.
+    ///
+    /// A cut can hold fewer frames than the probed stream length claims, and a
+    /// count above the real work leaves a progress bar that never fills.
+    fn frame_total(&self) -> usize {
+        if self.frames.is_empty() {
+            return 0;
+        }
+        if !self.cut_is_here() {
+            return self.frames.len();
+        }
+        let step = (self.cut_rate() / FRAME_RATE).round().max(1.0) as usize;
+        ((self.frames_cut.len() + step - 1) / step).min(self.frames.len())
+    }
+
+    /// The audio records of the fine grid. The cut is the authority here too.
+    fn audio_total(&self) -> usize {
+        if self.audios.is_empty() || !self.cut_is_here() {
+            return self.audios.len();
+        }
+        self.clips_cut.len().min(self.audios.len())
+    }
+
     /// The number of records this run will make.
     pub fn total(&self) -> usize {
-        if self.phase == Phase::Windows {
-            return self.windows.len();
-        }
-        self.frames.len() + self.audios.len()
+        self.frame_total() + self.audio_total() + self.windows.len()
     }
 
     /// The number of records made so far.
@@ -606,14 +721,26 @@ impl IndexRun {
         self.files.len().saturating_sub(self.at() - self.batch_from)
     }
 
+    /// The phase after the fine grid of a video.
+    ///
+    /// A window plan with the flag runs its windows after the grid. A fine
+    /// plan has no window, so its run ends.
+    fn after_fine(&self) -> Phase {
+        if self.windows.is_empty() {
+            Phase::Done
+        } else {
+            Phase::Windows
+        }
+    }
+
     fn advance(&mut self) {
         match self.phase {
             Phase::Frames => {
                 self.frame_at += 1;
                 if self.frame_at >= self.frames.len() {
-                    // A video with no audio track has no second phase.
+                    // A video with no audio track goes to its windows.
                     self.phase = if self.audios.is_empty() {
-                        Phase::Done
+                        self.after_fine()
                     } else {
                         Phase::Audio
                     };
@@ -625,7 +752,7 @@ impl IndexRun {
             Phase::Audio => {
                 self.audio_at += 1;
                 if self.audio_at >= self.audios.len() {
-                    self.phase = Phase::Done;
+                    self.phase = self.after_fine();
                 }
             }
             // Window mode advances a whole group, in `step_group`.
@@ -633,17 +760,38 @@ impl IndexRun {
         }
     }
 
+    /// The rate of the whole-video cut.
+    ///
+    /// The cut holds the fine grid when the plan asks for it, so it runs at a
+    /// rate that serves both paths at whole steps.
+    fn cut_rate(&self) -> f64 {
+        match self.plan.mode {
+            crate::plan::Mode::Window if self.plan.fine => dense_rate(self.plan.frame_rate()),
+            crate::plan::Mode::Window => self.plan.frame_rate(),
+            crate::plan::Mode::Fine => FRAME_RATE,
+        }
+    }
+
     /// The next group of windows, up to one model call of them.
+    ///
+    /// The clip list can hold the 1 s clips of the fine grid, so this call
+    /// reads the plan for the window audio. The fine grid keeps its own clips.
     fn window_group(&self) -> Vec<WindowPart> {
         let rate = self.plan.frame_rate();
+        let cut_rate = self.cut_rate();
         let end = (self.window_at + N_WINDOW_BATCH).min(self.windows.len());
         (self.window_at..end)
             .map(|at| {
                 let from = self.windows[at];
-                let mut files = frames_in(&self.frames_cut, from, self.plan.window, rate);
+                let mut files =
+                    frames_in_dense(&self.frames_cut, from, self.plan.window, rate, cut_rate);
                 let frames = files.len();
-                let clips = clips_in(&self.clips_cut, from, self.plan.window);
-                let times = window_times(from, rate, frames, clips.len());
+                let clips = if self.plan.audio {
+                    clips_in(&self.clips_cut, from, self.plan.window)
+                } else {
+                    Vec::new()
+                };
+                let times = window_times_dense(from, rate, frames, clips.len(), cut_rate);
                 files.extend(clips);
                 WindowPart {
                     start: from,
@@ -667,10 +815,7 @@ impl IndexRun {
         self.clear_media();
         self.dir = work_dir(0);
         std::fs::create_dir_all(&self.dir)?;
-        let rate = match self.plan.mode {
-            crate::plan::Mode::Window => self.plan.frame_rate(),
-            crate::plan::Mode::Fine => FRAME_RATE,
-        };
+        let rate = self.cut_rate();
         let frame_dir = self.dir.join("frames");
         self.frames_cut = media::cut_frames(&self.source, rate, &frame_dir)?;
         // Fine mode always holds audio records. Window mode holds them only
@@ -685,8 +830,12 @@ impl IndexRun {
 
     fn cut_batch(&mut self) -> Result<()> {
         self.files.clear();
-        if self.phase == Phase::Done || self.starts().is_empty() {
-            self.phase = Phase::Done;
+        if self.phase == Phase::Done {
+            return Ok(());
+        }
+        if self.starts().is_empty() {
+            // The fine stream of this video is over. The windows may still run.
+            self.phase = self.after_fine();
             return Ok(());
         }
         self.cut_media()?;
@@ -710,34 +859,49 @@ impl IndexRun {
             return Ok(());
         }
         // Fine mode slices the whole-video cut by item, because one frame sits
-        // at one frame step and one clip at one audio second.
+        // at one fine step and one clip at one audio second.
         let at = self.at();
-        let count = match self.phase {
-            Phase::Frames => FRAME_BATCH,
-            Phase::Audio => AUDIO_BATCH,
-            Phase::Windows | Phase::Done => unreachable!(),
-        };
-        let whole = match self.phase {
-            Phase::Frames => &self.frames_cut,
-            Phase::Audio => &self.clips_cut,
-            Phase::Windows | Phase::Done => unreachable!(),
-        };
-        let end = (at + count).min(whole.len());
+        if self.phase == Phase::Frames {
+            // A dense cut holds more frames than the fine grid wants, so the
+            // grid takes every `cut_rate / 4` frame.
+            let step = (self.cut_rate() / FRAME_RATE).round().max(1.0) as usize;
+            // The cut can hold fewer frames than the stream plan claims, so the
+            // guard counts the frames of the cut, and not the frames of the plan.
+            let held = (self.frames_cut.len() + step - 1) / step;
+            let end = (at + FRAME_BATCH).min(held);
+            if at >= end {
+                // The cut holds fewer frames than the grid, so the frame phase
+                // is over. A video without an audio track goes to its windows.
+                self.phase = if self.audios.is_empty() {
+                    self.after_fine()
+                } else {
+                    Phase::Audio
+                };
+                self.audio_at = 0;
+                self.files.clear();
+                self.batch_from = 0;
+                return Ok(());
+            }
+            self.files = self
+                .frames_cut
+                .iter()
+                .step_by(step)
+                .skip(at)
+                .take(end - at)
+                .cloned()
+                .collect();
+            self.batch_from = at;
+            return Ok(());
+        }
+        let end = (at + AUDIO_BATCH).min(self.clips_cut.len());
         if at >= end {
-            // The cut holds fewer items than the plan of this stream, so the
-            // stream is over. A stream duration that over-reports gives this
-            // case, and a video without an audio track gives it too.
-            self.phase = if self.phase == Phase::Audio || self.audios.is_empty() {
-                Phase::Done
-            } else {
-                Phase::Audio
-            };
+            self.phase = self.after_fine();
             self.audio_at = 0;
             self.files.clear();
             self.batch_from = 0;
             return Ok(());
         }
-        self.files = whole[at..end].to_vec();
+        self.files = self.clips_cut[at..end].to_vec();
         self.batch_from = at;
         Ok(())
     }
@@ -782,7 +946,7 @@ pub fn index_video(
             break;
         }
         records.extend(made);
-        on_step(run.done(), total);
+        on_step(run.done(), run.total());
     }
     Ok((records, run.notes().to_vec()))
 }
@@ -865,6 +1029,7 @@ pub fn group_hits(records: &[Record], ranked: &[(usize, f32)], baseline: f32) ->
             end: record.end,
             score: *score,
             margin: *score - baseline,
+            kind: record.kind,
         };
         match groups.iter_mut().find(|g| g.video == name) {
             Some(group) => {
@@ -948,6 +1113,7 @@ pub fn search_rows(
         if !store::is_video(record.kind) {
             notes.push(Row {
                 note: true,
+                kind: record.kind,
                 label: record.label.clone(),
                 start: record.start,
                 end: record.end,
@@ -963,6 +1129,7 @@ pub fn search_rows(
                 end: record.end,
                 score: *score,
                 margin: *score - baseline,
+                kind: record.kind,
             },
         ));
     }
@@ -981,6 +1148,7 @@ pub fn search_rows(
         for hit in merge_hits_with(hits, gap) {
             rows.push(Row {
                 note: false,
+                kind: hit.kind,
                 label: label.clone(),
                 start: hit.start,
                 end: hit.end,
@@ -1012,6 +1180,7 @@ pub fn merge_hits_with(hits: Vec<Hit>, gap: f32) -> Vec<Hit> {
                 if hit.score > last.score {
                     last.score = hit.score;
                     last.margin = hit.margin;
+                    last.kind = hit.kind;
                 }
                 if hit.end > last.end {
                     last.end = hit.end;
@@ -1099,6 +1268,178 @@ mod tests {
         let times = window_times(1.0, 4.0, 4, 0);
         assert_eq!(files.len(), times.len());
         assert_eq!(times, vec![1.0, 1.25, 1.5, 1.75]);
+    }
+
+    /// The dense cut serves both rates at whole steps.
+    #[test]
+    fn the_dense_cut_serves_both_rates() {
+        assert_eq!(dense_rate(1.0), 4.0);
+        assert_eq!(dense_rate(3.0), 12.0);
+        for rate in [0.5, 1.0, 1.5, 2.5, 4.0, 10.0] {
+            let cut = dense_rate(rate);
+            let plan_step = cut / rate;
+            let fine_step = cut / FRAME_RATE;
+            assert!(
+                (plan_step - plan_step.round()).abs() < 1e-9,
+                "the window step is whole at {rate} fps"
+            );
+            assert!(
+                (fine_step - fine_step.round()).abs() < 1e-9,
+                "the fine step is whole at {rate} fps"
+            );
+        }
+    }
+
+    /// A dense cut gives the window the frames of its own rate.
+    #[test]
+    fn a_dense_cut_gives_the_window_its_own_frames() {
+        // Four frames a second, so index `n` sits at `n / 4` s.
+        let cut: Vec<PathBuf> = (0..16).map(|n| PathBuf::from(format!("f{n}.jpg"))).collect();
+        // A 2 s window at 1 fps wants 2 frames, at 0 s and 1 s.
+        let files = frames_in_dense(&cut, 0.0, 2.0, 1.0, 4.0);
+        assert_eq!(files, vec![PathBuf::from("f0.jpg"), PathBuf::from("f4.jpg")]);
+        let times = window_times_dense(0.0, 1.0, files.len(), 0, 4.0);
+        assert_eq!(times, vec![0.0, 1.0]);
+        // The second window starts at 1 s, on its own frame.
+        let next = frames_in_dense(&cut, 1.0, 2.0, 1.0, 4.0);
+        assert_eq!(next[0], PathBuf::from("f4.jpg"));
+        // A window past the end of the cut takes what is left, and no more.
+        let left = frames_in_dense(&cut, 3.0, 2.0, 1.0, 4.0);
+        assert_eq!(left, vec![PathBuf::from("f12.jpg")]);
+        assert!(frames_in_dense(&cut, 40.0, 2.0, 1.0, 4.0).is_empty());
+    }
+
+    /// The item count follows the cut, so the progress bar can fill.
+    ///
+    /// A cut can hold fewer frames than the probed stream length claims. The
+    /// run then reports fewer items, and the page shows a bar that fills.
+    #[test]
+    fn the_item_count_follows_the_cut() {
+        let plan = plan::Plan::of(plan::Preset::Fine);
+        let mut run = IndexRun {
+            source: PathBuf::from("a.mp4"),
+            frames_cut: vec![PathBuf::from("f0.jpg"), PathBuf::from("f1.jpg")],
+            clips_cut: Vec::new(),
+            label: "a.mp4".to_string(),
+            duration: 2.0,
+            frames: vec![0.0, 0.25, 0.5, 0.75],
+            audios: Vec::new(),
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::from("cut"),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+            window_at: 0,
+            plan,
+            windows: Vec::new(),
+            group: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        // The cut holds two frames, so the run reports two items and not four.
+        assert_eq!(run.total(), 2, "the cut is the authority");
+
+        // Before the cut the plan holds the count.
+        run.dir = PathBuf::new();
+        assert_eq!(run.total(), 4, "the plan holds four frames");
+
+        // A short clip list holds the true audio count too.
+        run.dir = PathBuf::from("cut");
+        run.audios = vec![0.0, 1.0, 2.0];
+        run.clips_cut = vec![PathBuf::from("a0.wav")];
+        assert_eq!(run.total(), 3, "two frames and one clip");
+    }
+
+    /// A plan with the flag runs the fine grid and then the windows.
+    #[test]
+    fn the_flag_runs_the_fine_grid_and_the_windows() {
+        let mut plan = plan::Plan::of(plan::Preset::Object);
+        plan.fine = true;
+        let mut run = IndexRun {
+            source: PathBuf::from("a.mp4"),
+            frames_cut: Vec::new(),
+            clips_cut: Vec::new(),
+            label: "a.mp4".to_string(),
+            duration: 2.0,
+            frames: vec![0.0, 0.25],
+            audios: vec![0.0],
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::new(),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+            window_at: 0,
+            plan,
+            windows: vec![0.0],
+            group: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        assert_eq!(run.total(), 4, "two frames, one clip, one window");
+        run.advance();
+        run.advance();
+        assert!(
+            run.phase == Phase::Audio,
+            "the grid comes before the windows"
+        );
+        run.advance();
+        assert!(run.phase == Phase::Windows, "the windows come last");
+        run.advance();
+        assert!(run.phase == Phase::Windows, "a window waits for its group");
+    }
+
+    /// A grid with no audio track hands its video straight to the windows.
+    #[test]
+    fn a_grid_with_no_audio_goes_to_its_windows() {
+        let mut plan = plan::Plan::of(plan::Preset::Object);
+        plan.fine = true;
+        let mut run = IndexRun {
+            source: PathBuf::from("a.mp4"),
+            frames_cut: Vec::new(),
+            clips_cut: Vec::new(),
+            label: "a.mp4".to_string(),
+            duration: 2.0,
+            frames: vec![0.0],
+            audios: Vec::new(),
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::new(),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+            window_at: 0,
+            plan,
+            windows: vec![0.0],
+            group: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        assert_eq!(run.total(), 2, "one frame and one window");
+        run.advance();
+        assert!(
+            run.phase == Phase::Windows,
+            "no audio track, so the grid hands over"
+        );
+    }
+
+    /// A hit names the kind of its record.
+    #[test]
+    fn a_hit_names_its_kind() {
+        let records = vec![
+            record_of(store::KIND_WINDOW, "a.mp4", 0.0, 2.0),
+            record_of(store::KIND_FRAME, "a.mp4", 5.0, 5.25),
+        ];
+        let ranked = vec![(0usize, 0.9f32), (1usize, 0.5f32)];
+        let rows = search_rows(&records, &ranked, 0.2, 10, MERGE_GAP);
+        assert_eq!(rows.len(), 2, "the two sit apart, so neither folds");
+        let kinds: Vec<u8> = rows.iter().map(|row| row.kind).collect();
+        assert!(kinds.contains(&store::KIND_WINDOW));
+        assert!(kinds.contains(&store::KIND_FRAME));
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1466,9 +1807,9 @@ mod tests {
     #[test]
     fn touching_hits_join_one_moment() {
         let hits = vec![
-            Hit { start: 0.0, end: 0.25, score: 0.70, margin: 0.10 },
-            Hit { start: 0.25, end: 0.5, score: 0.80, margin: 0.20 },
-            Hit { start: 0.5, end: 0.75, score: 0.60, margin: 0.05 },
+            Hit { start: 0.0, end: 0.25, score: 0.70, margin: 0.10, kind: 0 },
+            Hit { start: 0.25, end: 0.5, score: 0.80, margin: 0.20, kind: 0 },
+            Hit { start: 0.5, end: 0.75, score: 0.60, margin: 0.05, kind: 0 },
         ];
         let moments = merge_hits(hits);
 
@@ -1483,8 +1824,8 @@ mod tests {
     #[test]
     fn a_gap_of_two_frame_steps_keeps_two_moments() {
         let hits = vec![
-            Hit { start: 0.0, end: 0.25, score: 0.80, margin: 0.20 },
-            Hit { start: 1.0, end: 1.25, score: 0.70, margin: 0.10 },
+            Hit { start: 0.0, end: 0.25, score: 0.80, margin: 0.20, kind: 0 },
+            Hit { start: 1.0, end: 1.25, score: 0.70, margin: 0.10, kind: 0 },
         ];
         let moments = merge_hits(hits);
 
@@ -1495,8 +1836,8 @@ mod tests {
     #[test]
     fn the_moments_come_back_best_first() {
         let hits = vec![
-            Hit { start: 0.0, end: 0.25, score: 0.60, margin: 0.01 },
-            Hit { start: 2.0, end: 2.25, score: 0.90, margin: 0.30 },
+            Hit { start: 0.0, end: 0.25, score: 0.60, margin: 0.01, kind: 0 },
+            Hit { start: 2.0, end: 2.25, score: 0.90, margin: 0.30, kind: 0 },
         ];
         let moments = merge_hits(hits);
 
@@ -1507,7 +1848,7 @@ mod tests {
 
     #[test]
     fn one_hit_stays_one_hit() {
-        let hits = vec![Hit { start: 1.0, end: 1.25, score: 0.5, margin: 0.0 }];
+        let hits = vec![Hit { start: 1.0, end: 1.25, score: 0.5, margin: 0.0, kind: 0 }];
         assert_eq!(merge_hits(hits).len(), 1);
         assert!(merge_hits(Vec::new()).is_empty());
     }
@@ -1520,9 +1861,9 @@ mod tests {
     #[test]
     fn touching_audio_hits_join_one_moment() {
         let hits = vec![
-            Hit { start: 0.0, end: 1.0, score: 0.70, margin: 0.10 },
-            Hit { start: 1.0, end: 2.0, score: 0.75, margin: 0.15 },
-            Hit { start: 2.0, end: 3.0, score: 0.72, margin: 0.12 },
+            Hit { start: 0.0, end: 1.0, score: 0.70, margin: 0.10, kind: 0 },
+            Hit { start: 1.0, end: 2.0, score: 0.75, margin: 0.15, kind: 0 },
+            Hit { start: 2.0, end: 3.0, score: 0.72, margin: 0.12, kind: 0 },
         ];
         assert_eq!(merge_hits(hits).len(), 1);
     }
@@ -2026,6 +2367,39 @@ mod tests {
         assert_eq!(run.phase, Phase::Audio);
         assert_eq!(run.files.len(), 24);
         assert_eq!(run.batch_from, 0);
+    }
+
+    /// A window record of an audio-off plan holds no audio, also with the flag.
+    ///
+    /// The fine grid cuts its own 1 s clips, so the clip list is not empty. The
+    /// window path must read the plan and not the clip list.
+    #[test]
+    fn an_audio_off_window_holds_no_audio_with_the_flag() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("hybrid_audio_media");
+        let mut plan = plan::Plan::of(plan::Preset::Object);
+        plan.audio = false;
+        plan.fine = true;
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+
+        run.cut_media().unwrap();
+        assert!(
+            !run.clips_cut.is_empty(),
+            "the fine grid cuts its own clips here"
+        );
+        let group = run.window_group();
+        assert!(!group.is_empty(), "the video holds a window");
+        for part in &group {
+            assert_eq!(
+                part.files.len(),
+                part.frames,
+                "the window at {} s holds audio",
+                part.start
+            );
+            assert_eq!(part.times.len(), part.frames, "one time for each frame");
+        }
     }
 
     /// A video with no audio track gives frame records alone.

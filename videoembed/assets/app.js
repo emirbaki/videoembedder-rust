@@ -75,7 +75,7 @@ function planWords(video) {
   if (video.plan === "fine") return "Fine, " + video.window + " s frames";
   const head = video.plan === "" ? "" : video.plan + ", ";
   return head + video.window + " s window, " + video.frames +
-    " frames" + (video.audio ? ", audio" : "");
+    " frames" + (video.audio ? ", audio" : "") + (video.fine ? ", both grids" : "");
 }
 
 async function forget(path) {
@@ -102,6 +102,7 @@ function showPlan(video) {
   $("plan-window").value = String(Math.max(1, Math.round(video.window)));
   $("plan-frames").value = String(video.frames);
   $("plan-audio").checked = video.audio;
+  $("plan-fine").checked = video.fine;
   updatePlanLabels();
   markPreset(planName);
 }
@@ -144,6 +145,7 @@ async function applyPlan() {
       window: Number($("plan-window").value),
       frames: Number($("plan-frames").value),
       audio: $("plan-audio").checked,
+      fine: $("plan-fine").checked,
     });
     startPolling();
   } catch (err) {
@@ -181,6 +183,7 @@ function usePreset(name) {
   $("plan-window").value = String(window);
   $("plan-frames").value = String(frames);
   $("plan-audio").checked = audio;
+  $("plan-fine").checked = false;
   markPreset(name);
   updatePlanLabels();
 }
@@ -277,9 +280,19 @@ function showProgress(p) {
   const width = p.window_count > 0 ? (p.window * 100) / p.window_count : 0;
   $("progress-bar").style.width = width + "%";
   // The speed line is set first, so an error cannot leave stale text.
-  $("speed").textContent = p.elapsed_ms > 0
-    ? ((p.elapsed_ms / 1000).toFixed(1) + " s of work, " + deviceLabel(p))
+  // The cold load holds its own number, apart from the warm work.
+  const load = p.load_ms > 0 ? "load " + p.load_ms + " ms" : "";
+  const work = p.elapsed_ms > 0
+    ? (p.elapsed_ms / 1000).toFixed(1) + " s of work, " + deviceLabel(p)
     : "";
+  const parts = [load, work].filter(function (s) { return s !== ""; });
+  const runs = (p.runs || []).map(function (r) {
+    return r.items + " items in " + (r.ms / 1000).toFixed(1) + " s";
+  });
+  if (runs.length > 0) {
+    parts.push("last runs: " + runs.join(", "));
+  }
+  $("speed").textContent = parts.join(" - ");
 
   if (p.error !== null) {
     $("progress-text").textContent = p.error;
@@ -376,9 +389,10 @@ function renderGroups(groups, baseline, cut) {
         "&path=" + encodeURIComponent(group.video) +
         "&t=" + hit.start.toFixed(2) + "&w=320";
 
+      const kind = hit.kind === 0 ? "window" : hit.kind === 2 ? "frame" : "audio";
       const text = document.createElement("span");
       text.textContent =
-        hit.score.toFixed(3) + " (" + hit.margin.toFixed(3) + ")  " +
+        kind + "  " + hit.score.toFixed(3) + " (" + hit.margin.toFixed(3) + ")  " +
         hit.start.toFixed(2) + "-" + hit.end.toFixed(2) + " s";
 
       row.append(shot, text);
@@ -536,6 +550,7 @@ function boot() {
   $("plan-window").addEventListener("input", planChanged);
   $("plan-frames").addEventListener("input", planChanged);
   $("plan-audio").addEventListener("change", planChanged);
+  $("plan-fine").addEventListener("change", planChanged);
   $("plan-apply").addEventListener("click", applyPlan);
   for (const button of document.querySelectorAll("[data-preset]")) {
     button.addEventListener("click", () => usePreset(button.dataset.preset));

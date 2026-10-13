@@ -233,6 +233,7 @@ fn a_ten_second_window_drops_its_audio() {
         stride: 10.0,
         frames: 10,
         audio: true,
+        fine: false,
     };
     let media = scratch("budget_media");
     let mut run = index::IndexRun::start_with(&video, &plan, &media).expect("the run starts");

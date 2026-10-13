@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use videoembed::embed::{Device, Embedder, QUERY_PREFIX};
-use videoembed::index::{self, Group, Progress};
+use videoembed::index::{self, Group, Progress, RunSample};
 use videoembed::media;
 use videoembed::store::{NewRecord, Store, normalize_label};
 
@@ -133,6 +133,7 @@ struct VideoRow {
     window: f64,
     frames: usize,
     audio: bool,
+    fine: bool,
 }
 
 #[derive(Serialize)]
@@ -178,6 +179,8 @@ struct PlanBody {
     frames: Option<usize>,
     #[serde(default)]
     audio: Option<bool>,
+    #[serde(default)]
+    fine: Option<bool>,
 }
 
 impl PlanBody {
@@ -197,6 +200,9 @@ impl PlanBody {
         }
         if let Some(audio) = self.audio {
             words.push(format!("audio={}", if audio { "on" } else { "off" }));
+        }
+        if let Some(fine) = self.fine {
+            words.push(format!("fine={}", if fine { "on" } else { "off" }));
         }
         if words.is_empty() {
             return Err(JobError::Message("no plan value arrived".into()));
@@ -553,6 +559,7 @@ fn videos(store: &Store) -> Vec<VideoRow> {
             window: plan.window,
             frames: plan.frames,
             audio: plan.audio,
+            fine: plan.fine,
         });
     }
     rows
@@ -631,6 +638,12 @@ fn engine_loop(
         };
 
         if let Some(Switch::SetDevice { device, answer }) = request {
+            if !needs_load(device, embedder.device()) {
+                // The model already runs here. A second load costs seconds and
+                // gives the same table.
+                let _ = answer.send(Ok(device.as_str().to_string()));
+                continue;
+            }
             let started = std::time::Instant::now();
             // The new model loads before the old one leaves, so a failure
             // keeps the server on the device it had.
@@ -673,6 +686,14 @@ fn engine_loop(
             }
         }
     }
+}
+
+/// True when a device change needs a model load.
+///
+/// A pick of the device already in use costs seconds and gives the same
+/// answer, so the server answers at once.
+fn needs_load(wanted: Device, in_use: Device) -> bool {
+    wanted != in_use
 }
 
 /// A change that the engine loop must make itself.
@@ -841,6 +862,8 @@ fn start_index(
         let device = held.device.clone();
         let gpu_available = held.gpu_available;
         let load_ms = held.load_ms;
+        // The runs of this session belong to the server, not to this job.
+        let runs = held.runs.clone();
         *held = Progress {
             running: true,
             folder: folder.display().to_string(),
@@ -848,6 +871,7 @@ fn start_index(
             device,
             gpu_available,
             load_ms,
+            runs,
             ..Progress::default()
         };
     }
@@ -897,6 +921,8 @@ fn start_plan(
         let device = held.device.clone();
         let gpu_available = held.gpu_available;
         let load_ms = held.load_ms;
+        // The runs of this session belong to the server, not to this job.
+        let runs = held.runs.clone();
         *held = Progress {
             running: true,
             folder: String::new(),
@@ -908,6 +934,7 @@ fn start_plan(
             device,
             gpu_available,
             load_ms,
+            runs,
             ..Progress::default()
         };
     }
@@ -953,12 +980,12 @@ fn step_job(
         // whole one on the next search.
         job.run = None;
         job.records.clear();
-        end_job(progress);
+        end_job(progress, None);
         return true;
     }
     if job.run.is_none() {
         if job.file_at >= job.files.len() {
-            end_job(progress);
+            end_job(progress, speed_of(job));
             return true;
         }
         let video = job.files[job.file_at].clone();
@@ -1033,14 +1060,17 @@ fn step_job(
         job.run = None;
         job.file_at += 1;
         if job.file_at >= job.files.len() {
-            end_job(progress);
+            end_job(progress, speed_of(job));
             return true;
         }
     } else {
         let done = job.indexed + job.records.len();
         let seconds = job.started.elapsed().as_secs_f64();
         let mut held = progress.lock().unwrap();
-        held.window = job.run.as_ref().map(|r| r.done()).unwrap_or(0);
+        let run = job.run.as_ref();
+        held.window = run.map(|r| r.done()).unwrap_or(0);
+        // The cut is the authority on the item count, so the bar can fill.
+        held.window_count = run.map(|r| r.total()).unwrap_or(held.window_count);
         held.indexed = done;
         held.elapsed_ms = (seconds * 1000.0) as u64;
         held.per_second = index::per_second(done, seconds);
@@ -1102,11 +1132,41 @@ fn hold_when_paused(flag: &Arc<AtomicBool>, progress: &Arc<Mutex<Progress>>) -> 
     true
 }
 
+/// How many runs the page keeps in its speed report.
+const RUN_KEEP: usize = 5;
+
+/// Add one run sample, and keep the last five.
+///
+/// A slow run stays in the list, so the page shows the shape of the work and
+/// not one average.
+fn keep_run(runs: &mut Vec<RunSample>, sample: RunSample) {
+    runs.push(sample);
+    if runs.len() > RUN_KEEP {
+        runs.remove(0);
+    }
+}
+
+/// The speed sample of one job at this moment.
+///
+/// The sample holds the warm work alone, because the load of the model holds
+/// its own field. A job with no time yet gives None.
+fn speed_of(job: &WebJob) -> Option<RunSample> {
+    let items = job.indexed + job.records.len();
+    let ms = (job.started.elapsed().as_secs_f64() * 1000.0) as u64;
+    (ms > 0).then_some(RunSample { items, ms })
+}
+
 /// End the running job, and clear its pause.
-fn end_job(progress: &Arc<Mutex<Progress>>) {
+///
+/// The sample holds the speed of a run that reached its end. A job that
+/// stopped part way gives None, because its work is partial.
+fn end_job(progress: &Arc<Mutex<Progress>>, sample: Option<RunSample>) {
     let mut held = progress.lock().unwrap();
     held.running = false;
     held.paused = false;
+    if let Some(sample) = sample {
+        keep_run(&mut held.runs, sample);
+    }
 }
 
 fn handle_request(
@@ -1953,6 +2013,106 @@ mod tests {
         assert!(body.plan().is_err());
     }
 
+    /// The plan body reads the fine flag.
+    #[test]
+    fn the_plan_body_reads_the_fine_flag() {
+        let body: PlanBody = serde_json::from_str(
+            r#"{"path":"a.mp4","window":2.0,"frames":2,"audio":true,"fine":true}"#,
+        )
+        .unwrap();
+        assert!(body.plan().unwrap().fine);
+        let off: PlanBody =
+            serde_json::from_str(r#"{"path":"a.mp4","window":2.0,"frames":2,"audio":true}"#)
+                .unwrap();
+        assert!(!off.plan().unwrap().fine);
+    }
+
+    /// The page holds a checkbox for the fine grid.
+    #[test]
+    fn the_page_holds_a_box_for_the_fine_grid() {
+        assert!(PAGE.contains(r#"id="plan-fine""#));
+        assert!(JS.contains(r#"$("plan-fine").checked"#));
+        assert!(JS.contains("fine: $(\"plan-fine\").checked"));
+    }
+
+    /// A pick of the device in use needs no model load.
+    #[test]
+    fn a_pick_of_the_device_in_use_needs_no_load() {
+        assert!(!needs_load(Device::Cpu, Device::Cpu));
+        assert!(!needs_load(Device::Gpu, Device::Gpu));
+        assert!(needs_load(Device::Cpu, Device::Gpu));
+    }
+
+    /// The speed report keeps the last five runs.
+    #[test]
+    fn the_speed_report_keeps_the_last_five_runs() {
+        let mut runs = Vec::new();
+        for items in 1..=7 {
+            keep_run(&mut runs, RunSample { items, ms: 100 });
+        }
+        assert_eq!(runs.len(), 5, "seven runs leave five");
+        assert_eq!(runs[0].items, 3, "the two oldest runs leave");
+        assert_eq!(runs[4].items, 7, "the newest run stays");
+    }
+
+    /// A stopped job takes no speed sample.
+    ///
+    /// The list holds the runs that reached their end. A stopped run holds
+    /// partial work, so it gives no sample.
+    #[test]
+    fn a_stopped_job_takes_no_speed_sample() {
+        let board = Arc::new(Mutex::new(Progress {
+            indexed: 5,
+            elapsed_ms: 900,
+            ..Progress::default()
+        }));
+        end_job(&board, None);
+        {
+            let held = board.lock().unwrap();
+            assert!(held.runs.is_empty(), "a stopped job takes no sample");
+            assert!(!held.running, "the job ends");
+        }
+
+        end_job(&board, Some(RunSample { items: 5, ms: 900 }));
+        assert_eq!(board.lock().unwrap().runs.len(), 1, "a finished job takes one");
+    }
+
+    /// The speed sample holds the time of the job at the moment of the call.
+    ///
+    /// The page reads the sample when the job ends, so the time of the last
+    /// step must be here.
+    #[test]
+    fn the_speed_sample_holds_the_final_time() {
+        let mut job = WebJob {
+            files: Vec::new(),
+            file_at: 0,
+            run: None,
+            records: Vec::new(),
+            indexed: 4,
+            started: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            label: String::new(),
+            plan: None,
+        };
+
+        let sample = speed_of(&job).expect("a running job gives a sample");
+        assert_eq!(sample.items, 4, "the items come from the job");
+        assert!(
+            sample.ms >= 2000,
+            "the sample holds the time at the call, got {}",
+            sample.ms
+        );
+
+        job.started = std::time::Instant::now();
+        assert!(speed_of(&job).is_none(), "a job with no time gives no sample");
+    }
+
+    /// The page shows the model load apart from the runs.
+    #[test]
+    fn the_page_shows_the_load_apart_from_the_runs() {
+        assert!(JS.contains("p.load_ms > 0"), "the load has its own words");
+        assert!(JS.contains("p.runs"), "the runs reach the page");
+    }
+
     /// The page reads the paused state from the progress answer.
     ///
     /// A reloaded page takes the state from this answer, so the button reads
@@ -2038,7 +2198,7 @@ mod tests {
             ..Progress::default()
         }));
 
-        end_job(&board);
+        end_job(&board, None);
 
         let held = board.lock().unwrap();
         assert!(!held.running, "the job ends");
