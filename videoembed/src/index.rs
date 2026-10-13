@@ -745,6 +745,9 @@ impl IndexRun {
     }
 
     /// The next group of windows, up to one model call of them.
+    ///
+    /// The clip list can hold the 1 s clips of the fine grid, so this call
+    /// reads the plan for the window audio. The fine grid keeps its own clips.
     fn window_group(&self) -> Vec<WindowPart> {
         let rate = self.plan.frame_rate();
         let cut_rate = self.cut_rate();
@@ -755,7 +758,11 @@ impl IndexRun {
                 let mut files =
                     frames_in_dense(&self.frames_cut, from, self.plan.window, rate, cut_rate);
                 let frames = files.len();
-                let clips = clips_in(&self.clips_cut, from, self.plan.window);
+                let clips = if self.plan.audio {
+                    clips_in(&self.clips_cut, from, self.plan.window)
+                } else {
+                    Vec::new()
+                };
                 let times = window_times_dense(from, rate, frames, clips.len(), cut_rate);
                 files.extend(clips);
                 WindowPart {
@@ -2289,6 +2296,39 @@ mod tests {
         assert_eq!(run.phase, Phase::Audio);
         assert_eq!(run.files.len(), 24);
         assert_eq!(run.batch_from, 0);
+    }
+
+    /// A window record of an audio-off plan holds no audio, also with the flag.
+    ///
+    /// The fine grid cuts its own 1 s clips, so the clip list is not empty. The
+    /// window path must read the plan and not the clip list.
+    #[test]
+    fn an_audio_off_window_holds_no_audio_with_the_flag() {
+        let Some(video) = spike_video() else {
+            return;
+        };
+        let media = scratch("hybrid_audio_media");
+        let mut plan = plan::Plan::of(plan::Preset::Object);
+        plan.audio = false;
+        plan.fine = true;
+        let mut run = IndexRun::start_with(&video, &plan, &media).unwrap();
+
+        run.cut_media().unwrap();
+        assert!(
+            !run.clips_cut.is_empty(),
+            "the fine grid cuts its own clips here"
+        );
+        let group = run.window_group();
+        assert!(!group.is_empty(), "the video holds a window");
+        for part in &group {
+            assert_eq!(
+                part.files.len(),
+                part.frames,
+                "the window at {} s holds audio",
+                part.start
+            );
+            assert_eq!(part.times.len(), part.frames, "one time for each frame");
+        }
     }
 
     /// A video with no audio track gives frame records alone.
