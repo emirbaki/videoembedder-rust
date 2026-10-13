@@ -367,10 +367,15 @@ pub struct WindowPart {
 }
 
 impl WindowPart {
+    /// Keep the first `n` parts of this window, and drop the rest.
+    pub fn keep_parts(&mut self, n: usize) {
+        self.files.truncate(n);
+        self.times.truncate(n);
+    }
+
     /// Drop the audio of this window. The frames stay.
     pub fn keep_frames(&mut self) {
-        self.files.truncate(self.frames);
-        self.times.truncate(self.frames);
+        self.keep_parts(self.frames);
     }
 }
 
@@ -383,6 +388,44 @@ pub fn budget_note(start: f64, tokens: usize) -> String {
         "window at {start:.1} s holds {tokens} tokens, above the budget of {}, \
          so the record keeps the frames alone",
         embed::BUDGET_TOKENS
+    )
+}
+
+/// The count of the leading windows that fit inside one model call.
+///
+/// The group holds up to four windows, but the call holds the tokens. The
+/// encoder cannot split a batch, so the sum of the group must sit inside
+/// `n_ubatch`. This call takes the longest leading part of the group that
+/// fits. One window always goes in, so a window that alone passes the limit
+/// goes in on its own, and the caller trims its frames.
+///
+/// `cost` holds the measured token count of each window, in order.
+fn fit_call(cost: &[usize], limit: usize) -> usize {
+    let mut held = 0;
+    let mut sum = 0;
+    for count in cost {
+        if held > 0 && sum + count > limit {
+            break;
+        }
+        sum += count;
+        held += 1;
+    }
+    held
+}
+
+/// The token count of one window, from the tokenizer of the real model.
+fn window_tokens(embedder: &Embedder, part: &WindowPart) -> Result<usize> {
+    embedder.tokens_of(&embed::window_text(&part.times), &part.files)
+}
+
+/// The line about one window that lost frames to the call limit.
+///
+/// A window that alone passes the limit of one model call keeps only its
+/// first frames, so the reader learns why the record is short.
+pub fn call_note(start: f64, tokens: usize, frames: usize, limit: usize) -> String {
+    format!(
+        "window at {start:.1} s holds {tokens} tokens alone, above the call limit of {limit}, \
+         so the record keeps the first {frames} frames"
     )
 }
 
@@ -646,24 +689,48 @@ impl IndexRun {
     }
 
     /// Embed the loaded group of windows in one model call.
+    ///
+    /// The encoder cannot split a batch, so the whole call must sit inside
+    /// `n_ubatch`. The group holds up to four windows, and a large frame
+    /// costs a large part of that limit. This call measures each window,
+    /// then embeds the longest leading part of the group that fits. The
+    /// windows that remain wait for the next call.
     fn step_group(
         &mut self,
         embedder: &Embedder,
         ctx: &mut LlamaContext<'_>,
     ) -> Result<Vec<NewRecord>> {
+        let limit = ctx.n_ubatch() as usize;
         let mut parts = std::mem::take(&mut self.group);
+
+        // A window above the window budget loses its audio. The frames stay.
+        let mut cost = Vec::with_capacity(parts.len());
         for part in &mut parts {
-            if part.files.len() == part.frames {
-                // A window with no audio cannot lose anything.
-                continue;
-            }
-            let text = embed::window_text(&part.times);
-            let count = embedder.tokens_of(&text, &part.files)?;
-            if count > embed::BUDGET_TOKENS {
+            let mut count = window_tokens(embedder, part)?;
+            if part.files.len() != part.frames && count > embed::BUDGET_TOKENS {
                 part.keep_frames();
                 self.notes.push(budget_note(part.start, count));
+                count = window_tokens(embedder, part)?;
             }
+            cost.push(count);
         }
+
+        let held = fit_call(&cost, limit);
+        let rest = parts.split_off(held);
+        let mut sum: usize = cost[..held].iter().sum();
+
+        // The call holds one window at least. One frame of the model fits
+        // the call, so this loop always ends.
+        if held == 1 && sum > limit {
+            while sum > limit && parts[0].files.len() > 1 {
+                let keep = parts[0].files.len() - 1;
+                parts[0].keep_parts(keep);
+                sum = window_tokens(embedder, &parts[0])?;
+            }
+            let part = &parts[0];
+            self.notes.push(call_note(part.start, cost[0], part.files.len(), limit));
+        }
+
         let windows: Vec<embed::WindowIn> = parts
             .iter()
             .map(|part| embed::WindowIn {
@@ -694,6 +761,10 @@ impl IndexRun {
         let made = out.len();
         self.window_at += made;
         self.done += made;
+        if !rest.is_empty() {
+            // The windows that did not fit this call hold the next one.
+            self.group = rest;
+        }
         if self.window_at >= self.windows.len() {
             self.phase = Phase::Done;
         }
@@ -715,7 +786,7 @@ impl IndexRun {
 
     fn remaining_in_batch(&self) -> usize {
         if self.phase == Phase::Windows {
-            // One group of windows fills one model call, so one item is ready.
+            // A loaded group holds the windows of the next model call.
             return usize::from(!self.group.is_empty());
         }
         self.files.len().saturating_sub(self.at() - self.batch_from)
@@ -2216,6 +2287,20 @@ mod tests {
             let name = file.to_string_lossy();
             assert!(name.ends_with(".jpg"), "{name} is not a frame");
         }
+    }
+
+    /// One call holds the leading windows that fit inside the batch.
+    ///
+    /// The group of the run holds four windows, but the model call takes
+    /// the tokens. A group of large windows gives two calls in place of
+    /// one. A window that alone passes the limit goes in on its own, and
+    /// the caller trims its frames.
+    #[test]
+    fn a_call_holds_the_leading_windows_that_fit() {
+        assert_eq!(fit_call(&[1000, 1000, 1000, 1000], 4096), 4, "a small group fits");
+        assert_eq!(fit_call(&[1374, 1374, 1374, 1374], 4096), 2, "two large windows fit");
+        assert_eq!(fit_call(&[4500, 10], 4096), 1, "a window over the limit goes alone");
+        assert_eq!(fit_call(&[], 4096), 0, "no window gives no call");
     }
 
     /// One model call reads four windows.

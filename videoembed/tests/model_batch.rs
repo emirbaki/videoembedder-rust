@@ -212,6 +212,150 @@ fn the_run_indexes_every_window_of_the_test_video() {
     let _ = std::fs::remove_dir_all(&media);
 }
 
+/// A copy of a video, scaled to `size` and cut to `seconds`.
+///
+/// The token cost of one frame follows the size of the frame. A scaled copy
+/// is how a test reaches the call limit of the batch. None means ffmpeg
+/// cannot make the copy.
+fn scaled_copy(video: &Path, dir: &Path, size: &str, seconds: &str) -> Option<PathBuf> {
+    let out = dir.join(format!("scaled_{}.mp4", size.replace(':', "x")));
+    let made = std::process::Command::new(media::FFMPEG)
+        .args(["-y", "-i"])
+        .arg(video)
+        .args([
+            "-t",
+            seconds,
+            "-vf",
+            &format!("scale={size}"),
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            "-c:a",
+            "copy",
+        ])
+        .arg(&out)
+        .output();
+    match made {
+        Ok(done) if done.status.success() => Some(out),
+        _ => None,
+    }
+}
+
+/// One model call reads the group, and a large group gives two calls.
+///
+/// A 720x720 frame costs 229 tokens against the 88 of the test video. Six
+/// frames and their clips pass the window budget, so the window drops its
+/// audio. Four such windows hold about 5496 tokens, above the call limit of
+/// 4096. The run must split the group into calls that fit, and it must
+/// report every window.
+#[test]
+fn a_group_of_large_windows_splits_into_calls_that_fit() {
+    let Some((embedder, _guard)) = the_model() else {
+        eprintln!("skipped: the model is not here");
+        return;
+    };
+    let Some(video) = video() else {
+        eprintln!("skipped: the test video is not here");
+        return;
+    };
+    let dir = scratch("large_group");
+    let Some(large) = scaled_copy(&video, &dir, "720:720", "24") else {
+        eprintln!("skipped: ffmpeg cannot scale the clip");
+        return;
+    };
+    let plan = plan::Plan {
+        mode: plan::Mode::Window,
+        window: 6.0,
+        stride: 6.0,
+        frames: 6,
+        audio: true,
+        fine: false,
+    };
+    let media = scratch("large_group_media");
+    let duration = media::probe_duration(&large).expect("the duration comes back");
+    let want = plan.window_starts(duration).len();
+    assert!(want >= 4, "the copy holds a full group, got {want}");
+
+    let mut run = index::IndexRun::start_with(&large, &plan, &media).expect("the run starts");
+    let mut ctx = embedder.new_context().expect("the context is made");
+    let mut records = Vec::new();
+    loop {
+        let made = run.step(embedder, &mut ctx).expect("the step ends");
+        if made.is_empty() {
+            break;
+        }
+        records.extend(made);
+    }
+
+    assert_eq!(records.len(), want, "one record for each window");
+    assert!(
+        records.iter().all(|record| !record.vec.is_empty()),
+        "every record holds a vector"
+    );
+    assert!(
+        run.notes().iter().all(|line| line.contains("above the budget")),
+        "each large window reports the audio drop: {:?}",
+        run.notes()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&media);
+}
+
+/// A window that alone passes the call limit loses its last frames.
+///
+/// A 1920x1920 frame costs about 1093 tokens, so four frames pass the call
+/// limit of 4096 tokens on their own. One frame always fits, so the run
+/// must drop the last frames until the window fits, and it must report the
+/// window that lost them.
+#[test]
+fn a_window_over_the_call_limit_loses_its_last_frames() {
+    let Some((embedder, _guard)) = the_model() else {
+        eprintln!("skipped: the model is not here");
+        return;
+    };
+    let Some(video) = video() else {
+        eprintln!("skipped: the test video is not here");
+        return;
+    };
+    let dir = scratch("huge_frame");
+    let Some(large) = scaled_copy(&video, &dir, "1920:1920", "8") else {
+        eprintln!("skipped: ffmpeg cannot scale the clip");
+        return;
+    };
+    let plan = plan::Plan {
+        mode: plan::Mode::Window,
+        window: 8.0,
+        stride: 8.0,
+        frames: 4,
+        audio: false,
+        fine: false,
+    };
+    let media = scratch("huge_frame_media");
+    let mut run = index::IndexRun::start_with(&large, &plan, &media).expect("the run starts");
+    let mut ctx = embedder.new_context().expect("the context is made");
+    let mut records = Vec::new();
+    loop {
+        let made = run.step(embedder, &mut ctx).expect("the step ends");
+        if made.is_empty() {
+            break;
+        }
+        records.extend(made);
+    }
+
+    assert_eq!(records.len(), 1, "the copy holds one window");
+    assert!(!records[0].vec.is_empty(), "the record holds a vector");
+    assert!(
+        run.notes()
+            .iter()
+            .any(|line| line.contains("above the call limit")),
+        "the window reports the frame drop: {:?}",
+        run.notes()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&media);
+}
+
 /// A window above the token budget loses its audio, and the run says so.
 ///
 /// The plan names a 10 s window of 10 frames with its audio. Ten frames and
