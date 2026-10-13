@@ -83,8 +83,6 @@ pub struct RunSample {
     pub items: usize,
     /// The milliseconds of the run.
     pub ms: u64,
-    /// The items of the run for each second.
-    pub per_second: f32,
 }
 
 /// The progress of the running index job. The server reads a copy.
@@ -554,9 +552,39 @@ impl IndexRun {
         })
     }
 
+    /// True when the whole-video cut is here.
+    ///
+    /// `cut_media` makes the cut folder, so the folder names the cut.
+    fn cut_is_here(&self) -> bool {
+        !self.dir.as_os_str().is_empty()
+    }
+
+    /// The frames of the fine grid. The cut is the authority once it is here.
+    ///
+    /// A cut can hold fewer frames than the probed stream length claims, and a
+    /// count above the real work leaves a progress bar that never fills.
+    fn frame_total(&self) -> usize {
+        if self.frames.is_empty() {
+            return 0;
+        }
+        if !self.cut_is_here() {
+            return self.frames.len();
+        }
+        let step = (self.cut_rate() / FRAME_RATE).round().max(1.0) as usize;
+        ((self.frames_cut.len() + step - 1) / step).min(self.frames.len())
+    }
+
+    /// The audio records of the fine grid. The cut is the authority here too.
+    fn audio_total(&self) -> usize {
+        if self.audios.is_empty() || !self.cut_is_here() {
+            return self.audios.len();
+        }
+        self.clips_cut.len().min(self.audios.len())
+    }
+
     /// The number of records this run will make.
     pub fn total(&self) -> usize {
-        self.frames.len() + self.audios.len() + self.windows.len()
+        self.frame_total() + self.audio_total() + self.windows.len()
     }
 
     /// The number of records made so far.
@@ -918,7 +946,7 @@ pub fn index_video(
             break;
         }
         records.extend(made);
-        on_step(run.done(), total);
+        on_step(run.done(), run.total());
     }
     Ok((records, run.notes().to_vec()))
 }
@@ -1279,6 +1307,49 @@ mod tests {
         let left = frames_in_dense(&cut, 3.0, 2.0, 1.0, 4.0);
         assert_eq!(left, vec![PathBuf::from("f12.jpg")]);
         assert!(frames_in_dense(&cut, 40.0, 2.0, 1.0, 4.0).is_empty());
+    }
+
+    /// The item count follows the cut, so the progress bar can fill.
+    ///
+    /// A cut can hold fewer frames than the probed stream length claims. The
+    /// run then reports fewer items, and the page shows a bar that fills.
+    #[test]
+    fn the_item_count_follows_the_cut() {
+        let plan = plan::Plan::of(plan::Preset::Fine);
+        let mut run = IndexRun {
+            source: PathBuf::from("a.mp4"),
+            frames_cut: vec![PathBuf::from("f0.jpg"), PathBuf::from("f1.jpg")],
+            clips_cut: Vec::new(),
+            label: "a.mp4".to_string(),
+            duration: 2.0,
+            frames: vec![0.0, 0.25, 0.5, 0.75],
+            audios: Vec::new(),
+            frame_at: 0,
+            audio_at: 0,
+            phase: Phase::Frames,
+            dir: PathBuf::from("cut"),
+            files: Vec::new(),
+            batch_from: 0,
+            done: 0,
+            window_at: 0,
+            plan,
+            windows: Vec::new(),
+            group: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        // The cut holds two frames, so the run reports two items and not four.
+        assert_eq!(run.total(), 2, "the cut is the authority");
+
+        // Before the cut the plan holds the count.
+        run.dir = PathBuf::new();
+        assert_eq!(run.total(), 4, "the plan holds four frames");
+
+        // A short clip list holds the true audio count too.
+        run.dir = PathBuf::from("cut");
+        run.audios = vec![0.0, 1.0, 2.0];
+        run.clips_cut = vec![PathBuf::from("a0.wav")];
+        assert_eq!(run.total(), 3, "two frames and one clip");
     }
 
     /// A plan with the flag runs the fine grid and then the windows.

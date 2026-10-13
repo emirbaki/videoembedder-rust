@@ -980,12 +980,12 @@ fn step_job(
         // whole one on the next search.
         job.run = None;
         job.records.clear();
-        end_job(progress);
+        end_job(progress, None);
         return true;
     }
     if job.run.is_none() {
         if job.file_at >= job.files.len() {
-            end_job(progress);
+            end_job(progress, speed_of(job));
             return true;
         }
         let video = job.files[job.file_at].clone();
@@ -1060,14 +1060,17 @@ fn step_job(
         job.run = None;
         job.file_at += 1;
         if job.file_at >= job.files.len() {
-            end_job(progress);
+            end_job(progress, speed_of(job));
             return true;
         }
     } else {
         let done = job.indexed + job.records.len();
         let seconds = job.started.elapsed().as_secs_f64();
         let mut held = progress.lock().unwrap();
-        held.window = job.run.as_ref().map(|r| r.done()).unwrap_or(0);
+        let run = job.run.as_ref();
+        held.window = run.map(|r| r.done()).unwrap_or(0);
+        // The cut is the authority on the item count, so the bar can fill.
+        held.window_count = run.map(|r| r.total()).unwrap_or(held.window_count);
         held.indexed = done;
         held.elapsed_ms = (seconds * 1000.0) as u64;
         held.per_second = index::per_second(done, seconds);
@@ -1143,20 +1146,25 @@ fn keep_run(runs: &mut Vec<RunSample>, sample: RunSample) {
     }
 }
 
+/// The speed sample of one job at this moment.
+///
+/// The sample holds the warm work alone, because the load of the model holds
+/// its own field. A job with no time yet gives None.
+fn speed_of(job: &WebJob) -> Option<RunSample> {
+    let items = job.indexed + job.records.len();
+    let ms = (job.started.elapsed().as_secs_f64() * 1000.0) as u64;
+    (ms > 0).then_some(RunSample { items, ms })
+}
+
 /// End the running job, and clear its pause.
 ///
-/// The call records one speed sample. The sample holds the warm work alone,
-/// because the load of the model holds its own field.
-fn end_job(progress: &Arc<Mutex<Progress>>) {
+/// The sample holds the speed of a run that reached its end. A job that
+/// stopped part way gives None, because its work is partial.
+fn end_job(progress: &Arc<Mutex<Progress>>, sample: Option<RunSample>) {
     let mut held = progress.lock().unwrap();
     held.running = false;
     held.paused = false;
-    if held.elapsed_ms > 0 {
-        let sample = RunSample {
-            items: held.indexed,
-            ms: held.elapsed_ms,
-            per_second: held.per_second,
-        };
+    if let Some(sample) = sample {
         keep_run(&mut held.runs, sample);
     }
 }
@@ -2040,18 +2048,62 @@ mod tests {
     fn the_speed_report_keeps_the_last_five_runs() {
         let mut runs = Vec::new();
         for items in 1..=7 {
-            keep_run(
-                &mut runs,
-                RunSample {
-                    items,
-                    ms: 100,
-                    per_second: 1.0,
-                },
-            );
+            keep_run(&mut runs, RunSample { items, ms: 100 });
         }
         assert_eq!(runs.len(), 5, "seven runs leave five");
         assert_eq!(runs[0].items, 3, "the two oldest runs leave");
         assert_eq!(runs[4].items, 7, "the newest run stays");
+    }
+
+    /// A stopped job takes no speed sample.
+    ///
+    /// The list holds the runs that reached their end. A stopped run holds
+    /// partial work, so it gives no sample.
+    #[test]
+    fn a_stopped_job_takes_no_speed_sample() {
+        let board = Arc::new(Mutex::new(Progress {
+            indexed: 5,
+            elapsed_ms: 900,
+            ..Progress::default()
+        }));
+        end_job(&board, None);
+        {
+            let held = board.lock().unwrap();
+            assert!(held.runs.is_empty(), "a stopped job takes no sample");
+            assert!(!held.running, "the job ends");
+        }
+
+        end_job(&board, Some(RunSample { items: 5, ms: 900 }));
+        assert_eq!(board.lock().unwrap().runs.len(), 1, "a finished job takes one");
+    }
+
+    /// The speed sample holds the time of the job at the moment of the call.
+    ///
+    /// The page reads the sample when the job ends, so the time of the last
+    /// step must be here.
+    #[test]
+    fn the_speed_sample_holds_the_final_time() {
+        let mut job = WebJob {
+            files: Vec::new(),
+            file_at: 0,
+            run: None,
+            records: Vec::new(),
+            indexed: 4,
+            started: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            label: String::new(),
+            plan: None,
+        };
+
+        let sample = speed_of(&job).expect("a running job gives a sample");
+        assert_eq!(sample.items, 4, "the items come from the job");
+        assert!(
+            sample.ms >= 2000,
+            "the sample holds the time at the call, got {}",
+            sample.ms
+        );
+
+        job.started = std::time::Instant::now();
+        assert!(speed_of(&job).is_none(), "a job with no time gives no sample");
     }
 
     /// The page shows the model load apart from the runs.
@@ -2146,7 +2198,7 @@ mod tests {
             ..Progress::default()
         }));
 
-        end_job(&board);
+        end_job(&board, None);
 
         let held = board.lock().unwrap();
         assert!(!held.running, "the job ends");
