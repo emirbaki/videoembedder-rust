@@ -1,6 +1,6 @@
 # Deferred work
 
-The state on 2026-10-12. The list holds the work that we chose not to do yet.
+The state on 2026-10-13. The list holds the work that we chose not to do yet.
 The rank comes from `docs/google-gallery-comparison.md` section 5, and from the
 review of the device-mode branch.
 
@@ -47,36 +47,38 @@ small fixes from the device-mode review, the fallback when the card fails, and
 one more fix from the branch review. The full suite passes on the merged tree:
 156 library tests, 21 console tests, 38 web tests, and 4 model tests.
 
+The `hybrid-grid` branch merged into `main` on 2026-10-13. It answered item 1
+and item 3 of section 1, and item 3 of section 2. A plan now takes a `fine`
+flag, one dense cut serves both grids, and one pass writes both kinds of
+record. The full suite passes on the merged tree: 166 library tests, 21 console
+tests, 45 web tests, and 4 model tests.
+
+The `fix/ubatch-group-budget` branch landed on 2026-10-13. The cost of one
+frame follows the size of the frame: a 480x270 frame costs 88 tokens, a
+720x720 frame costs 229, and a 1920x1920 frame costs 1093. A group of large
+windows therefore passed the 4096 token limit of one model call, and the run
+aborted on the assert at `llama-context.cpp:1512`. The run now measures each
+window and gives the model the longest leading part of the group that fits.
+A window that alone passes the limit keeps its first frames, and the run
+reports that window on one line. The full suite passes on the branch: 167
+library tests, 21 console tests, 45 web tests, and 6 model tests.
+
 ## 1. Features that wait
 
 The rank weighs the gain against the cost.
 
 | # | Item | Gain | Cost |
 | --- | --- | --- | --- |
-| 1 | Both grids for one video | Medium | Medium |
 | 2 | The model download | Medium | Medium |
-| 3 | The cold and warm speed report | Small | Low |
 | 4 | Finer steps in the plan panel | Small | Low |
 | 5 | A pause inside one window | Small | Low |
 
-### 1.1 Both grids for one video
-
-A plan holds one mode, and a plan change drops the old records. A video that
-holds the window grid and the fine grid at the same time answers "what happens
-here" and "which second" together. The comparison doc calls this a hybrid.
-
-The cost is more records for one video, plus a search that mixes two grids.
+Items 1 and 3 landed on `hybrid-grid` on 2026-10-13.
 
 ### 1.2 The model download
 
 The user fetches the model by hand. Google downloads with a range resume and a
 temporary file.
-
-### 1.3 The cold and warm speed report
-
-The page shows items a second and the model load in milliseconds. Google
-reports the cold init apart from the warm init, and it keeps the raw samples for
-each run. It never blends the numbers into one figure.
 
 ### 1.4 Finer steps in the plan panel
 
@@ -93,11 +95,9 @@ in the model. A finer check costs a flag read inside `IndexRun::step`.
 
 Five of the six landed on `small-fixes` on 2026-10-13: the turn order, the
 refusal text, the page mode, the flag stripping, and the load-failure code.
-The fallback when the card fails also landed there. One item still waits.
-
-| # | Item |
-| --- | --- |
-| 3 | `/api/device` reloads the model when the mode is already active. The console guards this. The page does not. |
+The fallback when the card fails also landed there. Item 3 landed on
+`hybrid-grid` on 2026-10-13. The page now guards the pick of the device in use,
+so the click answers at once. No item waits.
 
 ## 3. Optimisations
 
@@ -108,7 +108,7 @@ The fallback when the card fails also landed there. One item still waits.
 | The repeated cut | A plan change cuts the whole video again, and the video leaves the search for the length of the cut. Write the new records under a staging id, then swap them for the old ones in one write. |
 | The switch cost | A device switch opens one extra context. The cost is small, and the switch happens on request only. |
 | The whole media on disk | The run cuts every frame of the whole video before the first window reaches the model, so the frames of the whole video sit in a temporary folder. A 30 s video at 4 frames a second gives about 120 stills. |
-| The frames alone over the budget | A window whose frames alone pass 1024 tokens keeps them and goes into the batch, because the batch holds 4096 tokens. The run reports the window and does not refuse the plan. The Object window measures 257 tokens, so the case needs a named window of many frames. |
+| The text path over the batch limit | `embed_text` passes `n_batch = 8192` to the text path, above `n_ubatch = 4096`. A query or a note above 4096 tokens hits the same assert as the window path. A query of that length is unlikely, so the item waits. |
 
 ## 4. Kept as they are, by choice
 

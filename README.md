@@ -16,8 +16,8 @@ the window 21.0-23.0 s with a score of 0.78.
 
 ## How it works
 
-1. ffmpeg cuts the whole video one time: every frame at the plan rate, and every
-   one second audio clip.
+1. ffmpeg cuts the whole video one time: its frames, and every one second audio
+   clip.
 2. A window takes its own frames and clips from that one cut, so a window costs
    no further ffmpeg call.
 3. The model reads four windows in one call. Each window holds its frames, its
@@ -32,9 +32,26 @@ one call, and each window holds its own sequence, so the vectors do not move
 with the size of the batch. A window above 1024 tokens loses its audio, and the
 run reports that window on one line.
 
+The encoder cannot split a batch, so one call holds no more than 4096 tokens.
+A group of large windows therefore gives more than one call. A large frame
+costs many tokens, and the cost follows the size of the frame. A window that
+alone passes the limit keeps only its first frames, and the run reports that
+window on one line.
+
 Two steps keep the picture right. A fragmented MP4 is rewritten one time into a
 progressive copy, and the run reads that copy. A still near the opening steps
 forward past a black frame to the first frame with a picture.
+
+### Both grids
+
+A plan can hold the window grid and the 0.25 s fine grid at the same time. Set
+`fine=on` on the `plan` command, or tick Both grids on the page. One dense cut
+then serves both paths, because the cut rate divides by both steps: a plan of
+1 frame a second gives a 4 fps cut, and a plan of 3 fps gives 12 fps. One pass
+writes both kinds of record, and one search ranks them together. The flag adds
+the grid beside the windows. It never moves the windows.
+
+A video without the flag keeps its old shape.
 
 The model is `google/embeddinggemma-2`, in the `Q8_0` format, with its
 multimodal projection. The engine is `llama.cpp`, linked into the binary
@@ -111,6 +128,7 @@ a script.
 |---|---|
 | `index <path>` | Cut the video under its plan. Embed each item. |
 | `plan <path> <preset>` | Cut the video again under a new plan. |
+| `device gpu\|cpu` | Load the model on that device. |
 | `note <text>` | Add one free text record. |
 | `search <query> [\| <path>]` | Rank every record, or one video. Show the top 10, and mark a weak row. |
 | `list` | Group the records by video. |
@@ -125,13 +143,18 @@ know takes the default.
 An older video keeps the Fine plan that it was cut under.
 
 The `plan` command also reads values, as `plan <path> window=4 frames=4
-audio=on`. The window takes 1 to 10 seconds, and the frame count stops at the
-window in seconds.
+audio=on fine=on`. The window takes 1 to 10 seconds, and the frame count stops
+at the window in seconds. A preset holds no fine grid, so set `fine` by hand.
+
+Start the app with `--gpu` or `--cpu` to pick the device. The default is the
+card when the card is here.
 
 The store sits at `videoembed/store/index.db`. Both the console and the web
 binary use that one file. The format is SQLite with the sqlite-vec extension.
 One write is one transaction, so a crash cannot corrupt it. The app imports an
-old `VEI1` store one time at open, when the database holds no record.
+old `VEI1` store one time at open, when the database holds no record. A database
+from an older version gains its new columns at open, so no manual step is
+needed.
 
 Set `VEI_MODELS` to point at another model folder.
 
@@ -147,10 +170,11 @@ The app opens `http://127.0.0.1:8787/` in your browser.
 
 1. Press Choose folder and pick a folder.
 2. Press Index. The bar shows the file and the window.
-3. Type a query. The hits appear under Search.
+3. Type a query. The hits appear under Search. Each hit names its kind: window,
+   frame, or audio.
 4. Press a hit. The player jumps to that moment.
 5. Press the name of a video to show its plan. Pick a preset, or move the two
-   sliders, then press Apply to cut the video again.
+   sliders, and tick Both grids. Press Apply to cut the video again.
 6. Press Forget on a row to drop one video from the index.
 7. Press Quit to stop the server.
 
@@ -162,6 +186,10 @@ The Search list shows one row for each moment.
   files. The button reads Resume while the job waits.
 - A folder run clears the finished mark of a video that holds no records. The
   server prints the count when the count is not zero.
+- The device pick loads the model on the card or the processor. A pick of the
+  device in use costs no load, so the click answers at once.
+- The speed line shows the load of the model in milliseconds beside the work of
+  the job. It also lists the last five runs, so a slow run stays visible.
 
 The server binds to `127.0.0.1` only, so another machine cannot reach it.
 
@@ -180,6 +208,8 @@ takes a random key in the query instead. The page reads that key from
 | `/api/pick-folder` | POST | Open the folder dialog. |
 | `/api/index` | POST | Index every video under a folder. |
 | `/api/plan` | POST | Set the plan of one video. The reply names the item count. |
+| `/api/device` | POST | Load the model on the card or the processor. A pick of the device in use reloads nothing. |
+| `/api/stop` | POST | Stop the running job. The reply says whether a job ran. |
 | `/api/pause` | POST | Hold or release the running job. The reply names the new state. |
 | `/api/forget` | POST | Drop one video from the index. |
 | `/api/video` | GET | The video bytes, with byte ranges. |
@@ -223,5 +253,6 @@ Four queries work against `testvideo_nolabels.mp4`:
 ## Known rough edges
 
 1. The ffmpeg path is a fixed absolute path in `videoembed/src/media.rs`.
-2. The console has no progress line during a long index.
-3. The console indexes one video. The web page indexes a folder.
+2. The console indexes one video. The web page indexes a folder.
+3. A plan change cuts the whole video again, and the video leaves the search for
+   the length of the cut.

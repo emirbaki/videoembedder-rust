@@ -223,6 +223,8 @@ The rank weighs the user gain against the cost.
 
 **1. Window mode.** This is the only change that attacks the work itself rather than the wall clock. A 2 s window with 2 frames and audio cuts 207 calls to about 21 for the same 41.5 s clip. An A/B test would settle the accuracy question: index one video both ways, run the same ten queries, and compare the returned seconds against the truth. The cost is a new record kind and a re-index of every video. A hybrid is possible: keep the 4 fps frames for precision, and add windows for speed on long videos.
 
+**Note (2026-10-13).** The `hybrid-grid` branch built the hybrid. A plan now takes a `fine` flag, and the window grid shares one plan and one cut pass with the 0.25 s frame grid. See `docs/deferred-work.md`.
+
 **Measurement (2026-10-10).** The `measure` command ranks a store on a 0.25 s, 0.5 s, 1 s, and 2 s grid. The run uses the vectors already in the store, so it costs one text embedding for each query. It does not measure the audio packing or the timestamp text.
 
 On a 572 record store of four copies of `spike/testvideo_nolabels.mp4`:
